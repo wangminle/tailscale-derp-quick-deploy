@@ -1,0 +1,142 @@
+# ========================================
+# Tailscale DERP 部署项目专用 .gitignore
+# ========================================
+
+# ============ 项目特定目录 ============
+# 规划讨论文档（不纳入版本控制）
+plan/
+
+# 部署记录和执行日志（不纳入版本控制）
+records/
+
+# 测试部署生成的临时文件
+test-deploy/
+*.test.sh
+
+# ============ 系统文件 ============
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+.fseventsd
+.apdisk
+.DocumentRevisions-V100
+.TemporaryItems
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux/Unix
+.Trash-*
+.nfs*
+*.swp
+*.swo
+*~
+
+# ============ 编辑器/IDE ============
+# Vim
+*.swp
+*.swo
+*.swn
+.*.sw[a-p]
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# VS Code（保留常用配置）
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+!.vscode/tasks.json
+!.vscode/launch.json
+
+# JetBrains IDEs
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# ============ 日志和临时文件 ============
+# 日志文件
+logs/
+*.log
+*.log.*
+
+# 缓存
+.cache/
+cache/
+
+# 临时文件
+*.tmp
+*.temp
+*.bak
+*.old
+*.orig
+*.save
+.~*
+
+# ============ 敏感信息 ============
+# 环境变量和密钥（保留示例文件）
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+# 私钥和证书（如果有测试生成的）
+*.key
+*.pem
+*.crt
+*.csr
+*.p12
+*.pfx
+!*.example.key
+!*.example.pem
+
+# SSH 密钥
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+
+# 敏感配置
+secrets/
+.secrets/
+credentials/
+
+# ============ 其他 ============
+# 压缩文件
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+# 编译产物（如果有 Go 编译测试）
+*.o
+*.so
+*.exe
+*.dll
+derper
+tailscale
+tailscaled
+
+# 包管理（一般不会用到，但保留）
+node_modules/
+vendor/

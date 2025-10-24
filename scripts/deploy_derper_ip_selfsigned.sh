@@ -1,0 +1,1257 @@
+#!/usr/bin/env bash
+
+# 说明：
+#  - 面向“仅有公网 IP、无需域名”的轻量 DERP 部署；生成“基于 IP 的自签证书”。
+#  - 适合测试/临时/小规模使用；生产建议配合受信任 CA 证书与 443 端口。
+#  - 脚本会：安装依赖 -> 安装/构建 derper -> 生成证书 -> 写入 systemd -> 防火墙提示 -> 自检 -> 输出 ACL 片段。
+#  - 兼容新版 derper（使用 -a :PORT），旧版则回退到 -https-port；默认启用 -verify-clients。
+
+set -euo pipefail
+
+# 默认端口
+DERP_PORT="30399"        # DERP TLS 端口
+STUN_PORT="3478"         # STUN 端口（UDP）
+CERT_DAYS="365"          # 自签证书有效期（天）
+INSTALL_DIR="/opt/derper" # 安装/证书目录
+BIN_PATH="/usr/local/bin/derper"
+SERVICE_PATH="/etc/systemd/system/derper.service"
+
+# 版本门槛（可通过环境变量覆盖）
+REQUIRED_TS_VER="${REQUIRED_TS_VER:-1.66.3}"
+
+# 可选：Go 模块代理 / 校验数据库 / 工具链策略
+GOPROXY_ARG=""                 # 例：https://goproxy.cn,direct
+GOSUMDB_ARG=""                 # 例：sum.golang.google.cn
+GOTOOLCHAIN_ARG="auto"         # auto|local（默认 auto 以满足 >=1.25）
+
+# 客户端校验：on=强制启用；off=禁用（默认 on）
+VERIFY_CLIENTS_MODE="on"
+
+IP_ADDR=""
+AUTO_UFW=0               # 是否自动放行 UFW
+DRY_RUN=0                # 只做检查，不执行安装/写入
+FORCE=0                  # 强制全量重装
+REPAIR=0                 # 仅修复配置（不重装 derper）
+CHECK_ONLY=0             # --check 别名（等价于 --dry-run）
+
+# 新增：健康检查 / 卸载 / 指标导出
+HEALTH_CHECK=0           # 输出健康检查结果（便于 cron 监控）
+UNINSTALL=0              # 停止并卸载 systemd 单元
+PURGE=0                  # 与 --uninstall 一起使用：清理安装目录（证书等）
+PURGE_ALL=0              # 与 --uninstall 一起使用：清理安装目录与二进制
+METRICS_TEXTFILE=""      # 将健康检查指标写为 Prometheus textfile（供 node_exporter 收集）
+
+usage() {
+  cat <<EOF
+用法：sudo bash $0 [--ip 公网IP] [--derp-port 30399] [--stun-port 3478] [--cert-days 365] [--auto-ufw]
+               [--goproxy URL] [--gosumdb VALUE] [--gotoolchain auto|local]
+               [--no-verify-clients | --force-verify-clients]
+               [--check | --dry-run] [--repair] [--force]
+               [--health-check [--metrics-textfile 路径]]
+               [--uninstall [--purge | --purge-all]]
+
+参数说明：
+  --ip                    服务器公网 IPv4（推荐显式指定），缺省自动探测。
+  --derp-port             DERP TLS 端口，默认 30399/TCP。
+  --stun-port             STUN 端口，默认 3478/UDP。
+  --cert-days             自签临时证书有效期（天），默认 365。
+  --auto-ufw              若检测到 UFW，自动放行端口规则。
+  --goproxy URL           设置 GOPROXY，例如 https://goproxy.cn,direct（默认继承环境）。
+  --gosumdb VALUE         设置 GOSUMDB，例如 sum.golang.google.cn（默认继承环境）。
+  --gotoolchain MODE      go 工具链策略，默认 auto 以便自动获取 >=1.25 的工具链。
+  --no-verify-clients     不验证客户端身份（仅测试，默认并不推荐）。
+  --force-verify-clients  强制启用客户端校验（默认行为）。
+  --check, --dry-run      仅进行状态与参数检查，不执行安装/写服务/放行端口等操作。
+  --repair                仅修复/重写配置（systemd/证书等），不中断可用的依赖；不重装 derper。
+  --force                 强制全量重装（重新安装 derper、重签证书、重写服务）。
+
+  --health-check          输出健康检查摘要（适合 cron 周期探测；不更改系统）。
+  --metrics-textfile P    将健康检查结果以 Prometheus 文本格式写入到文件 P。
+                          建议结合 node_exporter 的 textfile collector 使用。
+  --uninstall             停止并卸载 derper systemd 服务（保留二进制与证书）。
+  --purge                 与 --uninstall 配合：额外删除 ${INSTALL_DIR}（证书等）。
+  --purge-all             与 --uninstall 配合：在 --purge 基础上，同时删除 ${BIN_PATH}。
+
+示例：
+  sudo bash $0 --ip 203.0.113.10 --derp-port 30399 --auto-ufw \
+    --goproxy https://goproxy.cn,direct --gosumdb sum.golang.google.cn
+
+   # 仅健康检查 + 导出 Prometheus 文本（可配合 cron）
+   sudo bash $0 --ip 203.0.113.10 --health-check --metrics-textfile /var/lib/node_exporter/textfile_collector/derper.prom
+
+   # 一键卸载服务并清理安装目录
+   sudo bash $0 --uninstall --purge
+EOF
+}
+
+require_root() {
+  if [[ "$(id -u)" -ne 0 ]]; then
+    echo "[错误] 需要 root 权限，请使用 sudo。" >&2
+    exit 1
+  fi
+}
+
+# 检查操作系统和运行环境
+check_os_environment() {
+  local os_type=""
+  local is_wsl=0
+  
+  # 检测操作系统类型
+  if [[ -f /proc/version ]]; then
+    if grep -qi microsoft /proc/version 2>/dev/null; then
+      is_wsl=1
+      os_type="WSL"
+    elif grep -qi linux /proc/version 2>/dev/null; then
+      os_type="Linux"
+    fi
+  fi
+  
+  # 如果 /proc/version 不存在，通过 uname 检测
+  if [[ -z "$os_type" ]]; then
+    case "$(uname -s)" in
+      Linux*)   os_type="Linux";;
+      Darwin*)  os_type="macOS";;
+      *)        os_type="Unknown";;
+    esac
+  fi
+  
+  # 检测 WSL 环境变量（仅当尚未确定为 Linux 时才检查，避免误判）
+  if [[ "$os_type" != "Linux" ]]; then
+    if [[ -n "${WSL_DISTRO_NAME:-}" ]] || [[ -n "${WSL_INTEROP:-}" ]]; then
+      is_wsl=1
+      os_type="WSL"
+    fi
+  fi
+  
+  # 阻断非 Linux 环境
+  if [[ "$os_type" == "macOS" ]]; then
+    cat >&2 <<'EOT'
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                          ⚠️  不支持的操作系统：macOS                          ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+[错误] 本脚本仅支持在具备公网 IPv4 的 Linux 服务器上部署 DERP 中继服务。
+
+macOS 不适合作为 DERP 服务器的原因：
+  ❌ macOS 设备通常位于家庭/办公网络的 NAT 后，缺乏公网可达性
+  ❌ 桌面系统不适合作为 24/7 在线的中继节点
+  ❌ Tailscale DERP 要求服务器可被全球客户端访问
+
+推荐部署方案：
+  ✅ 云服务器（阿里云、腾讯云、AWS、DigitalOcean 等）
+  ✅ 家用 Linux 设备 + 公网 IP + 端口转发（如树莓派、软路由）
+  ✅ VPS 或专用服务器
+
+本地开发测试：
+  如需在 macOS 上测试 derper 程序本身（非生产部署），可手动运行：
+    derper -hostname 127.0.0.1 -certmode manual -certdir ./certs \
+      -http-port -1 -a :30399 -stun
+  注意：此模式仅供本地功能验证，无法作为 Tailscale 网络的中继节点。
+
+EOT
+    exit 1
+  elif [[ "$is_wsl" -eq 1 ]]; then
+    cat >&2 <<'EOT'
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                       ⚠️  不支持的运行环境：WSL                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+[错误] 本脚本仅支持在具备公网 IPv4 的 Linux 服务器上部署 DERP 中继服务。
+
+WSL 不适合作为 DERP 服务器的原因：
+  ❌ WSL 位于双重 NAT 后（Windows NAT + 家庭网络 NAT），外部无法访问
+  ❌ WSL 网络栈不完整，无法稳定提供公网服务
+  ❌ WSL 依赖 Windows 主机运行，不适合 24/7 在线服务
+  ❌ Tailscale DERP 要求服务器可被全球客户端访问
+
+推荐部署方案：
+  ✅ 云服务器（阿里云、腾讯云、AWS、DigitalOcean 等）
+  ✅ 家用 Linux 设备 + 公网 IP + 端口转发（如树莓派、软路由）
+  ✅ VPS 或专用服务器
+
+本地开发测试：
+  如需在 WSL 上测试 derper 程序本身（非生产部署），可手动运行：
+    derper -hostname 127.0.0.1 -certmode manual -certdir ./certs \
+      -http-port -1 -a :30399 -stun
+  注意：此模式仅供本地功能验证，无法作为 Tailscale 网络的中继节点。
+
+EOT
+    exit 1
+  elif [[ "$os_type" != "Linux" ]]; then
+    cat >&2 <<'EOT'
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                          ⚠️  不支持的操作系统                                 ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+[错误] 本脚本仅支持在具备公网 IPv4 的 Linux 服务器上部署 DERP 中继服务。
+
+检测到的系统类型：未知或不受支持
+
+推荐部署方案：
+  ✅ 云服务器（阿里云、腾讯云、AWS、DigitalOcean 等）
+  ✅ 家用 Linux 设备 + 公网 IP + 端口转发（如树莓派、软路由）
+  ✅ VPS 或专用服务器
+
+EOT
+    exit 1
+  fi
+  
+  # 检测 systemd（仅警告，不阻断，因为后续会有更详细的提示）
+  if ! command -v systemctl >/dev/null 2>&1; then
+    cat >&2 <<'EOT'
+[警告] 未检测到 systemd 服务管理器
+  本脚本依赖 systemd 来管理 derper 服务。
+  如果你使用 OpenRC、SysV 或其他服务管理器，安装过程会在后续步骤中止，
+  届时会提供手动运行的命令示例。
+  
+EOT
+  fi
+  
+  echo "[✓] 环境检测通过：Linux 系统"
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --ip)
+        IP_ADDR=${2:-}
+        shift 2;;
+      --derp-port)
+        DERP_PORT=${2:-}
+        shift 2;;
+      --stun-port)
+        STUN_PORT=${2:-}
+        shift 2;;
+      --cert-days)
+        CERT_DAYS=${2:-}
+        shift 2;;
+      --auto-ufw)
+        AUTO_UFW=1
+        shift 1;;
+      --goproxy)
+        GOPROXY_ARG=${2:-}
+        shift 2;;
+      --gosumdb)
+        GOSUMDB_ARG=${2:-}
+        shift 2;;
+      --gotoolchain)
+        GOTOOLCHAIN_ARG=${2:-auto}
+        shift 2;;
+      --no-verify-clients)
+        VERIFY_CLIENTS_MODE="off"
+        shift 1;;
+      --force-verify-clients)
+        VERIFY_CLIENTS_MODE="on"
+        shift 1;;
+      --check)
+        DRY_RUN=1; CHECK_ONLY=1
+        shift 1;;
+      --dry-run)
+        DRY_RUN=1; CHECK_ONLY=1
+        shift 1;;
+      --repair)
+        REPAIR=1
+        shift 1;;
+      --force)
+        FORCE=1
+        shift 1;;
+      --health-check)
+        HEALTH_CHECK=1
+        shift 1;;
+      --metrics-textfile)
+        METRICS_TEXTFILE=${2:-}
+        shift 2;;
+      --uninstall)
+        UNINSTALL=1
+        shift 1;;
+      --purge)
+        PURGE=1
+        shift 1;;
+      --purge-all)
+        PURGE_ALL=1; PURGE=1
+        shift 1;;
+      -h|--help)
+        usage; exit 0;;
+      *)
+        echo "未知参数：$1" >&2; usage; exit 1;;
+    esac
+  done
+}
+
+# 在任何安装/构建之前进行的前置检查：
+# - 若要求启用 verify-clients，则本机必须检测到 tailscaled 正在运行并已登录。
+# - 若未满足条件，给出两种登录方式的提示并退出（避免继续安装造成误导）。
+precheck_verify_clients() {
+  if [[ "${VERIFY_CLIENTS_MODE}" == "off" ]]; then
+    echo "[警告] 你选择了 --no-verify-clients：将不验证客户端身份，仅供测试场景使用。"
+    return 0
+  fi
+
+  local active="inactive"
+  # 多种环境兼容：systemd / Unix socket / 进程名
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet tailscaled 2>/dev/null; then active="active"; fi
+  if [[ -S /run/tailscale/tailscaled.sock ]]; then active="active"; fi
+  if [[ -S /var/run/tailscale/tailscaled.sock ]]; then active="active"; fi
+  if pgrep -x tailscaled >/dev/null 2>&1; then active="active"; fi
+
+  if [[ "${active}" != "active" ]]; then
+    # 根据是否存在 systemctl 给出差异化提示
+    if command -v systemctl >/dev/null 2>&1; then
+      cat >&2 <<'EOT'
+[阻断] 脚本默认启用 -verify-clients，但未检测到本机 tailscaled 正在运行并登录 Tailnet。
+
+请先安装并启动 tailscaled，并完成登录（两种方式任选其一）：
+
+1) 浏览器登录方式：
+   sudo systemctl enable --now tailscaled
+   sudo tailscale up     # 复制输出的登录链接，在浏览器完成授权
+
+2) 预生成 Auth Key 方式：
+   sudo systemctl enable --now tailscaled
+   sudo tailscale up --authkey tskey-xxxxxxxxxxxxxxxxxxxx
+
+完成后再重新运行本脚本；若你确需跳过校验，可使用 --no-verify-clients（仅测试）。
+EOT
+    else
+      cat >&2 <<'EOT'
+[阻断] 脚本默认启用 -verify-clients，但未检测到本机 tailscaled 正在运行并登录 Tailnet（未发现 systemd）。
+
+请先安装并启动 tailscaled，并完成登录（不同发行版可参考以下方式，二选一）：
+
+1) OpenRC/Alpine：
+   sudo rc-update add tailscaled default
+   sudo rc-service tailscaled start
+   sudo tailscale up     # 或：sudo tailscale up --authkey tskey-xxxx
+
+2) SysV/init：
+   sudo service tailscaled start
+   sudo tailscale up     # 或：sudo tailscale up --authkey tskey-xxxx
+
+若仍无法使用服务管理器，可临时前台运行（仅测试）：
+   sudo tailscaled --state=/var/lib/tailscale/tailscaled.state \
+     --socket=/run/tailscale/tailscaled.sock
+   # 另开终端执行：sudo tailscale up
+
+完成后再重新运行本脚本；若你确需跳过校验，可使用 --no-verify-clients（仅测试）。
+EOT
+    fi
+    exit 2
+  fi
+  # 进一步校验：若 tailscale CLI 可用，必须确认已登录（已分配 Tailnet IP）后再继续
+  if command -v tailscale >/dev/null 2>&1; then
+    local tipv4
+    tipv4=$(tailscale ip -4 2>/dev/null | head -n1 || true)
+    if [[ -z "${tipv4}" ]]; then
+      cat >&2 <<'EOT'
+[阻断] 已检测到 tailscaled 进程，但未检测到已登录的 Tailnet IP。
+
+请先完成登录（任选其一）：
+  1) 浏览器登录：
+     sudo tailscale up    # 复制输出的登录链接，在浏览器完成授权
+
+  2) 使用 Auth Key：
+     sudo tailscale up --authkey tskey-xxxxxxxxxxxxxxxxxxxx
+
+完成登录后再运行本脚本；或使用 --no-verify-clients 跳过校验（仅测试）。
+EOT
+      exit 2
+    fi
+    echo "[信息] 已检测到 tailscaled 正常且已登录（${tipv4}），将启用 -verify-clients。"
+  else
+    echo "[信息] 检测到 tailscaled 在运行；未找到 tailscale CLI，无法进一步验证登录态，将继续并尝试启用 -verify-clients。"
+  fi
+}
+
+validate_settings() {
+  # 端口合法性
+  if ! [[ "${DERP_PORT}" =~ ^[0-9]+$ ]] || (( DERP_PORT < 1 || DERP_PORT > 65535 )); then
+    echo "[错误] --derp-port 必须为 1-65535 的整数，当前：${DERP_PORT}" >&2
+    exit 1
+  fi
+  if ! [[ "${STUN_PORT}" =~ ^[0-9]+$ ]] || (( STUN_PORT < 1 || STUN_PORT > 65535 )); then
+    echo "[错误] --stun-port 必须为 1-65535 的整数，当前：${STUN_PORT}" >&2
+    exit 1
+  fi
+  if ! [[ "${CERT_DAYS}" =~ ^[0-9]+$ ]] || (( CERT_DAYS < 1 )); then
+    echo "[错误] --cert-days 必须为正整数，当前：${CERT_DAYS}" >&2
+    exit 1
+  fi
+  # IPv4 基础校验（允许本地自动探测后的结果不严格匹配 RFC，尽量宽松）
+  if ! [[ "${IP_ADDR}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    echo "[错误] 公网 IP 不合法：${IP_ADDR}" >&2
+    exit 1
+  fi
+}
+
+detect_public_ip() {
+  # 自动探测公网 IP（失败则需 --ip 指定）
+  if [[ -z "${IP_ADDR}" ]]; then
+    echo "[信息] 正在尝试自动探测公网 IP…"
+    local IP1 IP2 IP3
+    IP1=$(curl -fsS https://1.1.1.1/cdn-cgi/trace | awk -F= '/^ip=/{print $2}' || true)
+    IP2=$(dig -4 +short myip.opendns.com @resolver1.opendns.com || true)
+    IP3=$(curl -fsS https://api.ipify.org || true)
+    IP_ADDR=${IP1:-${IP2:-${IP3:-}}}
+  fi
+  if [[ -z "${IP_ADDR}" ]]; then
+    echo "[错误] 无法自动探测公网 IP，请使用 --ip 明确指定。" >&2
+    exit 1
+  fi
+  echo "[信息] 使用公网 IP：${IP_ADDR}"
+}
+
+# 版本比较：ver_ge A B => A >= B ?
+ver_ge() {
+  if sort -V </dev/null &>/dev/null; then
+    local a="$1" b="$2"
+    [[ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -1)" == "$a" ]]
+  else
+    [[ "$1" == "$2" ]] || [[ "$1" > "$2" ]]
+  fi
+}
+
+ts_version() {
+  (tailscale version 2>/dev/null | head -n1 | sed -E 's/[^0-9\.].*$//' || true)
+}
+
+check_tailscale_status() {
+  TS_INSTALLED=0; TS_RUNNING=0; TS_VERSION=""; TS_VER_OK=0
+  if command -v tailscale >/dev/null 2>&1; then
+    TS_INSTALLED=1
+    TS_VERSION=$(ts_version || true)
+    if [[ -n "$TS_VERSION" ]] && ver_ge "$TS_VERSION" "$REQUIRED_TS_VER"; then
+      TS_VER_OK=1
+    fi
+  fi
+  local active="inactive"
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet tailscaled 2>/dev/null; then active="active"; fi
+  if [[ -S /run/tailscale/tailscaled.sock ]] || [[ -S /var/run/tailscale/tailscaled.sock ]]; then active="active"; fi
+  if pgrep -x tailscaled >/dev/null 2>&1; then active="active"; fi
+  [[ "$active" == "active" ]] && TS_RUNNING=1 || TS_RUNNING=0
+}
+
+get_derper_unit_path() {
+  if [[ -f "${SERVICE_PATH}" ]]; then
+    echo "${SERVICE_PATH}"; return 0
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl show -p FragmentPath derper 2>/dev/null | awk -F= '/FragmentPath=/ {print $2}'
+    return 0
+  fi
+  echo ""; return 0
+}
+
+read_derper_unit_content() {
+  local unit
+  unit=$(get_derper_unit_path)
+  if [[ -n "$unit" && -f "$unit" ]]; then
+    cat "$unit"
+  elif command -v systemctl >/dev/null 2>&1; then
+    systemctl cat derper 2>/dev/null || true
+  fi
+}
+
+check_ports_status() {
+  PORT_TLS_OK=0; PORT_STUN_OK=0
+  if command -v ss >/dev/null 2>&1; then
+    ss -ltnp 2>/dev/null | grep -E ":${DERP_PORT}\b" >/dev/null 2>&1 && PORT_TLS_OK=1 || true
+    ss -lunp 2>/dev/null | grep -E ":${STUN_PORT}\b" >/dev/null 2>&1 && PORT_STUN_OK=1 || true
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -ltnp 2>/dev/null | grep -E ":${DERP_PORT}\b" >/dev/null 2>&1 && PORT_TLS_OK=1 || true
+    netstat -lunp 2>/dev/null | grep -E ":${STUN_PORT}\b" >/dev/null 2>&1 && PORT_STUN_OK=1 || true
+  fi
+}
+
+check_pure_ip_from_unit() {
+  PURE_IP_OK=0
+  local content="$1"
+  [[ -z "$content" ]] && PURE_IP_OK=0 && return 0
+  echo "$content" | grep -E -- '-hostname[[:space:]]+([0-9]{1,3}\.){3}[0-9]{1,3}' >/dev/null 2>&1 || return 0
+  echo "$content" | grep -q -- '-certmode[[:space:]]+manual' || return 0
+  echo "$content" | grep -q -- '-certdir[[:space:]]' || return 0
+  echo "$content" | grep -q -- '-http-port[[:space:]]+-1' || return 0
+  if echo "$content" | grep -q -- '-https-port[[:space:]]+[0-9]'; then :; else
+    echo "$content" | grep -q -- '-a[[:space:]]+:[0-9]' || return 0
+  fi
+  echo "$content" | grep -q -- '-stun' || return 0
+  PURE_IP_OK=1
+}
+
+check_derper_status() {
+  DERPER_BIN=0; DERPER_SERVICE_PRESENT=0; DERPER_RUNNING=0; PURE_IP_OK=0
+  if [[ -x "${BIN_PATH}" ]] || command -v derper >/dev/null 2>&1; then DERPER_BIN=1; fi
+  local unit_path; unit_path=$(get_derper_unit_path)
+  [[ -n "$unit_path" && -f "$unit_path" ]] && DERPER_SERVICE_PRESENT=1
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet derper 2>/dev/null; then DERPER_RUNNING=1; fi
+  if [[ $DERPER_RUNNING -eq 0 ]] && pgrep -x derper >/dev/null 2>&1; then DERPER_RUNNING=1; fi
+  local content; content=$(read_derper_unit_content || true)
+  check_pure_ip_from_unit "$content"
+  check_ports_status
+}
+
+check_cert_status() {
+  CERT_PRESENT=0; CERT_SAN_MATCH=0; CERT_EXPIRY_OK=0
+  if [[ -f "${INSTALL_DIR}/certs/fullchain.pem" && -f "${INSTALL_DIR}/certs/privkey.pem" ]]; then
+    CERT_PRESENT=1
+    if command -v openssl >/dev/null 2>&1; then
+      if openssl x509 -in "${INSTALL_DIR}/certs/fullchain.pem" -noout -text 2>/dev/null | grep -E "IP( Address)?:[[:space:]]*${IP_ADDR}" >/dev/null 2>&1; then
+        CERT_SAN_MATCH=1
+      elif openssl x509 -in "${INSTALL_DIR}/certs/fullchain.pem" -noout -ext subjectAltName 2>/dev/null | grep -E "IP(:| Address:)[[:space:]]*${IP_ADDR}" >/dev/null 2>&1; then
+        CERT_SAN_MATCH=1
+      fi
+      if openssl x509 -checkend $((30*24*3600)) -in "${INSTALL_DIR}/certs/fullchain.pem" -noout >/dev/null 2>&1; then
+        CERT_EXPIRY_OK=1
+      fi
+    fi
+  fi
+}
+
+# 计算证书剩余天数（失败返回空）
+cert_days_remaining() {
+  command -v openssl >/dev/null 2>&1 || { echo ""; return 0; }
+  [[ -f "${INSTALL_DIR}/certs/fullchain.pem" ]] || { echo ""; return 0; }
+  local end raw ts_now ts_end
+  raw=$(openssl x509 -in "${INSTALL_DIR}/certs/fullchain.pem" -noout -enddate 2>/dev/null | awk -F= '{print $2}') || true
+  [[ -n "$raw" ]] || { echo ""; return 0; }
+  ts_now=$(date +%s)
+  # GNU date
+  if ts_end=$(date -d "$raw" +%s 2>/dev/null); then
+    :
+  else
+    # BSD date 兼容（较少见于本脚本目标环境）
+    ts_end=$(date -j -f "%b %d %T %Y %Z" "$raw" +%s 2>/dev/null || echo "")
+  fi
+  [[ -n "$ts_end" ]] || { echo ""; return 0; }
+  echo $(( (ts_end - ts_now) / 86400 ))
+}
+
+install_deps() {
+  # 按需安装：仅在缺少必要命令时才访问包管理器，避免无谓的网络访问
+  local need_pkgs=()
+  # 基础必需：curl、openssl、git（go 的获取在 ensure_go 内部处理）
+  command -v curl >/dev/null 2>&1     || need_pkgs+=(curl)
+  command -v openssl >/dev/null 2>&1  || need_pkgs+=(openssl)
+  command -v git >/dev/null 2>&1      || need_pkgs+=(git)
+  # 可选但常用：nc/ss，用于自检；缺失不强制
+  if ! command -v nc >/dev/null 2>&1; then
+    if command -v apt >/dev/null 2>&1; then need_pkgs+=(netcat-openbsd); fi
+    if command -v dnf >/dev/null 2>&1; then need_pkgs+=(nmap-ncat); fi
+    if command -v yum >/dev/null 2>&1; then need_pkgs+=(nmap-ncat); fi
+  fi
+  if ! command -v ss >/dev/null 2>&1; then
+    if command -v apt >/dev/null 2>&1; then need_pkgs+=(iproute2); fi
+    if command -v dnf >/dev/null 2>&1; then need_pkgs+=(iproute); fi
+    if command -v yum >/dev/null 2>&1; then need_pkgs+=(iproute); fi
+  fi
+
+  if [[ ${#need_pkgs[@]} -eq 0 ]]; then
+    echo "[信息] 依赖已就绪，跳过安装。"
+    return 0
+  fi
+
+  echo "[步骤] 按需安装依赖：${need_pkgs[*]} …"
+  if command -v apt >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt update -y || true
+    DEBIAN_FRONTEND=noninteractive apt install -y "${need_pkgs[@]}" || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y "${need_pkgs[@]}" || true
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y "${need_pkgs[@]}" || true
+  else
+    echo "[提示] 未检测到常见包管理器，请手工安装：${need_pkgs[*]}。"
+  fi
+  update-ca-certificates >/dev/null 2>&1 || true
+}
+
+# 轻量检测：确保系统有 go 命令。优先用发行版包，工具链版本交由 GOTOOLCHAIN=auto 处理。
+ensure_go() {
+  if command -v go >/dev/null 2>&1; then
+    echo "[信息] 已检测到 Go：$(go version 2>/dev/null)"
+    return 0
+  fi
+  echo "[步骤] 未检测到 go，尝试通过系统包管理器安装 golang-go…"
+  if command -v apt >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt install -y golang-go || true
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf install -y golang || true
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y golang || true
+  fi
+  if command -v go >/dev/null 2>&1; then
+    echo "[信息] Go 安装完成：$(go version 2>/dev/null)"
+    return 0
+  fi
+  # 兜底：按架构安装官方二进制（最新稳定工具链可再由 GOTOOLCHAIN 自动拉取）。
+  local arch os url tarball gov
+  os="linux"
+  case "$(uname -m)" in
+    x86_64|amd64) arch="amd64" ;;
+    aarch64|arm64) arch="arm64" ;;
+    *) echo "[错误] 未支持的架构 $(uname -m)，请自行安装 Go >= 1.21" >&2; exit 1;;
+  esac
+  gov="1.22.6"
+  url="https://go.dev/dl/go${gov}.${os}-${arch}.tar.gz"
+  tarball="/tmp/go${gov}.${os}-${arch}.tar.gz"
+  command -v curl >/dev/null 2>&1 || install_deps
+  echo "[步骤] 下载安装 Go ${gov} (${arch}) 作为基础工具链…"
+  curl -fsSL "$url" -o "$tarball"
+  rm -rf /usr/local/go
+  tar -C /usr/local -xzf "$tarball"
+  mkdir -p /etc/profile.d
+  echo 'export PATH=/usr/local/go/bin:$PATH' >/etc/profile.d/go.sh
+  export PATH=/usr/local/go/bin:$PATH
+  echo "[信息] Go 安装完成：$(go version 2>/dev/null || echo 失败)"
+}
+
+install_derper() {
+  echo "[步骤] 安装/构建 derper 可执行文件…"
+  ensure_go
+  # 组装环境：可选 GOPROXY/GOSUMDB，自动工具链（避免被墙/版本不足问题）
+  local envs=("GOBIN=/usr/local/bin" "GO111MODULE=on" "GOTOOLCHAIN=${GOTOOLCHAIN_ARG}")
+  if [[ -n "${GOPROXY_ARG}" ]]; then envs+=("GOPROXY=${GOPROXY_ARG}"); fi
+  if [[ -n "${GOSUMDB_ARG}" ]]; then envs+=("GOSUMDB=${GOSUMDB_ARG}"); fi
+  if ! env "${envs[@]}" go install tailscale.com/cmd/derper@latest 2>/tmp/derper_install.err; then
+    echo "[错误] go install 失败：" >&2
+    sed -n '1,160p' /tmp/derper_install.err >&2 || true
+    exit 1
+  fi
+  if [[ ! -x "${BIN_PATH}" ]]; then
+    echo "[错误] 未找到 derper 可执行文件：${BIN_PATH}" >&2
+    exit 1
+  fi
+  echo "[信息] derper 安装到：${BIN_PATH}"
+}
+
+derper_supports_stun_port() {
+  local bin help_output
+  if [[ -x "${BIN_PATH}" ]]; then bin="${BIN_PATH}"; else bin="$(command -v derper 2>/dev/null || echo ${BIN_PATH})"; fi
+  # derper -h 会以状态码 2 退出，先捕获输出以避免 pipefail 导致检测失败
+  help_output=$("$bin" -h 2>&1 || true)
+  if echo "$help_output" | grep -q -- '-stun-port'; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# 新旧参数兼容检测：新版本使用 -a :PORT 指定 TLS 监听地址，旧版本使用 -https-port
+derper_supports_https_port() {
+  local bin help_output
+  if [[ -x "${BIN_PATH}" ]]; then bin="${BIN_PATH}"; else bin="$(command -v derper 2>/dev/null || echo ${BIN_PATH})"; fi
+  # derper -h 会以状态码 2 退出，先捕获输出以避免 pipefail 导致检测失败
+  help_output=$("$bin" -h 2>&1 || true)
+  if echo "$help_output" | grep -q -- '-https-port'; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+# 新监听参数支持检测：是否支持使用 -a :PORT 指定 TLS 监听地址（新版）
+derper_supports_listen_a() {
+  local bin help_output
+  if [[ -x "${BIN_PATH}" ]]; then bin="${BIN_PATH}"; else bin="$(command -v derper 2>/dev/null || echo ${BIN_PATH})"; fi
+  # derper -h 会以状态码 2 退出，先捕获输出以避免 pipefail 导致检测失败
+  help_output=$("$bin" -h 2>&1 || true)
+  if echo "$help_output" | grep -qE '(^|[[:space:]])-a([[:space:]]|$)'; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+generate_selfsigned_cert() {
+  echo "[步骤] 生成基于 IP 的自签临时证书（SAN=IP:${IP_ADDR}）…"
+  mkdir -p "${INSTALL_DIR}/certs"
+
+  # 优先使用 -addext；若系统 openssl 太旧则降级到配置文件方式
+  if openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
+      -keyout "${INSTALL_DIR}/certs/privkey.pem" \
+      -out "${INSTALL_DIR}/certs/fullchain.pem" \
+      -days "${CERT_DAYS}" \
+      -subj "/CN=${IP_ADDR}" \
+      -addext "subjectAltName = IP:${IP_ADDR}" >/dev/null 2>&1; then
+    :
+  else
+    cat >"${INSTALL_DIR}/openssl-derper.cnf" <<CONF
+[ req ]
+default_bits       = 2048
+distinguished_name = req_distinguished_name
+req_extensions     = req_ext
+x509_extensions    = v3_req
+prompt             = no
+
+[ req_distinguished_name ]
+CN = ${IP_ADDR}
+
+[ req_ext ]
+subjectAltName = @alt_names
+
+[ v3_req ]
+subjectAltName = @alt_names
+
+[ alt_names ]
+IP.1 = ${IP_ADDR}
+CONF
+    openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
+      -keyout "${INSTALL_DIR}/certs/privkey.pem" \
+      -out "${INSTALL_DIR}/certs/fullchain.pem" \
+      -days "${CERT_DAYS}" \
+      -config "${INSTALL_DIR}/openssl-derper.cnf" >/dev/null 2>&1
+  fi
+
+  ln -sf fullchain.pem "${INSTALL_DIR}/certs/cert.pem"
+  ln -sf privkey.pem  "${INSTALL_DIR}/certs/key.pem"
+
+  echo "[信息] 证书文件生成于：${INSTALL_DIR}/certs/{fullchain.pem,privkey.pem}"
+}
+
+# 计算证书 DER 原始字节的 SHA256，用于 ACL 的 CertName（sha256-raw:<hex>）
+sha256_hex() {
+  # 从标准输入读取，返回十六进制 sha256 值
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print $1}'
+  elif command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 | awk '{print $1}'
+  else
+    openssl dgst -sha256 | awk '{print $2}'
+  fi
+}
+
+cert_file_sha256_raw() {
+  # 计算本地证书（脚本生成的 cert.pem/fullchain.pem）的指纹
+  if command -v openssl >/dev/null 2>&1; then
+    local pem
+    if [[ -f "${INSTALL_DIR}/certs/cert.pem" ]]; then
+      pem="${INSTALL_DIR}/certs/cert.pem"
+    else
+      pem="${INSTALL_DIR}/certs/fullchain.pem"
+    fi
+    [[ -f "$pem" ]] || return 1
+    openssl x509 -in "$pem" -outform DER 2>/dev/null | sha256_hex
+  fi
+}
+
+live_cert_sha256_raw() {
+  # 通过在线握手读取 derper 实际呈现的证书并计算指纹，最为权威
+  # 依赖 openssl；添加超时避免卡住
+  command -v openssl >/dev/null 2>&1 || return 1
+  local pem
+  pem=$(timeout 6 openssl s_client -connect "${IP_ADDR}:${DERP_PORT}" -servername "${IP_ADDR}" -showcerts </dev/null 2>/dev/null \
+        | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p') || true
+  [[ -n "$pem" ]] || return 1
+  printf "%s\n" "$pem" | openssl x509 -outform DER 2>/dev/null | sha256_hex
+}
+
+journal_certname_raw() {
+  # 从 systemd 日志中提取 derper 打印的 CertName（若可用）
+  if command -v journalctl >/dev/null 2>&1; then
+    journalctl -u derper -n 200 --no-pager 2>/dev/null \
+      | grep -oE 'sha256-raw:[0-9a-f]+' | tail -n1 | sed 's/^sha256-raw://'
+  fi
+}
+
+write_systemd_service() {
+  echo "[步骤] 写入 systemd 服务单元：${SERVICE_PATH}…"
+  local stun_flag
+  if derper_supports_stun_port; then
+    stun_flag="-stun -stun-port ${STUN_PORT}"
+  else
+    stun_flag="-stun"
+    if [[ "${STUN_PORT}" != "3478" ]]; then
+      echo "[提示] 检测到 derper 不支持自定义 STUN 端口，将使用默认 3478。" >&2
+    fi
+  fi
+
+  local listen_flag
+  if derper_supports_listen_a; then
+    listen_flag="-a :${DERP_PORT}"
+  elif derper_supports_https_port; then
+    listen_flag="-https-port ${DERP_PORT}"
+  else
+    # 极端兜底：仍尝试使用 -a
+    listen_flag="-a :${DERP_PORT}"
+  fi
+
+  # 根据配置决定是否启用客户端校验
+  local verify_flag=""
+  case "${VERIFY_CLIENTS_MODE}" in
+    on) verify_flag="-verify-clients" ;;
+    off) verify_flag="" ;;
+  esac
+
+  # 非 systemd 环境前置拦截并给出手动运行示例
+  if ! command -v systemctl >/dev/null 2>&1; then
+    cat >&2 <<EOT
+[阻断] 未检测到 systemd，无法写入服务单元：${SERVICE_PATH}
+
+你可以手动前台运行 derper（示例）：
+  ${BIN_PATH} \\
+    -hostname ${IP_ADDR} \\
+    -certmode manual \\
+    -certdir ${INSTALL_DIR}/certs \\
+    -http-port -1 \\
+    ${listen_flag} \\
+    ${stun_flag} \\
+    ${verify_flag}
+
+说明：若 derper 旧版本不支持 "-a" 或 "-stun-port"，请改用 "-https-port ${DERP_PORT}"，并去掉 "-stun-port"。
+EOT
+    exit 1
+  fi
+
+  cat >"${SERVICE_PATH}" <<SERVICE
+[Unit]
+Description=Tailscale DERP (derper) with self-signed IP cert
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=${BIN_PATH} \\
+  -hostname ${IP_ADDR} \\
+  -certmode manual \\
+  -certdir ${INSTALL_DIR}/certs \\
+  -http-port -1 \\
+  ${listen_flag} \\
+  ${stun_flag} \\
+  ${verify_flag}
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65535
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+SERVICE
+
+  systemctl daemon-reload
+  systemctl enable --now derper
+  systemctl status derper --no-pager -l || true
+}
+
+print_firewall_tips() {
+  echo "[步骤] 端口放行提示（请确保云厂商安全组也已放行）："
+  echo "  - 必需：${DERP_PORT}/tcp（DERP TLS），${STUN_PORT}/udp（STUN）"
+  echo "  - 可选：80/tcp（仅当使用 ACME 自动签发时；本脚本为自签证书，无需）"
+  if command -v ufw >/dev/null 2>&1; then
+    if [[ "${AUTO_UFW}" -eq 1 ]]; then
+      echo "[信息] 自动放行 UFW 端口规则…"
+      ufw allow ${DERP_PORT}/tcp || true
+      ufw allow ${STUN_PORT}/udp || true
+    else
+      echo "[信息] 检测到 UFW，可手动执行："
+      echo "  ufw allow ${DERP_PORT}/tcp"
+      echo "  ufw allow ${STUN_PORT}/udp"
+    fi
+  fi
+}
+
+runtime_checks() {
+  echo "[步骤] 运行时快速自检…"
+  echo "- 检查端口监听："
+  if command -v ss >/dev/null 2>&1; then
+    ss -tulpn | sed -n '1,200p' | grep -E ":(${DERP_PORT}|${STUN_PORT})" || true
+  elif command -v netstat >/dev/null 2>&1; then
+    netstat -tulpn | sed -n '1,200p' | grep -E ":(${DERP_PORT}|${STUN_PORT})" || true
+  fi
+
+  echo "- 测试 HTTPS 握手（自签证书会提示不受信）："
+  (command -v openssl >/dev/null 2>&1 && \
+    timeout 5 openssl s_client -connect ${IP_ADDR}:${DERP_PORT} -servername ${IP_ADDR} -brief </dev/null || true)
+
+  echo "- 测试 STUN 端口可达性（UDP）："
+  if command -v nc >/dev/null 2>&1; then
+    (timeout 3 nc -zvu ${IP_ADDR} ${STUN_PORT} || true)
+  else
+    echo "  [提示] 未找到 nc，跳过 UDP 探测。"
+  fi
+}
+
+# 在写入 systemd 服务前，预检端口占用，避免启动后才失败
+check_port_conflicts() {
+  echo "[步骤] 端口占用预检…"
+  local conflict=0
+  if command -v ss >/dev/null 2>&1; then
+    if ss -ltn 2>/dev/null | grep -E ":${DERP_PORT}\\b" >/dev/null; then
+      echo "[错误] 检测到 TCP 端口 ${DERP_PORT} 已被占用。请更换 --derp-port 或释放占用进程：" >&2
+      ss -ltnp | sed -n '1,200p' | grep -E ":${DERP_PORT}\\b" || true
+      conflict=1
+    fi
+    if ss -lun 2>/dev/null | grep -E ":${STUN_PORT}\\b" >/dev/null; then
+      echo "[错误] 检测到 UDP 端口 ${STUN_PORT} 已被占用。请更换 --stun-port 或释放占用进程：" >&2
+      ss -lunp | sed -n '1,200p' | grep -E ":${STUN_PORT}\\b" || true
+      conflict=1
+    fi
+  elif command -v netstat >/dev/null 2>&1; then
+    if netstat -ltnp 2>/dev/null | grep -E ":${DERP_PORT}\\b" >/dev/null; then
+      echo "[错误] 检测到 TCP 端口 ${DERP_PORT} 已被占用。请更换 --derp-port 或释放占用进程：" >&2
+      netstat -ltnp | sed -n '1,200p' | grep -E ":${DERP_PORT}\\b" || true
+      conflict=1
+    fi
+    if netstat -lunp 2>/dev/null | grep -E ":${STUN_PORT}\\b" >/dev/null; then
+      echo "[错误] 检测到 UDP 端口 ${STUN_PORT} 已被占用。请更换 --stun-port 或释放占用进程：" >&2
+      netstat -lunp | sed -n '1,200p' | grep -E ":${STUN_PORT}\\b" || true
+      conflict=1
+    fi
+  fi
+  if [[ ${conflict} -eq 1 ]]; then
+    echo "[提示] 你也可以使用如下命令进一步排查：" >&2
+    echo "  ss -tulpn | grep -E ':${DERP_PORT}|:${STUN_PORT}'" >&2
+    echo "  netstat -tulpn | grep -E ':${DERP_PORT}|:${STUN_PORT}'" >&2
+    exit 1
+  fi
+  echo "[信息] 端口未发现占用。"
+}
+
+print_acl_snippet_cert() {
+  local ip="$1" port="$2" fp="$3" region_id="900"
+  cat <<JSON
+==================== 推荐粘贴到 Tailscale 管理后台（Access Controls）的 derpMap 片段（使用 CertName 更安全） ====================
+{
+  "derpMap": {
+    "OmitDefaultRegions": false,
+    "Regions": {
+      "${region_id}": {
+        "RegionID": ${region_id},
+        "RegionCode": "my-derp",
+        "RegionName": "My IP DERP",
+        "Nodes": [
+          {
+            "Name": "${region_id}a",
+            "RegionID": ${region_id},
+            "HostName": "${ip}",
+            "DERPPort": ${port},
+            "CertName": "sha256-raw:${fp}"
+          }
+        ]
+      }
+    }
+  }
+}
+============================================================================================================================================
+JSON
+}
+
+print_acl_snippet_insecure() {
+  cat <<'JSON'
+==================== 备用方案（不推荐）：使用自签 + InsecureForTests 的 derpMap 片段 ====================
+// 注意：仅在无法使用 CertName 指纹时使用该片段，并设置 "InsecureForTests": true
+//       HostName 应填写你的公网 IP。
+{
+  "derpMap": {
+    "OmitDefaultRegions": false,
+    "Regions": {
+      "901": {
+        "RegionID": 901,
+        "RegionCode": "my-derp",
+        "RegionName": "My IP DERP",
+        "Nodes": [
+          {
+            "Name": "901a",
+            "RegionID": 901,
+            "HostName": "<你的公网IP>",
+            "DERPPort": 443,
+            "InsecureForTests": true
+          }
+        ]
+      }
+    }
+  }
+}
+====================================================================================================================
+JSON
+}
+
+print_client_verify_steps() {
+  cat <<EOF
+============================== 客户端验证步骤（在同一 Tailnet 的任意设备上执行） ==============================
+1) 更新 ACL：把上面的 derpMap 片段粘贴到管理后台 Access Controls 并保存；
+   - 若你修改了端口，请同步更新 "DERPPort"。
+   - 保存后等待 10~60 秒，客户端会自动拉取最新 derpMap。
+
+2) 在客户端验证：
+   - 查看 DERP 拓扑：
+       tailscale netcheck | sed -n '1,160p'
+     观察 "DERP latency" / 自定义 Region 是否出现你的自建节点（延迟应较低）。
+
+   - 查看连接状态：
+       tailscale status
+     某些直连失败的对端会显示 "relay \"my-derp\"" 或你的 Region/Node 名称。
+
+3) UDP STUN 探测（可选）：
+   - 在 Linux/macOS 客户端上可运行：
+       nc -zvu <你的公网IP> ${STUN_PORT}
+     若显示 succeeded / open，一般表示 STUN 端口可达。
+
+4) 常见排查：
+   - derper 启动失败：journalctl -u derper -f 查看报错（证书路径/端口占用/参数）。
+   - 客户端未走你的 DERP：确认 derpMap 已保存、HostName 为公网 IP、（若未使用 CertName）InsecureForTests 已设置。
+   - 端口被拦截：确认云安全组/本机防火墙已放行 ${DERP_PORT}/tcp 与 ${STUN_PORT}/udp。
+=========================================================================================================
+EOF
+}
+
+# 健康检查摘要（适合 cron 调用）
+health_check_report() {
+  detect_public_ip || true
+  validate_settings || true
+  check_tailscale_status
+  check_derper_status
+  check_cert_status
+  local days_left
+  days_left=$(cert_days_remaining || true)
+
+  echo "[健康检查] DERP 服务健康状态摘要："
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl is-active --quiet derper 2>/dev/null; then
+      echo "✅ 服务：derper 处于运行中"
+    else
+      echo "❌ 服务：derper 未在运行"
+    fi
+  else
+    [[ $DERPER_RUNNING -eq 1 ]] && echo "✅ 进程：derper 运行中" || echo "❌ 进程：derper 未运行"
+  fi
+  [[ $PORT_TLS_OK -eq 1 ]] && echo "✅ 端口：TLS ${DERP_PORT}/tcp 正在监听" || echo "❌ 端口：TLS ${DERP_PORT}/tcp 未监听"
+  [[ $PORT_STUN_OK -eq 1 ]] && echo "✅ 端口：STUN ${STUN_PORT}/udp 正在监听" || echo "❌ 端口：STUN ${STUN_PORT}/udp 未监听"
+
+  if [[ -n "$days_left" ]]; then
+    if (( days_left >= 30 )); then
+      echo "✅ 证书：有效期剩余 ${days_left} 天"
+    elif (( days_left >= 0 )); then
+      echo "⚠️  证书：有效期仅剩 ${days_left} 天（建议尽快重签）"
+    else
+      echo "❌ 证书：已过期（请重签）"
+    fi
+  else
+    echo "⚠️  证书：未能计算有效期（可能缺少 openssl 或证书文件）"
+  fi
+
+  # 进程内存占用（RSS）
+  local rss_kb rss_mb pidlist
+  pidlist=$(pgrep -x derper 2>/dev/null | xargs || true)
+  if [[ -n "$pidlist" ]]; then
+    rss_kb=$(ps -o rss= -p $pidlist 2>/dev/null | awk '{s+=$1} END{print s+0}')
+    rss_mb=$(( (rss_kb + 1023) / 1024 ))
+    echo "ℹ️  资源：derper 内存 RSS 约 ${rss_mb} MiB"
+  else
+    echo "ℹ️  资源：未发现 derper 进程，略过内存统计"
+  fi
+
+  # 导出 Prometheus 文本（可被 node_exporter textfile collector 收集）
+  if [[ -n "${METRICS_TEXTFILE}" ]]; then
+    write_prometheus_metrics "${METRICS_TEXTFILE}" "$days_left" "$rss_kb"
+    echo "[信息] 已写入 Prometheus 指标：${METRICS_TEXTFILE}"
+  fi
+}
+
+write_prometheus_metrics() {
+  local path="$1" days_left="$2" rss_kb="$3"
+  mkdir -p "$(dirname "$path")" 2>/dev/null || true
+  {
+    echo "# HELP derper_up Whether derper service is up (1)"
+    echo "# TYPE derper_up gauge"
+    [[ $DERPER_RUNNING -eq 1 ]] && echo "derper_up 1" || echo "derper_up 0"
+
+    echo "# HELP derper_tls_listen TLS port listen state"
+    echo "# TYPE derper_tls_listen gauge"
+    [[ $PORT_TLS_OK -eq 1 ]] && echo "derper_tls_listen 1" || echo "derper_tls_listen 0"
+
+    echo "# HELP derper_stun_listen STUN port listen state"
+    echo "# TYPE derper_stun_listen gauge"
+    [[ $PORT_STUN_OK -eq 1 ]] && echo "derper_stun_listen 1" || echo "derper_stun_listen 0"
+
+    echo "# HELP derper_cert_days_remaining Days until certificate expiry"
+    echo "# TYPE derper_cert_days_remaining gauge"
+    if [[ -n "$days_left" ]]; then
+      echo "derper_cert_days_remaining $days_left"
+    else
+      echo "derper_cert_days_remaining -1"
+    fi
+
+    echo "# HELP derper_verify_clients Whether verify-clients is enabled"
+    echo "# TYPE derper_verify_clients gauge"
+    [[ "${VERIFY_CLIENTS_MODE}" == "on" ]] && echo "derper_verify_clients 1" || echo "derper_verify_clients 0"
+
+    echo "# HELP derper_pure_ip_config_ok Whether pure IP mode config is detected"
+    echo "# TYPE derper_pure_ip_config_ok gauge"
+    [[ $PURE_IP_OK -eq 1 ]] && echo "derper_pure_ip_config_ok 1" || echo "derper_pure_ip_config_ok 0"
+
+    echo "# HELP derper_process_rss_bytes Total RSS of derper process in bytes"
+    echo "# TYPE derper_process_rss_bytes gauge"
+    if [[ -n "$rss_kb" ]]; then
+      echo "derper_process_rss_bytes $((rss_kb*1024))"
+    else
+      echo "derper_process_rss_bytes 0"
+    fi
+  } >"$path".tmp
+  mv -f "$path".tmp "$path"
+}
+
+uninstall_derper() {
+  require_root
+  echo "[步骤] 停止并卸载 derper systemd 服务…"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now derper 2>/dev/null || true
+  fi
+  if [[ -f "${SERVICE_PATH}" ]]; then
+    rm -f "${SERVICE_PATH}"
+    systemctl daemon-reload 2>/dev/null || true
+  fi
+  echo "[信息] 已卸载 service：${SERVICE_PATH}"
+
+  if [[ ${PURGE} -eq 1 ]]; then
+    echo "[步骤] 清理安装目录：${INSTALL_DIR} …"
+    rm -rf "${INSTALL_DIR}"
+    echo "[信息] 安装目录已清理。"
+  fi
+
+  if [[ ${PURGE_ALL} -eq 1 ]]; then
+    if [[ -x "${BIN_PATH}" ]]; then
+      echo "[步骤] 删除 derper 二进制：${BIN_PATH} …"
+      rm -f "${BIN_PATH}" || true
+    fi
+  fi
+  echo "完成：已卸载 derper 服务。"
+}
+
+main() {
+  parse_args "$@"
+  
+  # 环境检测（优先级最高，除了 --help 和 --uninstall）
+  if [[ "${UNINSTALL}" -eq 1 ]]; then
+    # 卸载优先处理：不依赖环境检测/公网 IP 探测/参数校验
+    uninstall_derper
+    exit 0
+  fi
+  
+  # 检查操作系统和运行环境（Linux only）
+  check_os_environment
+
+  # 探测 IP 与校验参数（即使非 root 也可做检查）
+  detect_public_ip || true
+  validate_settings || true
+
+  # 收集当前状态
+  check_tailscale_status
+  check_derper_status
+  check_cert_status
+
+  # 健康检查模式（仅输出状态/指标，不变更系统）
+  if [[ "${HEALTH_CHECK}" -eq 1 ]]; then
+    health_check_report
+    # 根据关键项给出退出码：全部健康返回 0，否则 1
+    local ok=1
+    if [[ $DERPER_RUNNING -eq 1 && $PORT_TLS_OK -eq 1 && $PORT_STUN_OK -eq 1 ]]; then ok=0; fi
+    exit $ok
+  fi
+
+  if [[ "${DRY_RUN}" -eq 1 || "${CHECK_ONLY}" -eq 1 ]]; then
+    echo "[检查] 参数与环境状态总结："
+    echo "- 公网 IP：${IP_ADDR}"
+    echo "- DERP 端口：${DERP_PORT}/tcp；STUN 端口：${STUN_PORT}/udp"
+    echo "- tailscale：安装=${TS_INSTALLED} 运行=${TS_RUNNING} 版本=${TS_VERSION:-<未知>} (>=${REQUIRED_TS_VER}) 满足=${TS_VER_OK}"
+    echo "- derper：二进制=${DERPER_BIN} 服务文件=${DERPER_SERVICE_PRESENT} 运行=${DERPER_RUNNING}"
+    echo "- 端口监听：TLS=${PORT_TLS_OK} STUN=${PORT_STUN_OK}"
+    echo "- 纯 IP 配置判定（基于 unit）：${PURE_IP_OK}"
+    echo "- 证书：存在=${CERT_PRESENT} SAN匹配IP=${CERT_SAN_MATCH} 30天内不过期=${CERT_EXPIRY_OK}"
+    echo "- 客户端校验模式：${VERIFY_CLIENTS_MODE}"
+
+    local suggest="--repair"
+    if [[ $DERPER_BIN -eq 1 && $DERPER_SERVICE_PRESENT -eq 1 && $DERPER_RUNNING -eq 1 && $PURE_IP_OK -eq 1 && $PORT_TLS_OK -eq 1 && $PORT_STUN_OK -eq 1 && $CERT_PRESENT -eq 1 && $CERT_SAN_MATCH -eq 1 && $CERT_EXPIRY_OK -eq 1 ]]; then
+      suggest="<已就绪：可直接跳过>"
+    elif [[ $DERPER_BIN -eq 0 ]]; then
+      suggest="安装 derper（缺少二进制）"
+    fi
+    echo "- 建议：${suggest}"
+
+    echo "- 关键可执行检查："
+    for bin in curl openssl git go tailscale; do
+      if command -v "$bin" >/dev/null 2>&1; then
+        echo "  * $bin: $(command -v "$bin")"
+      else
+        echo "  * $bin: 未找到（正式安装时将尝试通过包管理器或 go 安装）"
+      fi
+    done
+    if command -v systemctl >/dev/null 2>&1; then
+      echo "- 服务管理器：systemd 可用"
+    else
+      echo "- 服务管理器：未检测到 systemd（将无法写入 systemd 服务，请改用手动或其他服务管理器）"
+    fi
+
+    echo "[检查结束] 使用 --repair 修复配置，或 --force 全量重装；若一切就绪可直接跳过。"
+    return 0
+  fi
+
+  # 正式执行需要 root
+  require_root
+
+  # 默认启用 verify-clients 并在未登录时阻断
+  precheck_verify_clients
+
+  if [[ "${FORCE}" -eq 1 ]]; then
+    install_deps
+    install_derper
+    generate_selfsigned_cert
+    check_port_conflicts
+    write_systemd_service
+    print_firewall_tips
+    runtime_checks
+  elif [[ "${REPAIR}" -eq 1 ]]; then
+    install_deps
+    if [[ $CERT_PRESENT -ne 1 || $CERT_SAN_MATCH -ne 1 || $CERT_EXPIRY_OK -ne 1 ]]; then
+      generate_selfsigned_cert
+    fi
+    check_port_conflicts
+    write_systemd_service
+    print_firewall_tips
+    runtime_checks
+  else
+    # 默认幂等：按需修复
+    local changed=0
+    if [[ $DERPER_BIN -ne 1 ]]; then
+      install_deps
+      install_derper; changed=1
+    fi
+    if [[ $CERT_PRESENT -ne 1 || $CERT_SAN_MATCH -ne 1 || $CERT_EXPIRY_OK -ne 1 ]]; then
+      command -v openssl >/dev/null 2>&1 || install_deps
+      generate_selfsigned_cert; changed=1
+    fi
+    if [[ $DERPER_SERVICE_PRESENT -ne 1 || $PURE_IP_OK -ne 1 ]]; then
+      check_port_conflicts
+      write_systemd_service; changed=1
+    fi
+    if [[ $changed -eq 0 && $DERPER_RUNNING -eq 1 && $PORT_TLS_OK -eq 1 && $PORT_STUN_OK -eq 1 ]]; then
+      echo "✅ 已就绪：检测到 derper 正在以纯 IP 模式运行，跳过安装。"
+      exit 0
+    fi
+    print_firewall_tips
+    runtime_checks
+  fi
+
+  local FP
+  FP=$(live_cert_sha256_raw || true)
+  if [[ -z "$FP" ]]; then FP=$(journal_certname_raw || true); fi
+  if [[ -z "$FP" ]]; then FP=$(cert_file_sha256_raw || true); fi
+  if [[ -n "$FP" ]]; then
+    print_acl_snippet_cert "${IP_ADDR}" "${DERP_PORT}" "$FP"
+    echo "[信息] 已基于实际在线证书指纹生成片段：sha256-raw:${FP}"
+  else
+    print_acl_snippet_insecure | sed "s/<你的公网IP>/${IP_ADDR}/g" | sed "s/\"DERPPort\": 443/\"DERPPort\": ${DERP_PORT}/g"
+    echo "[提示] 未能获取证书指纹（可能端口未就绪或缺少 openssl），已回退到 InsecureForTests 片段。"
+  fi
+  print_client_verify_steps
+
+  cat <<INFO
+完成：DERP 服务已部署/修复并尝试运行。
+- 服务：systemctl status derper
+- 日志：journalctl -u derper -f
+- 证书：${INSTALL_DIR}/certs/{fullchain.pem,privkey.pem}（自签临时证书，建议仅测试用途）
+
+在 Tailscale 后台粘贴 derpMap 后，客户端数十秒内会自动下发。
+INFO
+}
+
+main "$@"
