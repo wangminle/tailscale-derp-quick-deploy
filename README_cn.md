@@ -1,5 +1,7 @@
 # DERP 基于 IP 的自签名部署指南
 
+> **中文 | [English README](README.md)**
+
 > **脚本文件**：`deploy_derper_ip_selfsigned.sh`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)

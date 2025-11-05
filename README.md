@@ -1,5 +1,7 @@
 # DERP Deployment Guide with IP-based Self-signed Certificate
 
+> **[中文版 README](README_cn.md) | English**
+
 > **Script File**: `deploy_derper_ip_selfsigned.sh`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)

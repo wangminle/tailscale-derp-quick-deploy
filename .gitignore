@@ -54,12 +54,8 @@ $RECYCLE.BIN/
 \#*\#
 .\#*
 
-# VS Code（保留常用配置）
-.vscode/*
-!.vscode/settings.json
-!.vscode/extensions.json
-!.vscode/tasks.json
-!.vscode/launch.json
+# VS Code（完全忽略，不上传到 GitHub）
+.vscode/
 
 # JetBrains IDEs
 .idea/
