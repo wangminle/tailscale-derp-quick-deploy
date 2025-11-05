@@ -92,6 +92,7 @@ Note: Pre-check won't modify system or open ports, only outputs current environm
 
 3) Run deployment script (formal installation/repair; example for China mainland, with `-verify-clients` enabled by default)
 
+**Default: Creates dedicated `derper` user (most secure)**
 ```bash
 sudo bash scripts/deploy_derper_ip_selfsigned.sh \
   --ip <your-public-ip> \
@@ -99,6 +100,23 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
   --goproxy https://goproxy.cn,direct \
   --gosumdb sum.golang.google.cn \
   --gotoolchain auto
+```
+
+**Alternative: Use current user (simpler, no user creation)**
+```bash
+sudo bash scripts/deploy_derper_ip_selfsigned.sh \
+  --ip <your-public-ip> \
+  --use-current-user \
+  --derp-port 30399 --stun-port 3478 --auto-ufw
+```
+
+**Advanced: Specify a different user**
+```bash
+# Use existing system user (e.g., nobody, www-data)
+sudo bash scripts/deploy_derper_ip_selfsigned.sh \
+  --ip <your-public-ip> \
+  --user nobody \
+  --derp-port 30399
 ```
 
 After completion, the script will (made idempotent, will skip if already ready; dependencies installed "on-demand", won't access package repositories if all present):
@@ -166,6 +184,10 @@ Pre-check outputs several key items, their meanings and solutions (in order of a
   - Any is 0: Re-run script (or `--repair`) to re-sign certificate; if IP changed ensure `--ip` points to new IP; if missing openssl, install first.
 - Client verification mode
   - on: Enables `-verify-clients`, requires local tailscaled to be logged in (recommended). For testing only, use `--no-verify-clients` temporarily (not recommended long-term).
+- Running user (user and group for service execution)
+  - Shows which user/group will run derper service (e.g., `derper (group: derper)`)
+  - Default is dedicated `derper` user; can customize with `--user` or `--use-current-user`
+  - If user doesn't exist yet, group name shows as username placeholder
 - Critical executable checks
   - Missing items (like curl/openssl/git/go): Formal installation will fill on-demand; for offline/restricted networks, install via package manager first.
 - Service manager
@@ -200,6 +222,12 @@ Common paths:
 
 --no-verify-clients       Disable client verification (not enabled by default; testing only)
 --force-verify-clients    Force enable client verification (default behavior)
+--region-id               ACL derpMap RegionID (default 900)
+--region-code             ACL derpMap RegionCode (default my-derp)
+--region-name             ACL derpMap RegionName (default "My IP DERP")
+--user <username>         Specify which user runs derper (default: derper, auto-created)
+                          Can specify existing users (e.g., nobody, www-data)
+--use-current-user        Use current login user to run derper (equivalent to --user $USER)
 --check / --dry-run       Only perform status and parameter checks, no install/write service/open ports
 --repair                  Only fix/rewrite config (systemd/certificates etc.), don't reinstall derper
 --force                   Force full reinstall (reinstall derper, re-sign certs, rewrite service)
@@ -279,6 +307,80 @@ openssl x509 -in /opt/derper/certs/fullchain.pem -outform DER | sha256sum | awk 
 
 ---
 
+## Security Best Practices
+
+The script implements several security hardening measures by default:
+
+### Flexible User Configuration
+
+**You can choose who runs derper** - the script supports three modes:
+
+1. **Dedicated `derper` user (default, most secure)**
+   - Automatically created system user with no login shell, no home directory
+   - Minimal permissions, isolated from other system activities
+   - Best practice for production environments
+
+2. **Current user (`--use-current-user`)**
+   - Simpler deployment, no user creation needed
+   - Suitable for testing or personal servers
+   - Still secure with systemd hardening (see below)
+
+3. **Specific user (`--user <username>`)**
+   - Use existing system users like `nobody`, `www-data`, etc.
+   - Flexible for integration with existing setups
+
+**Technical details:**
+- **Port ≥ 1024 (default 30399)**: Any non-root user can run derper without special capabilities
+- **Port < 1024 (e.g., 443)**: Script automatically grants `CAP_NET_BIND_SERVICE` via systemd, regardless of which user you choose
+- **Cross-distro compatibility**: Automatically detects `nologin` path (`/sbin/nologin` for RHEL/CentOS, `/usr/sbin/nologin` for Debian/Ubuntu, falls back to `/bin/false`)
+- **Robust user creation**: Validates user/group existence before and after creation, with clear error messages on failure
+
+### systemd Security Hardening
+
+The generated systemd service includes multiple protection layers:
+
+```ini
+# Prevent privilege escalation
+NoNewPrivileges=true
+
+# Filesystem protection
+ProtectSystem=strict        # Read-only /usr, /boot, /efi
+ProtectHome=true            # Inaccessible /home, /root, /run/user
+PrivateTmp=true             # Private /tmp and /var/tmp
+ReadWritePaths=/opt/derper  # Only allow writes to installation dir
+
+# Network restrictions
+RestrictAddressFamilies=AF_INET AF_INET6  # Only IPv4/IPv6
+
+# System call filtering
+SystemCallFilter=@system-service  # Whitelist safe syscalls only
+SystemCallErrorNumber=EPERM       # Deny with EPERM instead of killing
+```
+
+### Certificate Security
+
+- **Private key protection**: `privkey.pem` set to `600` (owner read/write only)
+- **Directory isolation**: Certificate directory (`/opt/derper/certs`) set to `750` with `derper:derper` ownership
+- **SHA256 verification**: Go toolchain downloads are integrity-checked before extraction
+
+### Network Security
+
+- **Client verification**: `-verify-clients` enabled by default (requires local tailscaled authentication)
+- **Firewall guidance**: Script provides instructions for UFW, firewalld, and iptables
+- **Port restriction**: Only opens necessary ports (DERP TLS + STUN UDP)
+
+### Additional Recommendations
+
+For production deployments, consider:
+
+1. **Use trusted CA certificates** instead of self-signed (via Let's Encrypt/ACME or your organization's CA)
+2. **Deploy on port 443** for better firewall traversal: `--derp-port 443`
+3. **Enable automatic updates** for derper binary and system packages
+4. **Monitor with Prometheus**: Use `--health-check --metrics-textfile` for alerting
+5. **Regular certificate rotation**: Current validity is 365 days by default
+
+---
+
 ## Common Verification Commands
 
 ```bash
@@ -301,6 +403,47 @@ tailscale netcheck
 # Check if "via DERP(my-derp)"
 tailscale ping -c 5 <peer-tailscale-ip>
 ```
+
+---
+
+## Firewall Configuration (Multi-platform)
+
+The script automatically detects and provides instructions for your firewall solution:
+
+### UFW (Ubuntu/Debian)
+
+```bash
+# Manual execution
+ufw allow 30399/tcp
+ufw allow 3478/udp
+
+# Or use --auto-ufw flag for automatic configuration
+sudo bash scripts/deploy_derper_ip_selfsigned.sh --ip <your-public-ip> --auto-ufw
+```
+
+### firewalld (RHEL/CentOS/Fedora)
+
+```bash
+firewall-cmd --permanent --add-port=30399/tcp
+firewall-cmd --permanent --add-port=3478/udp
+firewall-cmd --reload
+```
+
+### iptables (Direct rules)
+
+```bash
+# Add rules
+iptables -I INPUT -p tcp --dport 30399 -j ACCEPT
+iptables -I INPUT -p udp --dport 3478 -j ACCEPT
+
+# Save rules (Debian/Ubuntu with netfilter-persistent)
+netfilter-persistent save
+
+# Or save rules (RHEL/CentOS with iptables-services)
+service iptables save
+```
+
+**Note**: Don't forget to also open these ports in your cloud provider's security groups (AWS, Alibaba Cloud, etc.).
 
 ---
 

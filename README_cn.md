@@ -92,6 +92,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh --ip <你的公网IP> --check
 
 3) 运行部署脚本（正式安装/修复；国内网络示例，默认开启 `-verify-clients`）
 
+**默认：创建专用 `derper` 用户（最安全）**
 ```bash
 sudo bash scripts/deploy_derper_ip_selfsigned.sh \
   --ip <你的公网IP> \
@@ -99,6 +100,23 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
   --goproxy https://goproxy.cn,direct \
   --gosumdb sum.golang.google.cn \
   --gotoolchain auto
+```
+
+**备选：使用当前用户（更简单，无需创建用户）**
+```bash
+sudo bash scripts/deploy_derper_ip_selfsigned.sh \
+  --ip <你的公网IP> \
+  --use-current-user \
+  --derp-port 30399 --stun-port 3478 --auto-ufw
+```
+
+**进阶：指定其他用户**
+```bash
+# 使用已有系统用户（如 nobody、www-data）
+sudo bash scripts/deploy_derper_ip_selfsigned.sh \
+  --ip <你的公网IP> \
+  --user nobody \
+  --derp-port 30399
 ```
 
 执行完成后脚本会（已做成幂等，已就绪则直接跳过；依赖“按需安装”，若都已具备则不会访问包仓库）：
@@ -166,6 +184,10 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
   - 任一为 0：重新运行脚本（或 `--repair`）以重签证书；若 IP 有变化需确保 `--ip` 指向新 IP；缺少 openssl 请先安装。
 - 客户端校验模式
   - on：启用 `-verify-clients`，要求本机 tailscaled 已登录（推荐）。如仅测试可 `--no-verify-clients` 暂时跳过（不建议长期）。
+- 运行用户（服务执行的用户与组）
+  - 显示将以哪个用户/组运行 derper 服务（如 `derper（组：derper）`）
+  - 默认为专用 `derper` 用户；可通过 `--user` 或 `--use-current-user` 自定义
+  - 若用户尚未创建，组名显示为用户名占位符
 - 关键可执行检查
   - 缺少项（如 curl/openssl/git/go）：正式安装会按需补齐；离线/受限网络下请先用包管理器安装。
 - 服务管理器
@@ -200,6 +222,12 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 --no-verify-clients       关闭客户端校验（默认不开启此项；仅测试）
 --force-verify-clients    强制开启客户端校验（默认行为）
+--region-id               ACL derpMap 的 RegionID（默认 900）
+--region-code             ACL derpMap 的 RegionCode（默认 my-derp）
+--region-name             ACL derpMap 的 RegionName（默认 "My IP DERP"）
+--user <username>         指定运行 derper 的用户（默认 derper，自动创建）
+                          可指定现有用户（如 nobody、www-data 等）
+--use-current-user        使用当前登录用户运行 derper（等价于 --user $USER）
 --check / --dry-run       仅进行状态与参数检查，不执行安装/写服务/放行等
 --repair                  仅修复/重写配置（systemd/证书等），不重装 derper
 --force                   强制全量重装（重装 derper、重签证书、重写服务）
@@ -279,6 +307,80 @@ openssl x509 -in /opt/derper/certs/fullchain.pem -outform DER | sha256sum | awk 
 
 ---
 
+## 安全最佳实践
+
+脚本默认实施了多项安全加固措施：
+
+### 灵活的用户配置
+
+**你可以选择谁来运行 derper** - 脚本支持三种模式：
+
+1. **专用 `derper` 用户（默认，最安全）**
+   - 自动创建系统用户，无登录 shell，无家目录
+   - 最小权限，与其他系统活动隔离
+   - 生产环境最佳实践
+
+2. **当前用户（`--use-current-user`）**
+   - 部署更简单，无需创建用户
+   - 适合测试或个人服务器
+   - 仍然通过 systemd 加固保持安全（见下文）
+
+3. **指定用户（`--user <username>`）**
+   - 使用已有系统用户，如 `nobody`、`www-data` 等
+   - 灵活集成到现有环境
+
+**技术细节：**
+- **端口 ≥ 1024（默认 30399）**：任何非 root 用户都可以运行 derper，无需特殊能力
+- **端口 < 1024（如 443）**：脚本自动通过 systemd 授予 `CAP_NET_BIND_SERVICE` 能力，无论选择哪个用户
+- **跨发行版兼容**：自动检测 `nologin` 路径（RHEL/CentOS 使用 `/sbin/nologin`，Debian/Ubuntu 使用 `/usr/sbin/nologin`，兜底使用 `/bin/false`）
+- **健壮的用户创建**：创建前后强校验用户/组是否存在，失败时给出明确错误信息
+
+### systemd 安全加固
+
+生成的 systemd 服务包含多层保护：
+
+```ini
+# 防止权限提升
+NoNewPrivileges=true
+
+# 文件系统保护
+ProtectSystem=strict        # /usr, /boot, /efi 只读
+ProtectHome=true            # /home, /root, /run/user 不可访问
+PrivateTmp=true             # 私有 /tmp 和 /var/tmp
+ReadWritePaths=/opt/derper  # 仅允许写入安装目录
+
+# 网络限制
+RestrictAddressFamilies=AF_INET AF_INET6  # 仅 IPv4/IPv6
+
+# 系统调用过滤
+SystemCallFilter=@system-service  # 仅白名单安全系统调用
+SystemCallErrorNumber=EPERM       # 拒绝返回 EPERM 而非杀死进程
+```
+
+### 证书安全
+
+- **私钥保护**：`privkey.pem` 设置为 `600`（仅所有者读写）
+- **目录隔离**：证书目录（`/opt/derper/certs`）设置为 `750`，所有权为 `derper:derper`
+- **SHA256 校验**：Go 工具链下载前进行完整性检查
+
+### 网络安全
+
+- **客户端验证**：默认启用 `-verify-clients`（需要本地 tailscaled 认证）
+- **防火墙指导**：脚本提供 UFW、firewalld 和 iptables 的配置说明
+- **端口限制**：仅开放必要端口（DERP TLS + STUN UDP）
+
+### 额外建议
+
+生产环境部署建议：
+
+1. **使用受信任的 CA 证书**而非自签证书（通过 Let's Encrypt/ACME 或组织 CA）
+2. **部署在 443 端口**以获得更好的防火墙穿透性：`--derp-port 443`
+3. **启用自动更新**：derper 二进制和系统包
+4. **使用 Prometheus 监控**：使用 `--health-check --metrics-textfile` 进行告警
+5. **定期证书轮换**：当前默认有效期为 365 天
+
+---
+
 ## 常用验证命令
 
 ```bash
@@ -301,6 +403,47 @@ tailscale netcheck
 # 观察是否“经由 DERP(my-derp)”
 tailscale ping -c 5 <对端 Tailscale IP>
 ```
+
+---
+
+## 防火墙配置（多平台支持）
+
+脚本会自动检测并提供适合你的防火墙解决方案的指令：
+
+### UFW (Ubuntu/Debian)
+
+```bash
+# 手动执行
+ufw allow 30399/tcp
+ufw allow 3478/udp
+
+# 或使用 --auto-ufw 参数自动配置
+sudo bash scripts/deploy_derper_ip_selfsigned.sh --ip <你的公网IP> --auto-ufw
+```
+
+### firewalld (RHEL/CentOS/Fedora)
+
+```bash
+firewall-cmd --permanent --add-port=30399/tcp
+firewall-cmd --permanent --add-port=3478/udp
+firewall-cmd --reload
+```
+
+### iptables (直接规则)
+
+```bash
+# 添加规则
+iptables -I INPUT -p tcp --dport 30399 -j ACCEPT
+iptables -I INPUT -p udp --dport 3478 -j ACCEPT
+
+# 保存规则（Debian/Ubuntu 使用 netfilter-persistent）
+netfilter-persistent save
+
+# 或保存规则（RHEL/CentOS 使用 iptables-services）
+service iptables save
+```
+
+**注意**：别忘了同时在云服务商的安全组中开放这些端口（阿里云、腾讯云、AWS 等）。
 
 ---
 

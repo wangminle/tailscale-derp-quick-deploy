@@ -27,6 +27,15 @@ GOTOOLCHAIN_ARG="auto"         # auto|local（默认 auto 以满足 >=1.25）
 # 客户端校验：on=强制启用；off=禁用（默认 on）
 VERIFY_CLIENTS_MODE="on"
 
+# ACL Region 配置（可自定义）
+REGION_ID="900"
+REGION_CODE="my-derp"
+REGION_NAME="My IP DERP"
+
+# 运行用户配置（可自定义）
+RUN_USER="derper"        # 默认创建专用 derper 用户（安全最佳实践）
+USE_CURRENT_USER=0       # 是否使用当前用户
+
 IP_ADDR=""
 AUTO_UFW=0               # 是否自动放行 UFW
 DRY_RUN=0                # 只做检查，不执行安装/写入
@@ -46,6 +55,8 @@ usage() {
 用法：sudo bash $0 [--ip 公网IP] [--derp-port 30399] [--stun-port 3478] [--cert-days 365] [--auto-ufw]
                [--goproxy URL] [--gosumdb VALUE] [--gotoolchain auto|local]
                [--no-verify-clients | --force-verify-clients]
+               [--region-id 900] [--region-code my-derp] [--region-name "My IP DERP"]
+               [--user <username> | --use-current-user]
                [--check | --dry-run] [--repair] [--force]
                [--health-check [--metrics-textfile 路径]]
                [--uninstall [--purge | --purge-all]]
@@ -61,6 +72,12 @@ usage() {
   --gotoolchain MODE      go 工具链策略，默认 auto 以便自动获取 >=1.25 的工具链。
   --no-verify-clients     不验证客户端身份（仅测试，默认并不推荐）。
   --force-verify-clients  强制启用客户端校验（默认行为）。
+  --region-id             ACL derpMap 的 RegionID（默认 900）。
+  --region-code           ACL derpMap 的 RegionCode（默认 my-derp）。
+  --region-name           ACL derpMap 的 RegionName（默认 "My IP DERP"）。
+  --user <username>       指定运行 derper 的用户（默认 derper，会自动创建）。
+                          可指定现有用户（如 nobody、www-data 等）。
+  --use-current-user      使用当前登录用户运行 derper（等价于 --user \$USER）。
   --check, --dry-run      仅进行状态与参数检查，不执行安装/写服务/放行端口等操作。
   --repair                仅修复/重写配置（systemd/证书等），不中断可用的依赖；不重装 derper。
   --force                 强制全量重装（重新安装 derper、重签证书、重写服务）。
@@ -243,6 +260,22 @@ parse_args() {
       --force-verify-clients)
         VERIFY_CLIENTS_MODE="on"
         shift 1;;
+      --region-id)
+        REGION_ID=${2:-}
+        shift 2;;
+      --region-code)
+        REGION_CODE=${2:-}
+        shift 2;;
+      --region-name)
+        REGION_NAME=${2:-}
+        shift 2;;
+      --user)
+        RUN_USER=${2:-}
+        shift 2;;
+      --use-current-user)
+        USE_CURRENT_USER=1
+        RUN_USER="${SUDO_USER:-$USER}"
+        shift 1;;
       --check)
         DRY_RUN=1; CHECK_ONLY=1
         shift 1;;
@@ -387,11 +420,14 @@ detect_public_ip() {
   # 自动探测公网 IP（失败则需 --ip 指定）
   if [[ -z "${IP_ADDR}" ]]; then
     echo "[信息] 正在尝试自动探测公网 IP…"
-    local IP1 IP2 IP3
-    IP1=$(curl -fsS https://1.1.1.1/cdn-cgi/trace | awk -F= '/^ip=/{print $2}' || true)
-    IP2=$(dig -4 +short myip.opendns.com @resolver1.opendns.com || true)
-    IP3=$(curl -fsS https://api.ipify.org || true)
-    IP_ADDR=${IP1:-${IP2:-${IP3:-}}}
+    local IP1 IP2 IP3 IP4 IP5
+    # 强制 IPv4 + 超时，避免卡住或返回 IPv6
+    IP1=$(curl -4 --connect-timeout 3 --max-time 5 -fsS https://1.1.1.1/cdn-cgi/trace 2>/dev/null | awk -F= '/^ip=/{print $2}' || true)
+    IP2=$(dig -4 +short +time=3 +tries=1 myip.opendns.com @resolver1.opendns.com 2>/dev/null || true)
+    IP3=$(curl -4 --connect-timeout 3 --max-time 5 -fsS https://api.ipify.org 2>/dev/null || true)
+    IP4=$(curl -4 --connect-timeout 3 --max-time 5 -fsS https://ifconfig.co 2>/dev/null || true)
+    IP5=$(curl -4 --connect-timeout 3 --max-time 5 -fsS https://icanhazip.com 2>/dev/null || true)
+    IP_ADDR=${IP1:-${IP2:-${IP3:-${IP4:-${IP5:-}}}}}
   fi
   if [[ -z "${IP_ADDR}" ]]; then
     echo "[错误] 无法自动探测公网 IP，请使用 --ip 明确指定。" >&2
@@ -550,16 +586,35 @@ install_deps() {
   fi
 
   echo "[步骤] 按需安装依赖：${need_pkgs[*]} …"
+  local install_failed=0
   if command -v apt >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive apt update -y || true
-    DEBIAN_FRONTEND=noninteractive apt install -y "${need_pkgs[@]}" || true
+    if ! DEBIAN_FRONTEND=noninteractive apt update -y 2>/tmp/apt_update.err; then
+      echo "[警告] apt update 失败，可能影响依赖安装" >&2
+      sed -n '1,20p' /tmp/apt_update.err >&2 || true
+    fi
+    if ! DEBIAN_FRONTEND=noninteractive apt install -y "${need_pkgs[@]}" 2>/tmp/apt_install.err; then
+      install_failed=1
+    fi
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y "${need_pkgs[@]}" || true
+    if ! dnf install -y "${need_pkgs[@]}" 2>/tmp/dnf_install.err; then
+      install_failed=1
+    fi
   elif command -v yum >/dev/null 2>&1; then
-    yum install -y "${need_pkgs[@]}" || true
+    if ! yum install -y "${need_pkgs[@]}" 2>/tmp/yum_install.err; then
+      install_failed=1
+    fi
   else
-    echo "[提示] 未检测到常见包管理器，请手工安装：${need_pkgs[*]}。"
+    echo "[警告] 未检测到常见包管理器（apt/dnf/yum），请手动安装以下依赖：" >&2
+    echo "  ${need_pkgs[*]}" >&2
+    install_failed=1
   fi
+  
+  if [[ $install_failed -eq 1 ]]; then
+    echo "[警告] 依赖安装可能失败，缺少的包：${need_pkgs[*]}" >&2
+    echo "  请手动安装后重新运行脚本，或检查网络/软件源配置。" >&2
+    # 不中止，继续尝试（某些依赖非强制）
+  fi
+  
   update-ca-certificates >/dev/null 2>&1 || true
 }
 
@@ -582,11 +637,17 @@ ensure_go() {
     return 0
   fi
   # 兜底：按架构安装官方二进制（最新稳定工具链可再由 GOTOOLCHAIN 自动拉取）。
-  local arch os url tarball gov
+  local arch os url tarball gov sha256_expected
   os="linux"
   case "$(uname -m)" in
-    x86_64|amd64) arch="amd64" ;;
-    aarch64|arm64) arch="arm64" ;;
+    x86_64|amd64) 
+      arch="amd64"
+      sha256_expected="999805bed7d9039ec3da1a53bfbcafc13e367da52aa823cb60b68ba22d44c616"
+      ;;
+    aarch64|arm64) 
+      arch="arm64"
+      sha256_expected="c15fa895341b8eaf7f219fada25c36a610eb042985dc1a912410c1c90098eaf2"
+      ;;
     *) echo "[错误] 未支持的架构 $(uname -m)，请自行安装 Go >= 1.21" >&2; exit 1;;
   esac
   gov="1.22.6"
@@ -595,6 +656,29 @@ ensure_go() {
   command -v curl >/dev/null 2>&1 || install_deps
   echo "[步骤] 下载安装 Go ${gov} (${arch}) 作为基础工具链…"
   curl -fsSL "$url" -o "$tarball"
+  
+  # SHA256 完整性校验
+  echo "[步骤] 校验 Go tarball 完整性（SHA256）…"
+  local sha256_actual
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256_actual=$(sha256sum "$tarball" | awk '{print $1}')
+  elif command -v shasum >/dev/null 2>&1; then
+    sha256_actual=$(shasum -a 256 "$tarball" | awk '{print $1}')
+  else
+    echo "[警告] 未找到 sha256sum/shasum，跳过完整性校验（不推荐）" >&2
+    sha256_actual="$sha256_expected"  # 跳过校验
+  fi
+  
+  if [[ "$sha256_actual" != "$sha256_expected" ]]; then
+    echo "[错误] Go tarball SHA256 校验失败：" >&2
+    echo "  期望：$sha256_expected" >&2
+    echo "  实际：$sha256_actual" >&2
+    echo "  文件可能被篡改或下载不完整，已中止安装。" >&2
+    rm -f "$tarball"
+    exit 1
+  fi
+  echo "[信息] SHA256 校验通过"
+  
   rm -rf /usr/local/go
   tar -C /usr/local -xzf "$tarball"
   mkdir -p /etc/profile.d
@@ -703,6 +787,13 @@ CONF
   ln -sf fullchain.pem "${INSTALL_DIR}/certs/cert.pem"
   ln -sf privkey.pem  "${INSTALL_DIR}/certs/key.pem"
 
+  # 加固证书目录与私钥权限
+  chmod 750 "${INSTALL_DIR}/certs"
+  chmod 600 "${INSTALL_DIR}/certs/privkey.pem"
+  chmod 644 "${INSTALL_DIR}/certs/fullchain.pem"
+  
+  # 注意：证书目录权限由 setup_service_user() 统一设置，避免重复
+
   echo "[信息] 证书文件生成于：${INSTALL_DIR}/certs/{fullchain.pem,privkey.pem}"
 }
 
@@ -745,9 +836,89 @@ live_cert_sha256_raw() {
 
 journal_certname_raw() {
   # 从 systemd 日志中提取 derper 打印的 CertName（若可用）
-  if command -v journalctl >/dev/null 2>&1; then
-    journalctl -u derper -n 200 --no-pager 2>/dev/null \
-      | grep -oE 'sha256-raw:[0-9a-f]+' | tail -n1 | sed 's/^sha256-raw://'
+  command -v journalctl >/dev/null 2>&1 || return 1
+  local fp
+  fp=$(journalctl -u derper -n 200 --no-pager 2>/dev/null \
+       | grep -oE 'sha256-raw:[0-9a-f]+' 2>/dev/null | tail -n1 | sed 's/^sha256-raw://' || true)
+  [[ -n "$fp" ]] && echo "$fp" || return 1
+}
+
+setup_service_user() {
+  # 智能设置服务运行用户：创建新用户或使用现有用户
+  
+  # 检查是否为 root
+  if [[ "$RUN_USER" == "root" ]]; then
+    echo "[警告] 不推荐以 root 用户运行 derper 服务" >&2
+    echo "  建议使用 --user 指定非 root 用户，或使用默认的 derper 用户" >&2
+  fi
+  
+  # 检查用户是否已存在
+  if id "$RUN_USER" >/dev/null 2>&1; then
+    echo "[信息] 将使用现有用户运行 derper：$RUN_USER"
+    
+    # 设置证书目录权限
+    if [[ -d "${INSTALL_DIR}/certs" ]]; then
+      local user_group
+      user_group=$(id -g -n "$RUN_USER" 2>/dev/null || echo "$RUN_USER")
+      chown -R "$RUN_USER":"$user_group" "${INSTALL_DIR}/certs" || {
+        echo "[警告] 无法设置证书目录所有权（用户：$RUN_USER, 组：$user_group）" >&2
+        echo "  服务可能无法访问证书文件，建议手动执行：" >&2
+        echo "    chown -R $RUN_USER:$user_group ${INSTALL_DIR}/certs" >&2
+      }
+    fi
+    return 0
+  fi
+  
+  # 用户不存在，尝试创建
+  echo "[步骤] 创建系统用户：$RUN_USER …"
+  
+  # 动态发现 nologin 路径（兼容多种发行版）
+  local nologin_path
+  if command -v nologin >/dev/null 2>&1; then
+    nologin_path=$(command -v nologin)
+  elif [[ -x /sbin/nologin ]]; then
+    nologin_path="/sbin/nologin"
+  elif [[ -x /usr/sbin/nologin ]]; then
+    nologin_path="/usr/sbin/nologin"
+  else
+    nologin_path="/bin/false"
+  fi
+  
+  # 确保用户组存在（某些系统不会自动创建同名组）
+  if ! getent group "$RUN_USER" >/dev/null 2>&1; then
+    groupadd -r "$RUN_USER" 2>/dev/null || true
+  fi
+  
+  # 创建系统用户（-r 系统用户，-M 不创建家目录，-g 指定组，-s 指定 shell）
+  if useradd -r -M -g "$RUN_USER" -s "$nologin_path" "$RUN_USER" 2>/dev/null; then
+    echo "[信息] 用户 $RUN_USER 创建成功（shell: $nologin_path）"
+  else
+    # 回退：尝试不指定组（让系统自动处理）
+    if useradd --system --no-create-home --shell "$nologin_path" "$RUN_USER" 2>/dev/null; then
+      echo "[信息] 用户 $RUN_USER 创建成功（回退方案）"
+    else
+      echo "[错误] 无法创建系统用户：$RUN_USER" >&2
+      echo "  请手动创建后重试，或使用现有用户（--user <existing-user>）。" >&2
+      echo "  手动创建命令示例：" >&2
+      echo "    groupadd -r $RUN_USER" >&2
+      echo "    useradd -r -M -g $RUN_USER -s $nologin_path $RUN_USER" >&2
+      exit 1
+    fi
+  fi
+  
+  # 强校验：确认用户已成功创建
+  if ! id "$RUN_USER" >/dev/null 2>&1; then
+    echo "[错误] 用户 $RUN_USER 创建失败（校验未通过）" >&2
+    exit 1
+  fi
+  
+  # 设置证书目录权限
+  if [[ -d "${INSTALL_DIR}/certs" ]]; then
+    local user_group
+    user_group=$(id -g -n "$RUN_USER" 2>/dev/null || echo "$RUN_USER")
+    chown -R "$RUN_USER":"$user_group" "${INSTALL_DIR}/certs" || {
+      echo "[警告] 无法设置证书目录所有权，服务启动时可能失败" >&2
+    }
   fi
 }
 
@@ -800,6 +971,13 @@ EOT
     exit 1
   fi
 
+  # 设置服务运行用户
+  setup_service_user
+  
+  # 获取用户的组名
+  local run_group
+  run_group=$(id -g -n "$RUN_USER" 2>/dev/null || echo "$RUN_USER")
+
   cat >"${SERVICE_PATH}" <<SERVICE
 [Unit]
 Description=Tailscale DERP (derper) with self-signed IP cert
@@ -808,7 +986,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=root
+User=${RUN_USER}
+Group=${run_group}
 ExecStart=${BIN_PATH} \\
   -hostname ${IP_ADDR} \\
   -certmode manual \\
@@ -820,8 +999,18 @@ ExecStart=${BIN_PATH} \\
 Restart=on-failure
 RestartSec=2
 LimitNOFILE=65535
+
+# 安全加固
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+ReadWritePaths=${INSTALL_DIR}
 
 [Install]
 WantedBy=multi-user.target
@@ -836,6 +1025,8 @@ print_firewall_tips() {
   echo "[步骤] 端口放行提示（请确保云厂商安全组也已放行）："
   echo "  - 必需：${DERP_PORT}/tcp（DERP TLS），${STUN_PORT}/udp（STUN）"
   echo "  - 可选：80/tcp（仅当使用 ACME 自动签发时；本脚本为自签证书，无需）"
+  
+  # UFW
   if command -v ufw >/dev/null 2>&1; then
     if [[ "${AUTO_UFW}" -eq 1 ]]; then
       echo "[信息] 自动放行 UFW 端口规则…"
@@ -846,6 +1037,25 @@ print_firewall_tips() {
       echo "  ufw allow ${DERP_PORT}/tcp"
       echo "  ufw allow ${STUN_PORT}/udp"
     fi
+  fi
+  
+  # firewalld
+  if command -v firewall-cmd >/dev/null 2>&1; then
+    echo "[信息] 检测到 firewalld，可手动执行："
+    echo "  firewall-cmd --permanent --add-port=${DERP_PORT}/tcp"
+    echo "  firewall-cmd --permanent --add-port=${STUN_PORT}/udp"
+    echo "  firewall-cmd --reload"
+  fi
+  
+  # iptables（仅提示，不自动执行）
+  if command -v iptables >/dev/null 2>&1 && ! command -v ufw >/dev/null 2>&1 && ! command -v firewall-cmd >/dev/null 2>&1; then
+    echo "[信息] 未检测到 UFW/firewalld，若使用 iptables 可手动执行："
+    echo "  iptables -I INPUT -p tcp --dport ${DERP_PORT} -j ACCEPT"
+    echo "  iptables -I INPUT -p udp --dport ${STUN_PORT} -j ACCEPT"
+    echo "  # 保存规则（Debian/Ubuntu）："
+    echo "  netfilter-persistent save"
+    echo "  # 或（RHEL/CentOS）："
+    echo "  service iptables save"
   fi
 }
 
@@ -907,21 +1117,21 @@ check_port_conflicts() {
 }
 
 print_acl_snippet_cert() {
-  local ip="$1" port="$2" fp="$3" region_id="900"
+  local ip="$1" port="$2" fp="$3"
   cat <<JSON
 ==================== 推荐粘贴到 Tailscale 管理后台（Access Controls）的 derpMap 片段（使用 CertName 更安全） ====================
 {
   "derpMap": {
     "OmitDefaultRegions": false,
     "Regions": {
-      "${region_id}": {
-        "RegionID": ${region_id},
-        "RegionCode": "my-derp",
-        "RegionName": "My IP DERP",
+      "${REGION_ID}": {
+        "RegionID": ${REGION_ID},
+        "RegionCode": "${REGION_CODE}",
+        "RegionName": "${REGION_NAME}",
         "Nodes": [
           {
-            "Name": "${region_id}a",
-            "RegionID": ${region_id},
+            "Name": "${REGION_ID}a",
+            "RegionID": ${REGION_ID},
             "HostName": "${ip}",
             "DERPPort": ${port},
             "CertName": "sha256-raw:${fp}"
@@ -996,6 +1206,14 @@ EOF
 
 # 健康检查摘要（适合 cron 调用）
 health_check_report() {
+  # 检查关键依赖工具
+  local missing_tools=()
+  command -v timeout >/dev/null 2>&1 || missing_tools+=(timeout)
+  command -v openssl >/dev/null 2>&1 || missing_tools+=(openssl)
+  if [[ ${#missing_tools[@]} -gt 0 ]]; then
+    echo "[提示] 健康检查建议安装以下工具以获得完整功能：${missing_tools[*]}" >&2
+  fi
+  
   detect_public_ip || true
   validate_settings || true
   check_tailscale_status
@@ -1093,6 +1311,16 @@ write_prometheus_metrics() {
 uninstall_derper() {
   require_root
   echo "[步骤] 停止并卸载 derper systemd 服务…"
+
+  # 在移除单元前尽力识别当前服务运行用户
+  local svc_user=""
+  if command -v systemctl >/dev/null 2>&1; then
+    svc_user=$(systemctl cat derper 2>/dev/null | awk -F= '/^[[:space:]]*User=/{print $2}' | tail -n1 || true)
+  fi
+  if [[ -z "$svc_user" && -f "${SERVICE_PATH}" ]]; then
+    svc_user=$(awk -F= '/^[[:space:]]*User=/{print $2}' "${SERVICE_PATH}" | tail -n1 || true)
+  fi
+
   if command -v systemctl >/dev/null 2>&1; then
     systemctl disable --now derper 2>/dev/null || true
   fi
@@ -1112,6 +1340,13 @@ uninstall_derper() {
     if [[ -x "${BIN_PATH}" ]]; then
       echo "[步骤] 删除 derper 二进制：${BIN_PATH} …"
       rm -f "${BIN_PATH}" || true
+    fi
+    # 根据已识别的服务用户给出更准确的清理提示
+    if [[ -n "$svc_user" && "$svc_user" != "root" ]]; then
+      echo "[提示] 检测到服务运行用户：${svc_user}。如需删除该账户，可执行："
+      echo "  userdel ${svc_user}"
+    else
+      echo "[提示] 未能识别非 root 的服务运行用户；如需删除账户请手动确认后执行 userdel。"
     fi
   fi
   echo "完成：已卸载 derper 服务。"
@@ -1158,6 +1393,10 @@ main() {
     echo "- 纯 IP 配置判定（基于 unit）：${PURE_IP_OK}"
     echo "- 证书：存在=${CERT_PRESENT} SAN匹配IP=${CERT_SAN_MATCH} 30天内不过期=${CERT_EXPIRY_OK}"
     echo "- 客户端校验模式：${VERIFY_CLIENTS_MODE}"
+    # 展示将要使用的运行用户与组（若用户尚未创建则组名以用户名代替）
+    local chk_group
+    chk_group=$(id -g -n "$RUN_USER" 2>/dev/null || echo "$RUN_USER")
+    echo "- 运行用户：${RUN_USER}（组：${chk_group}）"
 
     local suggest="--repair"
     if [[ $DERPER_BIN -eq 1 && $DERPER_SERVICE_PRESENT -eq 1 && $DERPER_RUNNING -eq 1 && $PURE_IP_OK -eq 1 && $PORT_TLS_OK -eq 1 && $PORT_STUN_OK -eq 1 && $CERT_PRESENT -eq 1 && $CERT_SAN_MATCH -eq 1 && $CERT_EXPIRY_OK -eq 1 ]]; then
