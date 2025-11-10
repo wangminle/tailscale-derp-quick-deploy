@@ -33,8 +33,12 @@ REGION_CODE="my-derp"
 REGION_NAME="My IP DERP"
 
 # 运行用户配置（可自定义）
-RUN_USER="derper"        # 默认创建专用 derper 用户（安全最佳实践）
-USE_CURRENT_USER=0       # 是否使用当前用户
+RUN_USER="${SUDO_USER:-$USER}"  # 默认使用当前用户（个人环境友好）
+USE_CURRENT_USER=1       # 默认使用当前用户
+CREATE_DEDICATED_USER=0  # 是否强制创建专用用户
+RELAX_SOCKET_PERMS=0     # 是否允许放宽 socket 权限（不推荐）
+NON_INTERACTIVE=0        # 非交互模式（CI/自动化）
+SECURITY_LEVEL="standard" # 安全加固级别：basic|standard|paranoid
 
 IP_ADDR=""
 AUTO_UFW=0               # 是否自动放行 UFW
@@ -52,7 +56,12 @@ METRICS_TEXTFILE=""      # 将健康检查指标写为 Prometheus textfile（供
 
 usage() {
   cat <<EOF
-用法：sudo bash $0 [--ip 公网IP] [--derp-port 30399] [--stun-port 3478] [--cert-days 365] [--auto-ufw]
+用法：sudo bash $0 [选项]
+或者：sudo bash $0 wizard  (启动交互式配置向导)
+
+选项列表：
+用法（向导模式）：sudo bash $0 wizard  [启动交互式配置向导]
+用法（命令模式）：sudo bash $0 [--ip 公网IP] [--derp-port 30399] [--stun-port 3478] [--cert-days 365] [--auto-ufw]
                [--goproxy URL] [--gosumdb VALUE] [--gotoolchain auto|local]
                [--no-verify-clients | --force-verify-clients]
                [--region-id 900] [--region-code my-derp] [--region-name "My IP DERP"]
@@ -75,9 +84,13 @@ usage() {
   --region-id             ACL derpMap 的 RegionID（默认 900）。
   --region-code           ACL derpMap 的 RegionCode（默认 my-derp）。
   --region-name           ACL derpMap 的 RegionName（默认 "My IP DERP"）。
-  --user <username>       指定运行 derper 的用户（默认 derper，会自动创建）。
+  --user <username>       指定运行 derper 的用户（默认：当前登录用户）。
                           可指定现有用户（如 nobody、www-data 等）。
-  --use-current-user      使用当前登录用户运行 derper（等价于 --user \$USER）。
+  --use-current-user      使用当前登录用户运行 derper（等价于 --user \$USER，默认行为）。
+  --dedicated-user        强制创建专用 derper 系统账户（生产环境推荐）。
+  --security-level LEVEL  安全加固级别：basic|standard|paranoid（默认 standard）。
+  --relax-socket-perms    允许临时放宽 tailscaled socket 权限到 0666（不推荐，仅紧急情况）。
+  --yes, --non-interactive 非交互模式，自动确认所有选择（适合 CI/自动化脚本）。
   --check, --dry-run      仅进行状态与参数检查，不执行安装/写服务/放行端口等操作。
   --repair                仅修复/重写配置（systemd/证书等），不中断可用的依赖；不重装 derper。
   --force                 强制全量重装（重新安装 derper、重签证书、重写服务）。
@@ -274,7 +287,22 @@ parse_args() {
         shift 2;;
       --use-current-user)
         USE_CURRENT_USER=1
+        CREATE_DEDICATED_USER=0
         RUN_USER="${SUDO_USER:-$USER}"
+        shift 1;;
+      --dedicated-user)
+        CREATE_DEDICATED_USER=1
+        USE_CURRENT_USER=0
+        RUN_USER="derper"
+        shift 1;;
+      --security-level)
+        SECURITY_LEVEL=${2:-standard}
+        shift 2;;
+      --relax-socket-perms)
+        RELAX_SOCKET_PERMS=1
+        shift 1;;
+      --yes|--non-interactive)
+        NON_INTERACTIVE=1
         shift 1;;
       --check)
         DRY_RUN=1; CHECK_ONLY=1
@@ -409,11 +437,18 @@ validate_settings() {
     echo "[错误] --cert-days 必须为正整数，当前：${CERT_DAYS}" >&2
     exit 1
   fi
-  # IPv4 基础校验（允许本地自动探测后的结果不严格匹配 RFC，尽量宽松）
+  # IPv4 合法性校验：格式 + 每段范围 0-255
   if ! [[ "${IP_ADDR}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
     echo "[错误] 公网 IP 不合法：${IP_ADDR}" >&2
     exit 1
   fi
+  IFS='.' read -r o1 o2 o3 o4 <<< "${IP_ADDR}"
+  for _oct in "$o1" "$o2" "$o3" "$o4"; do
+    if ! [[ "$_oct" =~ ^[0-9]+$ ]] || (( _oct < 0 || _oct > 255 )); then
+      echo "[错误] 公网 IP 字段超出范围（0-255）：${IP_ADDR}" >&2
+      exit 1
+    fi
+  done
 }
 
 detect_public_ip() {
@@ -464,6 +499,26 @@ check_tailscale_status() {
   if [[ -S /run/tailscale/tailscaled.sock ]] || [[ -S /var/run/tailscale/tailscaled.sock ]]; then active="active"; fi
   if pgrep -x tailscaled >/dev/null 2>&1; then active="active"; fi
   [[ "$active" == "active" ]] && TS_RUNNING=1 || TS_RUNNING=0
+  
+  # 版本检查提示（非阻断）
+  if [[ "${TS_INSTALLED}" -eq 1 && "${TS_VER_OK}" -eq 0 && -n "${TS_VERSION}" ]]; then
+    cat >&2 <<EOT
+
+[建议] 检测到 Tailscale 版本较旧
+  当前版本：${TS_VERSION}
+  推荐版本：>= ${REQUIRED_TS_VER}
+  
+  虽然不影响基本功能，但建议升级以获得最佳体验和安全性：
+    sudo tailscale update
+  
+  或访问官网手动升级：
+    https://tailscale.com/download
+
+  此提示不会阻止部署，脚本将继续执行...
+
+EOT
+    sleep 2  # 给用户时间看到提示
+  fi
 }
 
 get_derper_unit_path() {
@@ -795,6 +850,57 @@ CONF
   # 注意：证书目录权限由 setup_service_user() 统一设置，避免重复
 
   echo "[信息] 证书文件生成于：${INSTALL_DIR}/certs/{fullchain.pem,privkey.pem}"
+  
+  # 生成 derper 配置文件（新版 derper 要求必须指定 -c 参数）
+  generate_derper_config
+}
+
+generate_derper_config() {
+  echo "[步骤] 生成 derper 配置文件…"
+  
+  # 注意：当使用 -verify-clients 时，derper 需要访问 tailscaled 本地 API
+  # 来获取节点密钥和验证客户端。配置文件留空让 derper 自动处理。
+  # PrivateKeyPath 指的是 derper 自身的节点私钥（非 TLS 证书私钥）。
+  cat >"${INSTALL_DIR}/derper.json" <<CONFIG
+{}
+CONFIG
+  
+  chmod 644 "${INSTALL_DIR}/derper.json"
+  echo "[信息] derper 配置文件生成于：${INSTALL_DIR}/derper.json"
+  
+  # 创建环境变量文件模板（用于敏感配置）
+  local env_file="/etc/derper/derper.env"
+  mkdir -p "$(dirname "$env_file")" 2>/dev/null || true
+  
+  if [[ ! -f "$env_file" ]]; then
+    cat >"$env_file" <<'ENVFILE'
+# DERP 环境变量配置文件
+# 本文件用于存储敏感配置，权限设置为 600
+#
+# 使用说明：
+# - 取消注释并填写需要的配置项
+# - 修改后执行：systemctl restart derper
+
+# Tailscale Auth Key（仅当容器内运行 tailscaled 时需要）
+# TS_AUTHKEY=tskey-auth-xxxxxx
+
+# Headscale 客户端验证 URL（使用 Headscale 时）
+# DERP_VERIFY_CLIENT_URL=https://headscale.example.com/verify
+
+# 自定义本地 API Socket 路径（通常无需设置）
+# TS_LOCAL_API_SOCKET=/var/run/tailscale/tailscaled.sock
+
+# 其他自定义环境变量
+# ...
+ENVFILE
+    
+    chmod 600 "$env_file"
+    chown root:root "$env_file" 2>/dev/null || true
+    echo "[信息] 环境变量模板已创建：$env_file"
+    echo "       如需使用，请编辑该文件并重启服务"
+  else
+    echo "[信息] 环境变量文件已存在：$env_file"
+  fi
 }
 
 # 计算证书 DER 原始字节的 SHA256，用于 ACL 的 CertName（sha256-raw:<hex>）
@@ -856,14 +962,14 @@ setup_service_user() {
   if id "$RUN_USER" >/dev/null 2>&1; then
     echo "[信息] 将使用现有用户运行 derper：$RUN_USER"
     
-    # 设置证书目录权限
-    if [[ -d "${INSTALL_DIR}/certs" ]]; then
+    # 设置整个安装目录的所有权（包括父目录）
+    if [[ -d "${INSTALL_DIR}" ]]; then
       local user_group
       user_group=$(id -g -n "$RUN_USER" 2>/dev/null || echo "$RUN_USER")
-      chown -R "$RUN_USER":"$user_group" "${INSTALL_DIR}/certs" || {
-        echo "[警告] 无法设置证书目录所有权（用户：$RUN_USER, 组：$user_group）" >&2
-        echo "  服务可能无法访问证书文件，建议手动执行：" >&2
-        echo "    chown -R $RUN_USER:$user_group ${INSTALL_DIR}/certs" >&2
+      chown -R "$RUN_USER":"$user_group" "${INSTALL_DIR}" || {
+        echo "[警告] 无法设置安装目录所有权（用户：$RUN_USER, 组：$user_group）" >&2
+        echo "  服务可能无法访问必要文件，建议手动执行：" >&2
+        echo "    chown -R $RUN_USER:$user_group ${INSTALL_DIR}" >&2
       }
     fi
     return 0
@@ -912,12 +1018,13 @@ setup_service_user() {
     exit 1
   fi
   
-  # 设置证书目录权限
-  if [[ -d "${INSTALL_DIR}/certs" ]]; then
+  # 设置整个安装目录的所有权（包括父目录和所有子目录）
+  if [[ -d "${INSTALL_DIR}" ]]; then
     local user_group
     user_group=$(id -g -n "$RUN_USER" 2>/dev/null || echo "$RUN_USER")
-    chown -R "$RUN_USER":"$user_group" "${INSTALL_DIR}/certs" || {
-      echo "[警告] 无法设置证书目录所有权，服务启动时可能失败" >&2
+    echo "[步骤] 设置安装目录权限：${INSTALL_DIR}"
+    chown -R "$RUN_USER":"$user_group" "${INSTALL_DIR}" || {
+      echo "[警告] 无法设置安装目录所有权，服务启动时可能失败" >&2
     }
   fi
 }
@@ -950,14 +1057,179 @@ write_systemd_service() {
     on) verify_flag="-verify-clients" ;;
     off) verify_flag="" ;;
   esac
+  
+  # 检测 tailscaled socket 路径和权限（用于 verify-clients）
+  local tailscale_socket_group=""
+  local socket_needs_permission_fix=0
+  local tailscaled_socket_unit_has_override=0
+  local tailscaled_socket_override_group=""
+  local need_add_user_to_tailscale_group=0
+  if [[ "${VERIFY_CLIENTS_MODE}" == "on" ]]; then
+    local socket_path=""
+    if [[ -S /run/tailscale/tailscaled.sock ]]; then
+      socket_path="/run/tailscale/tailscaled.sock"
+    elif [[ -S /var/run/tailscale/tailscaled.sock ]]; then
+      socket_path="/var/run/tailscale/tailscaled.sock"
+    fi
+    
+    if [[ -n "$socket_path" ]]; then
+      # 获取 socket 的所属组和权限
+      tailscale_socket_group=$(stat -c '%G' "$socket_path" 2>/dev/null || true)
+      local socket_perms=$(stat -c '%a' "$socket_path" 2>/dev/null || true)
+      
+      if [[ -n "$tailscale_socket_group" && "$tailscale_socket_group" != "$RUN_USER" ]]; then
+        echo "[步骤] 配置 tailscaled socket 访问权限（当前组：${tailscale_socket_group}，权限：${socket_perms}）"
+
+        # 若当前组为 root，优先尝试创建/使用 tailscale 组，并重启 tailscaled 让本地 API 以 tailscale 组创建
+        if [[ "$tailscale_socket_group" == "root" ]]; then
+          if ! getent group tailscale >/dev/null 2>&1; then
+            echo "[步骤] 创建 tailscale 组（若已存在将跳过）"
+            groupadd -r tailscale 2>/dev/null || true
+          fi
+          if getent group tailscale >/dev/null 2>&1; then
+            echo "[步骤] 重启 tailscaled 尝试应用 tailscale 组到本地 API socket"
+            if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet tailscaled 2>/dev/null; then
+              systemctl restart tailscaled 2>/dev/null || true
+              sleep 1
+              # 重读 socket 组与权限
+              tailscale_socket_group=$(stat -c '%G' "$socket_path" 2>/dev/null || echo "$tailscale_socket_group")
+              socket_perms=$(stat -c '%a' "$socket_path" 2>/dev/null || echo "$socket_perms")
+              echo "[信息] tailscaled 本地 API 刷新后：组=${tailscale_socket_group} 权限=${socket_perms}"
+            fi
+          fi
+        fi
+
+        # 将 derper 用户加入 tailscale 组（若存在）
+        if getent group tailscale >/dev/null 2>&1; then
+          need_add_user_to_tailscale_group=1
+          usermod -a -G tailscale "$RUN_USER" 2>/dev/null || true
+        fi
+        # 优先使用 systemd 覆盖 tailscaled.socket 的组与权限（更安全、持久）
+        if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q '^tailscaled\.socket'; then
+          # 选择一个合适的组：优先 tailscale 组，其次 derper 组
+          if getent group tailscale >/dev/null 2>&1; then
+            tailscaled_socket_override_group="tailscale"
+          else
+            tailscaled_socket_override_group="${RUN_USER}"
+          fi
+          local dropin_dir="/etc/systemd/system/tailscaled.socket.d"
+          local dropin_file="${dropin_dir}/10-derper-localapi.conf"
+          mkdir -p "$dropin_dir" 2>/dev/null || true
+          cat >"$dropin_file" <<EOF
+[Socket]
+SocketGroup=${tailscaled_socket_override_group}
+SocketMode=0660
+EOF
+          if systemctl daemon-reload 2>/dev/null && systemctl restart tailscaled.socket 2>/dev/null; then
+            tailscaled_socket_unit_has_override=1
+            echo "[信息] 已为 tailscaled.socket 应用覆盖：SocketGroup=${tailscaled_socket_override_group} SocketMode=0660"
+            # 同步将 derper 用户加入该组（若为 tailscale 组）
+            if [[ "$tailscaled_socket_override_group" == "tailscale" ]]; then
+              usermod -a -G tailscale "$RUN_USER" 2>/dev/null || true
+            fi
+          else
+            echo "[警告] tailscaled.socket 覆盖应用失败，将回退到临时权限调整或 ACL。" >&2
+          fi
+        fi
+
+        # 若无法持久覆盖，尝试 ACL，失败则报错并提示解决方案
+        if [[ "$tailscaled_socket_unit_has_override" -ne 1 ]]; then
+          local acl_success=0
+          if command -v setfacl >/dev/null 2>&1; then
+            echo "[步骤] 使用 ACL 赋权 $RUN_USER 访问 tailscaled.sock"
+            if setfacl -m "u:${RUN_USER}:rw" "$socket_path" 2>/dev/null; then
+              acl_success=1
+              echo "[信息] ACL 权限设置成功（注意：重启 tailscaled 后需重新设置）"
+            else
+              echo "[警告] ACL 设置失败" >&2
+            fi
+          fi
+          
+          # 如果 systemd drop-in 和 ACL 都失败，检查是否需要报错
+          if [[ "$acl_success" -ne 1 ]]; then
+            if [[ "$tailscale_socket_group" == "root" ]] && [[ "$socket_perms" != "666" && "$socket_perms" != "667" && "$socket_perms" != "676" && "$socket_perms" != "777" ]]; then
+              # 权限不足且没有成功的解决方案
+              if [[ "$RELAX_SOCKET_PERMS" -eq 1 ]]; then
+                echo "[警告] 已启用 --relax-socket-perms，临时放宽 socket 权限到 0666（不推荐，重启 tailscaled 后失效）" >&2
+                chmod 666 "$socket_path" 2>/dev/null || true
+              else
+                # 报错并提供三种合规解决方案
+                cat >&2 <<EOT
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                    ⚠️  tailscaled socket 权限不足                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+[错误] derper 用户 ($RUN_USER) 无法访问 tailscaled 本地 API socket
+
+当前状态：
+  Socket 路径：$socket_path
+  所属组：$tailscale_socket_group
+  权限：$socket_perms
+  运行用户：$RUN_USER
+
+推荐解决方案（按优先级排序）：
+
+方案 1：使用 systemd socket 覆盖（最安全，持久化） ✅
+  已尝试自动配置但未生效，请手动执行：
+    mkdir -p /etc/systemd/system/tailscaled.socket.d
+    cat > /etc/systemd/system/tailscaled.socket.d/10-derper-localapi.conf <<'EOF'
+[Socket]
+SocketGroup=tailscale
+SocketMode=0660
+EOF
+    systemctl daemon-reload
+    systemctl restart tailscaled.socket
+    # 确保 $RUN_USER 在 tailscale 组中
+    usermod -a -G tailscale $RUN_USER
+
+方案 2：使用 ACL（灵活，需 acl 包）
+  已尝试但失败，可能需要安装 acl 包：
+    # Debian/Ubuntu
+    apt-get install acl
+    # RHEL/CentOS
+    yum install acl
+    
+  然后重新运行本脚本
+
+方案 3：使用当前用户运行 derper（简单，适合个人环境）
+  重新执行脚本并使用当前用户：
+    bash $0 --use-current-user [其他参数]
+
+方案 4：临时放宽权限（不推荐，仅紧急情况）
+  如果你了解风险，可添加 --relax-socket-perms 参数：
+    bash $0 --relax-socket-perms [其他参数]
+  注意：该方案在 tailscaled 重启后失效，且存在安全风险
+
+EOT
+                exit 1
+              fi
+            fi
+          fi
+        fi
+      fi
+    else
+      echo "[警告] 未检测到 tailscaled socket，-verify-clients 可能无法正常工作" >&2
+    fi
+  fi
 
   # 非 systemd 环境前置拦截并给出手动运行示例
   if ! command -v systemctl >/dev/null 2>&1; then
+    # 根据配置文件是否为空，决定是否在示例命令中包含 -c 选项
+    local config_flag=""
+    if [[ -f "${INSTALL_DIR}/derper.json" ]]; then
+      local _cfg_trim
+      _cfg_trim=$(tr -d ' \t\r\n' <"${INSTALL_DIR}/derper.json" 2>/dev/null || echo "")
+      if [[ -n "${_cfg_trim}" && "${_cfg_trim}" != "{}" ]]; then
+        config_flag="-c ${INSTALL_DIR}/derper.json"
+      fi
+    fi
     cat >&2 <<EOT
 [阻断] 未检测到 systemd，无法写入服务单元：${SERVICE_PATH}
 
 你可以手动前台运行 derper（示例）：
   ${BIN_PATH} \\
+    ${config_flag} \\
     -hostname ${IP_ADDR} \\
     -certmode manual \\
     -certdir ${INSTALL_DIR}/certs \\
@@ -973,22 +1245,125 @@ EOT
 
   # 设置服务运行用户
   setup_service_user
+  # 若需要，将运行用户加入 tailscale 组（再次执行以确保用户已存在）
+  if [[ "$need_add_user_to_tailscale_group" -eq 1 ]] && getent group tailscale >/dev/null 2>&1; then
+    usermod -a -G tailscale "$RUN_USER" 2>/dev/null || true
+  fi
   
   # 获取用户的组名
   local run_group
   run_group=$(id -g -n "$RUN_USER" 2>/dev/null || echo "$RUN_USER")
+  
+  # 构建 SupplementaryGroups 配置（用于 tailscaled socket 访问）
+  local supplementary_groups_line=""
+  local target_group_for_access=""
+  if [[ -n "$tailscaled_socket_override_group" ]]; then
+    target_group_for_access="$tailscaled_socket_override_group"
+  else
+    target_group_for_access="$tailscale_socket_group"
+  fi
+  if [[ -n "$target_group_for_access" && "$target_group_for_access" != "$RUN_USER" && "$target_group_for_access" != "root" ]]; then
+    supplementary_groups_line="SupplementaryGroups=${target_group_for_access}"
+  fi
+
+  # 根据配置文件是否为空，决定是否在 ExecStart 中包含 -c 选项
+  local config_flag=""
+  if [[ -f "${INSTALL_DIR}/derper.json" ]]; then
+    local _cfg_trim
+    _cfg_trim=$(tr -d ' \t\r\n' <"${INSTALL_DIR}/derper.json" 2>/dev/null || echo "")
+    if [[ -n "${_cfg_trim}" && "${_cfg_trim}" != "{}" ]]; then
+      config_flag="-c ${INSTALL_DIR}/derper.json"
+    fi
+  fi
+
+  # 根据 verify-clients 与已探测的 socket 路径，设置本地 API 环境变量
+  local localapi_env_line=""
+  if [[ "${VERIFY_CLIENTS_MODE}" == "on" ]]; then
+    local chosen_socket=""
+    if [[ -S /run/tailscale/tailscaled.sock ]]; then
+      chosen_socket="/run/tailscale/tailscaled.sock"
+    elif [[ -S /var/run/tailscale/tailscaled.sock ]]; then
+      chosen_socket="/var/run/tailscale/tailscaled.sock"
+    elif [[ -n "$socket_path" ]]; then
+      chosen_socket="$socket_path"
+    fi
+    # 即便未检测到，也写入常见路径，避免 derper 误用默认
+    [[ -z "$chosen_socket" ]] && chosen_socket="/run/tailscale/tailscaled.sock"
+    localapi_env_line="Environment=TS_LOCAL_API_SOCKET=${chosen_socket}"
+  fi
+
+  # 根据安全级别生成加固选项
+  local hardening_basic="NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true"
+
+  local hardening_standard="NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictSUIDSGID=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true"
+
+  local hardening_paranoid="NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+RestrictSUIDSGID=true
+ProtectClock=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectProc=invisible
+LockPersonality=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RemoveIPC=true
+MemoryDenyWriteExecute=true"
+
+  local hardening_options="$hardening_standard"  # 默认 standard
+  case "${SECURITY_LEVEL}" in
+    basic)
+      hardening_options="$hardening_basic"
+      echo "[信息] 使用 basic 安全级别（最大兼容性）"
+      ;;
+    paranoid)
+      hardening_options="$hardening_paranoid"
+      echo "[信息] 使用 paranoid 安全级别（最严格加固）"
+      ;;
+    standard|*)
+      hardening_options="$hardening_standard"
+      echo "[信息] 使用 standard 安全级别（推荐）"
+      ;;
+  esac
 
   cat >"${SERVICE_PATH}" <<SERVICE
 [Unit]
 Description=Tailscale DERP (derper) with self-signed IP cert
-After=network-online.target
-Wants=network-online.target
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
 
 [Service]
 Type=simple
 User=${RUN_USER}
 Group=${run_group}
+${supplementary_groups_line}
+
+# 环境变量（支持敏感配置）
+EnvironmentFile=-/etc/derper/derper.env
+${localapi_env_line}
+
 ExecStart=${BIN_PATH} \\
+  ${config_flag} \\
   -hostname ${IP_ADDR} \\
   -certmode manual \\
   -certdir ${INSTALL_DIR}/certs \\
@@ -1000,16 +1375,14 @@ Restart=on-failure
 RestartSec=2
 LimitNOFILE=65535
 
-# 安全加固
+# 能力边界
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=true
-PrivateTmp=true
-RestrictAddressFamilies=AF_INET AF_INET6
-SystemCallFilter=@system-service
-SystemCallErrorNumber=EPERM
+
+# 安全加固（级别：${SECURITY_LEVEL}）
+$hardening_options
+
+# 路径权限
 ReadWritePaths=${INSTALL_DIR}
 
 [Install]
@@ -1017,8 +1390,70 @@ WantedBy=multi-user.target
 SERVICE
 
   systemctl daemon-reload
-  systemctl enable --now derper
+  
+  # 尝试启动服务，如果失败则可能是加固选项不兼容
+  if ! systemctl enable --now derper 2>/dev/null; then
+    echo "[警告] 服务启动失败，可能是某些安全选项不兼容当前系统" >&2
+    
+    # 检查是否是 MemoryDenyWriteExecute 导致的问题（Go 程序常见）
+    if [[ "${SECURITY_LEVEL}" == "paranoid" ]]; then
+      echo "[步骤] 尝试禁用 MemoryDenyWriteExecute 选项重试" >&2
+      sed -i '/MemoryDenyWriteExecute/d' "${SERVICE_PATH}"
+      systemctl daemon-reload
+      
+      if systemctl enable --now derper 2>/dev/null; then
+        echo "[信息] 服务已成功启动（已禁用 MemoryDenyWriteExecute）"
+      else
+        cat >&2 <<'EOT'
+
+[错误] 服务仍然无法启动
+
+可能原因：
+  1. paranoid 级别的加固选项在您的系统上不兼容
+     - ProtectProc=invisible 需要 Linux 5.8+ 和 systemd 247+
+     - RestrictNamespaces 需要较新的内核和 systemd
+  
+解决方案：
+  1) 降级到 standard 安全级别（推荐）：
+     sudo bash $0 --security-level standard --repair
+  
+  2) 降级到 basic 安全级别（最大兼容）：
+     sudo bash $0 --security-level basic --repair
+  
+  3) 查看详细错误日志：
+     journalctl -u derper -n 50 --no-pager
+
+EOT
+        exit 1
+      fi
+    else
+      cat >&2 <<'EOT'
+
+[错误] 服务启动失败
+
+解决方案：
+  1) 如果是 standard 级别，尝试降级到 basic：
+     sudo bash $0 --security-level basic --repair
+  
+  2) 查看详细错误日志：
+     journalctl -u derper -n 50 --no-pager
+  
+  3) 手动排查 systemd 服务配置：
+     systemctl status derper
+
+EOT
+      exit 1
+    fi
+  fi
+  
   systemctl status derper --no-pager -l || true
+  
+  # 显示安全评分（如果可用）
+  if command -v systemd-analyze >/dev/null 2>&1; then
+    echo ""
+    echo "[信息] systemd 安全评分："
+    systemd-analyze security derper.service 2>/dev/null | head -20 || true
+  fi
 }
 
 print_firewall_tips() {
@@ -1352,8 +1787,196 @@ uninstall_derper() {
   echo "完成：已卸载 derper 服务。"
 }
 
+deployment_wizard() {
+  # 非交互模式检测
+  if [[ "${NON_INTERACTIVE}" -eq 1 ]]; then
+    cat >&2 <<'EOT'
+[错误] 向导模式需要交互式输入，与 --non-interactive/--yes 冲突
+
+建议：
+  1) 去掉 --non-interactive 标志，正常使用向导
+  2) 或者直接使用命令行参数，例如：
+     sudo bash $0 --ip <IP> --dedicated-user --auto-ufw
+EOT
+    exit 1
+  fi
+  
+  cat <<'EOT'
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                      DERP 部署配置向导                                        ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+本向导将引导您生成适合您场景的部署命令。
+
+EOT
+
+  # 问题1：使用场景
+  echo "1. 您的使用场景？"
+  echo "   a) 个人测试/学习"
+  echo "   b) 小团队（<10人）"
+  echo "   c) 生产环境"
+  read -p "   请选择 (a/b/c): " scenario
+  
+  # 问题2：账户偏好
+  echo ""
+  echo "2. 账户管理偏好？"
+  echo "   a) 简单优先（使用当前账户）"
+  echo "   b) 安全优先（创建专用账户）"
+  read -p "   请选择 (a/b): " account_pref
+  
+  # 问题3：端口选择
+  echo ""
+  echo "3. DERP 端口？"
+  echo "   a) 443（推荐，防火墙友好）"
+  echo "   b) 30399（默认，避免与其他服务冲突）"
+  read -p "   请选择 (a/b): " port_choice
+  
+  # 问题4：客户端验证
+  echo ""
+  echo "4. 是否启用客户端验证？"
+  echo "   a) 是（推荐，更安全）- 需要本地 tailscaled 已登录"
+  echo "   b) 否（仅测试环境）"
+  read -p "   请选择 (a/b): " verify_choice
+  
+  # 生成命令（使用模板替换，不用 eval）
+  # 注意：每个参数必须是独立的数组元素，以便 exec 正确执行
+  local cmd_parts=()
+  cmd_parts+=("sudo" "bash" "$0")
+  cmd_parts+=("--ip" "__IP_PLACEHOLDER__")
+  
+  # 账户策略
+  case "$account_pref" in
+    a) cmd_parts+=("--use-current-user") ;;
+    b) cmd_parts+=("--dedicated-user") ;;
+  esac
+  
+  # 端口
+  case "$port_choice" in
+    a) cmd_parts+=("--derp-port" "443") ;;
+    b) cmd_parts+=("--derp-port" "30399") ;;
+  esac
+  
+  # 客户端验证
+  case "$verify_choice" in
+    b) cmd_parts+=("--no-verify-clients") ;;
+  esac
+  
+  # 安全级别
+  case "$scenario" in
+    a) cmd_parts+=("--security-level" "basic") ;;
+    c) cmd_parts+=("--security-level" "paranoid") ;;
+    # b) 使用默认 standard，不需要添加参数
+  esac
+  
+  # 自动防火墙
+  cmd_parts+=("--auto-ufw")
+  
+  # 如果是国内，添加代理建议
+  if [[ -n "${LANG}" ]] && [[ "${LANG}" =~ zh ]]; then
+    cmd_parts+=("--goproxy" "https://goproxy.cn,direct")
+    cmd_parts+=("--gosumdb" "sum.golang.google.cn")
+  fi
+  
+  # 组装完整命令（人类可读，使用 shell 安全转义）
+  local full_cmd
+  if printf -v full_cmd '%q ' "${cmd_parts[@]}" 2>/dev/null; then
+    full_cmd=${full_cmd% }  # 去掉末尾空格
+  else
+    full_cmd="${cmd_parts[*]}"
+  fi
+  
+  cat <<EOT
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                      推荐的部署命令                                           ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+$full_cmd
+
+提示：
+- 请将 __IP_PLACEHOLDER__ 替换为您的实际公网 IP
+- 命令已保存到 derper_deploy_cmd.sh，方便后续使用
+
+是否立即执行？(y/n)
+EOT
+  
+  # 保存到文件
+  echo "$full_cmd" > derper_deploy_cmd.sh
+  chmod +x derper_deploy_cmd.sh
+  
+  read -p "> " execute
+  if [[ "$execute" == "y" || "$execute" == "Y" ]]; then
+    echo ""
+    read -p "请输入您的公网 IP: " user_ip
+    
+    # 严格验证 IPv4 格式
+    if [[ ! "$user_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+      echo "[错误] IP 格式不正确，请手动修改 derper_deploy_cmd.sh 后执行" >&2
+      exit 1
+    fi
+    
+    # 验证每个字段范围（0-255）
+    IFS='.' read -ra octets <<< "$user_ip"
+    for octet in "${octets[@]}"; do
+      if [[ "$octet" -gt 255 ]]; then
+        echo "[错误] IP 地址字段超出范围（0-255），请重新输入" >&2
+        exit 1
+      fi
+    done
+    
+    # 构建安全的参数数组（避免 eval）
+    local exec_args=()
+    for part in "${cmd_parts[@]}"; do
+      if [[ "$part" == *"__IP_PLACEHOLDER__"* ]]; then
+        exec_args+=("${part//__IP_PLACEHOLDER__/$user_ip}")
+      else
+        exec_args+=("$part")
+      fi
+    done
+    
+    echo ""
+    echo "[信息] 即将执行："
+    local preview
+    if printf -v preview '%q ' "${exec_args[@]}" 2>/dev/null; then
+      preview=${preview% }
+      echo "  $preview"
+    else
+      echo "  ${exec_args[*]}"
+    fi
+    echo ""
+    read -p "确认执行？(yes/no): " final_confirm
+    
+    if [[ "$final_confirm" == "yes" ]]; then
+      # 使用数组安全执行，彻底避免 shell 注入
+      exec "${exec_args[@]}"
+    else
+      echo "[信息] 已取消执行，命令已保存到 derper_deploy_cmd.sh"
+    fi
+  else
+    echo "[信息] 命令已保存到 derper_deploy_cmd.sh"
+    echo "       手动执行前请替换 __IP_PLACEHOLDER__ 为实际 IP"
+  fi
+}
+
 main() {
+  # 特殊子命令处理
+  if [[ "$1" == "wizard" ]]; then
+    deployment_wizard
+    exit 0
+  fi
+  
   parse_args "$@"
+
+  # 非交互 + 直接以 root 运行时的安全默认：切换为专用账户
+  # 条件：当前用户为 root，且未通过 sudo 传入真实用户，且未显式选择专用用户
+  if [[ "$(id -u)" -eq 0 && -z "${SUDO_USER:-}" && "${NON_INTERACTIVE}" -eq 1 ]]; then
+    if [[ "${RUN_USER}" == "root" && "${CREATE_DEDICATED_USER}" -eq 0 ]]; then
+      echo "[信息] 检测到非交互 root 运行，默认切换为专用账户（等同 --dedicated-user）。"
+      RUN_USER="derper"
+      CREATE_DEDICATED_USER=1
+      USE_CURRENT_USER=0
+    fi
+  fi
   
   # 环境检测（优先级最高，除了 --help 和 --uninstall）
   if [[ "${UNINSTALL}" -eq 1 ]]; then
@@ -1366,6 +1989,7 @@ main() {
   check_os_environment
 
   # 探测 IP 与校验参数（即使非 root 也可做检查）
+  # 注意：在 --check/--health-check 模式下容错，允许部分失败继续输出信息
   detect_public_ip || true
   validate_settings || true
 
@@ -1426,6 +2050,17 @@ main() {
 
   # 正式执行需要 root
   require_root
+
+  # 进入安装/修复分支前，强制校验参数（不容错）
+  echo "[步骤] 强制校验参数..."
+  if ! detect_public_ip; then
+    echo "[错误] 无法探测或验证公网 IP，请使用 --ip 显式指定" >&2
+    exit 1
+  fi
+  if ! validate_settings; then
+    echo "[错误] 参数校验失败，请检查 IP、端口等配置" >&2
+    exit 1
+  fi
 
   # 默认启用 verify-clients 并在未登录时阻断
   precheck_verify_clients
@@ -1488,6 +2123,7 @@ main() {
 - 服务：systemctl status derper
 - 日志：journalctl -u derper -f
 - 证书：${INSTALL_DIR}/certs/{fullchain.pem,privkey.pem}（自签临时证书，建议仅测试用途）
+- 配置：${INSTALL_DIR}/derper.json
 
 在 Tailscale 后台粘贴 derpMap 后，客户端数十秒内会自动下发。
 INFO

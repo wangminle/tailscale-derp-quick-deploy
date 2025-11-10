@@ -1,273 +1,289 @@
-# DERP Deployment Guide with IP-based Self-signed Certificate
+# Tailscale DERP Quick Deploy Script
 
-> **[中文版 README](README_cn.md) | English**
-
-> **Script File**: `deploy_derper_ip_selfsigned.sh`
-
-![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
-![systemd](https://img.shields.io/badge/Service-systemd-orange?logo=systemd&logoColor=white)
-![Public IPv4 Required](https://img.shields.io/badge/Network-Public%20IPv4%20Required-red?logo=cloudflare&logoColor=white)
-![Bash](https://img.shields.io/badge/Shell-Bash-green?logo=gnu-bash&logoColor=white)
-
-This solution automatically deploys Tailscale DERP relay service (`derper`) on Linux servers with only a public IP (no domain required), auto-generates "IP-based self-signed certificates", configures `systemd` service, and outputs a `derpMap` configuration snippet that can be directly pasted into Tailscale admin console (using certificate fingerprint `CertName` for better security).
-
-**Features**:
-- ✅ Idempotent and reentrant, supports check, repair, and force reinstall modes
-- ✅ Auto-detects new/old derper parameters (`-a` vs `-https-port`)
-- ✅ Enables `-verify-clients` by default for client verification (security first)
-- ✅ Built-in health check and Prometheus metrics export
-- ✅ Supports uninstall and cleanup
-
-**Use Cases**: Testing environments, temporary deployments, home small-scale relay. For production, we recommend using trusted CA certificates + port 443.
+> **Language / 语言**: [English](#english) | [中文](#中文)
 
 ---
 
-## Prerequisites
+<a id="english"></a>
 
-### Operating System Requirements (Mandatory)
+## English
 
-> ⚠️ **Important Notice**: This script **ONLY supports Linux systems**, NOT compatible with macOS or WSL environments
+### 📋 Project Overview
 
-**✅ Supported Deployment Environments**:
-- **Cloud Servers**: Alibaba Cloud, Tencent Cloud, AWS, DigitalOcean, Vultr, etc.
-- **VPS/Dedicated Servers**: Any Linux server with public IPv4 access
-- **Home Linux Devices**: Raspberry Pi, soft routers, NAS (with port forwarding and public IP)
+This project provides a **fully automated Tailscale DERP relay service deployment solution**, specifically designed for scenarios with **only a public IP (no domain required)**. It addresses the following pain points:
 
-**❌ Unsupported Environments**:
-- **macOS**: Desktop systems typically behind NAT, lack public accessibility, unsuitable for 24/7 online DERP relay nodes
-- **WSL (Windows Subsystem for Linux)**: Behind double NAT, incomplete network stack, cannot provide stable public services
-- **Devices without public IP**: DERP relay services must be accessible from other devices on the internet
+#### Core Objectives
 
-**Local Development Testing**:
-If you need to test the `derper` program itself on macOS/WSL (not for production deployment), you can manually run it in foreground:
-```bash
-derper -hostname 127.0.0.1 -certmode manual -certdir ./certs \
-  -http-port -1 -a :30399 -stun
-```
-Note: This mode is only for local functional verification and cannot serve as a relay node for Tailscale network.
+1. **Zero-Domain Deployment**: Build DERP relay with just a public IP, no domain purchase needed
+2. **Security-First**: Auto-generate IP-based self-signed certificates with certificate fingerprint (`CertName`) verification, eliminating the need for insecure `InsecureForTests` flag
+3. **Out-of-the-Box**: Complete deployment from dependency installation to service startup with a single command
+4. **Production-Grade**: Built-in security hardening, health checks, and Prometheus metrics export
+
+#### Use Cases
+
+- 🧪 **Testing Environments**: Quickly set up temporary relay nodes
+- 🏠 **Home Networks**: Build private relays using home broadband public IPs
+- 👥 **Small Teams**: Low-cost internal Tailscale acceleration nodes
+- 🚀 **Rapid Prototyping**: Instant network topology validation without DNS/certificate configuration
 
 ---
 
-### Hardware & Network
-- A Linux host with **public IPv4** (cloud server or home broadband device accessible from the internet)
-- Ports must be accessible: `DERP_PORT/tcp` (default 30399), `STUN_PORT/udp` (default 3478)
-- Outbound network access to Go module proxy (for China mainland, configure `GOPROXY` and `GOSUMDB`)
+### 🎯 Core Features
 
-### Permissions & System
-- Requires **root privileges** to run the script (or use `sudo`)
-- Recommended to use **systemd** as service manager (script will auto-detect and provide manual run examples if incompatible)
+#### 1. Intelligent Deployment
 
-### Security Settings (Important)
-- **`-verify-clients` enabled by default**: Script checks if local `tailscaled` is running and logged in before installation
-  - ✅ If not ready, script will abort and show login instructions
-  - ⚠️ To skip verification, use `--no-verify-clients` (**testing only**)
-  - 📝 Detection logic:
-    - If `tailscale` CLI detected, checks via `tailscale ip` whether Tailnet IP is assigned
-    - If CLI not detected, only checks `tailscaled` running status
+- ✅ **Idempotent Design**: Safe to run multiple times, automatically detects existing configurations
+- ✅ **Parameter Auto-Adaptation**: Auto-detects new/old derper parameter differences (`-a` vs `-https-port`)
+- ✅ **Smart Repair**: `--repair` mode fixes configurations without interrupting service
 
-### Additional Notes
-- Auto-detection of public IP relies on `curl`/`dig` tools
-- If system lacks these tools, use `--ip <your-public-ip>` to specify explicitly
+#### 2. Security Hardening
+
+- 🔒 **Tiered Security Policies**: Three-level systemd hardening (basic/standard/paranoid)
+- 🔒 **Flexible User Management**: Supports current user/dedicated user/custom user modes
+- 🔒 **Client Verification**: Enables `-verify-clients` by default, rejecting unauthorized access
+- 🔒 **Privilege Minimization**: Grants `CAP_NET_BIND_SERVICE` capability, no root execution required
+
+#### 3. Enterprise Operations
+
+- 📊 **Health Checks**: Built-in `--health-check` outputs service status summary
+- 📊 **Prometheus Integration**: Exports textfile format metrics for seamless monitoring integration
+- 🔧 **Multi-Mode Operation**: check/repair/force modes for different scenarios
+- 🗑️ **Complete Uninstall**: `--uninstall` supports three-level options (retain/cleanup/purge-all)
+
+#### 4. Cross-Environment Compatibility
+
+- 🐧 **Multi-Distribution Support**: Debian/Ubuntu/RHEL/CentOS/Fedora, etc.
+- 🔥 **Firewall Adaptation**: Auto-detects UFW/firewalld/iptables
+- 🌐 **China Network Optimization**: Built-in GOPROXY/GOSUMDB mirror configuration
 
 ---
 
-## Quick Start
+### 🚀 Usage Guide
 
-1) Login to server and start `tailscaled` (recommended)
+#### Quick Start (3-Step Deployment)
+
+##### Step 1: Login to Tailscale (Required)
 
 ```bash
+# Start tailscaled daemon
 sudo systemctl enable --now tailscaled
-sudo tailscale up            # First run will output authorization link, login via browser
-# Or use pre-generated key:
-# sudo tailscale up --authkey tskey-xxxx
+
+# Login to Tailnet (browser authorization)
+sudo tailscale up
+
+# Or use pre-generated Auth Key (for automation)
+sudo tailscale up --authkey tskey-xxxxxxxxxxxxxxxxxxxx
 ```
 
-2) Pre-check (check only, no system changes)
+##### Step 2: Pre-Check (Recommended)
 
-```bash
-sudo bash scripts/deploy_derper_ip_selfsigned.sh --ip <your-public-ip> --check
-```
-
-Note: Pre-check won't modify system or open ports, only outputs current environment and parameter check results, plus suggested next actions. If it shows tailscaled not logged in, port conflicts, or missing dependencies, handle them first as instructed.
-
-3) Run deployment script (formal installation/repair; example for China mainland, with `-verify-clients` enabled by default)
-
-**Default: Creates dedicated `derper` user (most secure)**
 ```bash
 sudo bash scripts/deploy_derper_ip_selfsigned.sh \
   --ip <your-public-ip> \
-  --derp-port 30399 --stun-port 3478 --auto-ufw \
-  --goproxy https://goproxy.cn,direct \
-  --gosumdb sum.golang.google.cn \
-  --gotoolchain auto
+  --check
 ```
 
-**Alternative: Use current user (simpler, no user creation)**
+**Pre-check outputs:**
+- Public IP detection result
+- Port occupation status
+- Tailscale installation and login state
+- System dependency integrity
+- Repair recommendations
+
+##### Step 3: Formal Deployment
+
+**Option A: Personal/Testing Environment (Use Current User, Simplest)**
+
 ```bash
 sudo bash scripts/deploy_derper_ip_selfsigned.sh \
   --ip <your-public-ip> \
   --use-current-user \
-  --derp-port 30399 --stun-port 3478 --auto-ufw
+  --security-level basic \
+  --auto-ufw
 ```
 
-**Advanced: Specify a different user**
+**Option B: Production Environment (Dedicated User + High Security)**
+
 ```bash
-# Use existing system user (e.g., nobody, www-data)
 sudo bash scripts/deploy_derper_ip_selfsigned.sh \
   --ip <your-public-ip> \
-  --user nobody \
-  --derp-port 30399
+  --dedicated-user \
+  --security-level paranoid \
+  --derp-port 443 \
+  --auto-ufw \
+  --goproxy https://goproxy.cn,direct \
+  --gosumdb sum.golang.google.cn
 ```
 
-After completion, the script will (made idempotent, will skip if already ready; dependencies installed "on-demand", won't access package repositories if all present):
-- Install dependencies (`git/curl/openssl/golang/netcat` etc.)
-- Install/build `derper` (using `GOTOOLCHAIN=auto` to auto-fetch matching version)
-- Generate "IP-based self-signed certificate" to `/opt/derper/certs/`
-- Write and start `systemd` service `/etc/systemd/system/derper.service`
-- Print port opening instructions and run self-check
-- Output `derpMap` snippet with `CertName` (certificate fingerprint) - directly paste to Tailscale ACL
+**Option C: Wizard Mode (Beginner-Friendly)** 🆕
 
-### Common Abort Reasons & Solutions (with Login Flow Diagram)
-
-```text
-Login Flow (Diagram):
-  sudo systemctl enable --now tailscaled    # Or other service manager to start tailscaled
-  sudo tailscale up                         # Terminal prints login URL
-        │
-        ├──> Open URL in browser to authorize
-        │
-        └──> tailscaled obtains login state (connects to Tailnet)
-               │
-               └──> Re-run script, pre-check passes (-verify-clients)
+```bash
+sudo bash scripts/deploy_derper_ip_selfsigned.sh wizard
 ```
 
-- tailscaled not running/not logged in (most common)
-  - Solution: `sudo systemctl enable --now tailscaled && sudo tailscale up`
-  - Non-systemd environments: OpenRC (`rc-service tailscaled start`), SysV (`service tailscaled start`).
-- Cannot auto-detect public IP:
-  - Solution: Manually specify `--ip <your-public-ip>`; or confirm outbound network is available (curl/dig). Minimal systems may lack `curl/dig`, install them first or explicitly pass `--ip`.
-- Port occupied:
-  - Solution: `ss -tulpn | grep -E ':30399|:3478'` to check occupying process, or use different ports. Script will pre-check port conflicts before writing service and abort with prompt if found.
-- Missing dependencies/network restrictions causing installation failure:
-  - Solution: Configure China mainland mirrors for Go: `--goproxy https://goproxy.cn,direct --gosumdb sum.golang.google.cn`.
-- systemd not detected:
-  - Solution: Script cannot write systemd service; use other service manager or manually run `derper` in foreground.
-- Insufficient permissions:
-  - Solution: Use `sudo` to run script.
+The wizard will interactively ask about:
+1. Usage scenario (personal/team/production)
+2. Account strategy (current user/dedicated user)
+3. Port selection (443/30399)
+4. Enable client verification
 
-Tip: The "pre-check" step can also use `--dry-run`, equivalent to `--check`.
+Then automatically generate the deployment command suitable for your needs.
 
 ---
 
-## Pre-check Results Interpretation & Common Solutions
+### ⚙️ Parameter Reference
 
-Pre-check outputs several key items, their meanings and solutions (in order of appearance):
+#### Default Parameters (No Explicit Specification Required)
 
-- Public IP
-  - Empty/incorrect: Use `--ip <your-public-ip>` to specify; if detecting private IP, need to bind public IP to host or do port forwarding (and confirm external accessibility).
-- DERP Port / STUN Port
-  - Port conflict: Use `ss -tulpn | grep -E ':<DERP_PORT>|:<STUN_PORT>'` to troubleshoot occupation, release process or change `--derp-port/--stun-port`; also open cloud security groups/UFW/iptables.
-- tailscale status (installed/running/version/meets threshold)
-  - Installed=0: Install tailscale via distro package manager (or official one-liner: `curl -fsSL https://tailscale.com/install.sh | sh`).
-  - Running=0: `sudo systemctl enable --now tailscaled`.
-  - Meets=false: Upgrade to `REQUIRED_TS_VER` or higher.
-  - Not logged in: `sudo tailscale up` to complete login (or use `--authkey`).
-- derper components (binary/service file/running)
-  - Binary=0: Formal installation phase will auto-build; for offline environments, use `go install tailscale.com/cmd/derper@latest`.
-  - Service file=0: Formal installation will auto-write to systemd; for non-systemd see "Service Manager" below.
-  - Running=0: `journalctl -u derper -f` to check logs, mostly port conflicts or cert path/permission issues.
-- Port listening (TLS / STUN)
-  - Is 0: Service not running, blocked by firewall/security groups, or listening port doesn't match expected; open `${DERP_PORT}/tcp` and `${STUN_PORT}/udp`, for UFW execute `ufw allow <port>/tcp|udp`.
-- Pure IP configuration detection (based on unit)
-  - Is 0: Current unit is not "pure IP mode" (e.g., HostName is not IP). Execute `--repair` to rewrite, or `--force` for full reinstall; if public IP changed, sync `--ip`.
-- Certificate (exists/SAN matches IP/not expiring within 30 days)
-  - Any is 0: Re-run script (or `--repair`) to re-sign certificate; if IP changed ensure `--ip` points to new IP; if missing openssl, install first.
-- Client verification mode
-  - on: Enables `-verify-clients`, requires local tailscaled to be logged in (recommended). For testing only, use `--no-verify-clients` temporarily (not recommended long-term).
-- Running user (user and group for service execution)
-  - Shows which user/group will run derper service (e.g., `derper (group: derper)`)
-  - Default is dedicated `derper` user; can customize with `--user` or `--use-current-user`
-  - If user doesn't exist yet, group name shows as username placeholder
-- Critical executable checks
-  - Missing items (like curl/openssl/git/go): Formal installation will fill on-demand; for offline/restricted networks, install via package manager first.
-- Service manager
-  - systemd not detected: Cannot write service. Can run manually in foreground (example):
-    `derper -hostname <your-public-ip> -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun -stun-port 3478 -verify-clients`
-    Note: For older versions not supporting `-a/-stun-port`, use `-https-port 30399` and remove `-stun-port`.
-- Non-systemd environments will show manual run examples, installation process will abort.
-- Suggestions (summary of recommended actions)
-  - `<Ready: can skip directly>`: No action needed.
-  - `Install derper (missing binary)`: Execute formal installation command from "Quick Start".
-  - `--repair`: Only fix config/certificates, don't interrupt available dependencies.
-  - `--force`: Full reinstall (binary/certificates/service).
-
-Common paths:
-- Pre-check no fatal issues → Directly proceed to formal installation (or `--repair`).
-- Pre-check shows "not logged in/port conflict/missing dependencies" → Handle first as above, then execute formal installation.
-
----
-
-## Script Parameters
-
-```text
---ip <IPv4>               Server public IP (recommended explicit; defaults to auto-detect)
---derp-port <int>         DERP TLS port, default 30399/TCP
---stun-port <int>         STUN port, default 3478/UDP
---cert-days <int>         Self-signed cert validity (days), default 365
---auto-ufw                If UFW detected, auto-open ports
-
---goproxy <URL>           Go module proxy, e.g.: https://goproxy.cn,direct
---gosumdb <VALUE>         Go checksum database, e.g.: sum.golang.google.cn
---gotoolchain <MODE>      go toolchain policy, default auto (can auto-fetch ≥1.25)
-
---no-verify-clients       Disable client verification (not enabled by default; testing only)
---force-verify-clients    Force enable client verification (default behavior)
---region-id               ACL derpMap RegionID (default 900)
---region-code             ACL derpMap RegionCode (default my-derp)
---region-name             ACL derpMap RegionName (default "My IP DERP")
---user <username>         Specify which user runs derper (default: derper, auto-created)
-                          Can specify existing users (e.g., nobody, www-data)
---use-current-user        Use current login user to run derper (equivalent to --user $USER)
---check / --dry-run       Only perform status and parameter checks, no install/write service/open ports
---repair                  Only fix/rewrite config (systemd/certificates etc.), don't reinstall derper
---force                   Force full reinstall (reinstall derper, re-sign certs, rewrite service)
-
-# Operations & Maintenance
---health-check            Only output health check summary (no system changes, for cron/monitoring)
---metrics-textfile <P>    Export health check as Prometheus text metrics to path P (use with node_exporter)
---uninstall               Stop and uninstall derper systemd service (keep binary and certificates)
---purge                   With --uninstall: additionally delete installation directory (/opt/derper)
---purge-all               With --uninstall: on top of --purge, also delete binary (/usr/local/bin/derper)
+```bash
+DERP_PORT="30399"              # DERP TLS port
+STUN_PORT="3478"               # STUN UDP port
+CERT_DAYS="365"                # Certificate validity (1 year)
+INSTALL_DIR="/opt/derper"      # Installation directory
+BIN_PATH="/usr/local/bin/derper"
+VERIFY_CLIENTS_MODE="on"       # Enable client verification (secure default)
+SECURITY_LEVEL="standard"      # Standard security level
+RUN_USER="${SUDO_USER:-$USER}" # Use current login user
 ```
 
-> Compatibility: Script prioritizes new `-a :<PORT>` for listening; falls back to old parameter `-https-port <PORT>` if unsupported.
+#### Core Parameters
 
-> Idempotency note: If detects existing "pure IP mode" derper working properly (port listening healthy, cert matches IP and not expiring soon), defaults to skip installation.
+##### Network Configuration
+
+| Parameter | Description | Default | Example |
+|-----------|-------------|---------|---------|
+| `--ip <IPv4>` | Server public IP | Auto-detect | `--ip 203.0.113.10` |
+| `--derp-port <int>` | DERP TLS port | 30399 | `--derp-port 443` |
+| `--stun-port <int>` | STUN UDP port | 3478 | `--stun-port 3478` |
+| `--auto-ufw` | Auto-configure UFW rules | Off | `--auto-ufw` |
+
+**Port Selection Recommendations:**
+- **30399** (default): Avoids conflicts with web services, suitable for multi-service servers
+- **443**: Best firewall traversal, but check for HTTPS service conflicts
+
+##### Go Build Configuration (Required for China Mainland)
+
+| Parameter | Description | Default | Recommended (China) |
+|-----------|-------------|---------|---------------------|
+| `--goproxy <URL>` | Go module proxy | Inherit env | `https://goproxy.cn,direct` |
+| `--gosumdb <VALUE>` | Go checksum database | Inherit env | `sum.golang.google.cn` |
+| `--gotoolchain <MODE>` | Toolchain policy | `auto` | `auto` (auto-fetch ≥1.25) |
+
+##### Security & Account Management
+
+| Parameter | Description | Default Behavior | Use Case |
+|-----------|-------------|------------------|----------|
+| `--use-current-user` | Use current login user | ✅ Default | Personal servers, testing |
+| `--dedicated-user` | Create dedicated `derper` user | Off | **Production strongly recommended** |
+| `--user <username>` | Specify existing user | - | Integration (e.g., `nobody`) |
+| `--security-level <level>` | Security hardening level | `standard` | `basic`/`standard`/`paranoid` |
+
+**Security Level Comparison:**
+
+| Level | systemd Protection | Compatibility | Use Case |
+|-------|-------------------|---------------|----------|
+| **basic** | Minimal (NoNewPrivileges + ProtectSystem) | Best | Old kernels, embedded devices |
+| **standard** | Standard hardening (+PrivateTmp +RestrictAddressFamilies) | Good | **Recommended default** |
+| **paranoid** | Maximum (+ProtectProc +RestrictNamespaces) | Requires Linux 5.8+, systemd 247+ | High security requirements |
+
+##### Client Verification
+
+| Parameter | Description | Default | Security Impact |
+|-----------|-------------|---------|-----------------|
+| `--force-verify-clients` | Force enable client verification | ✅ Default | Only allow Tailnet devices |
+| `--no-verify-clients` | Disable client verification | Off | ⚠️ Anyone can connect (testing only) |
+
+##### ACL Region Configuration
+
+| Parameter | Description | Default | Purpose |
+|-----------|-------------|---------|---------|
+| `--region-id <int>` | ACL derpMap RegionID | 900 | Unique identifier for your relay node |
+| `--region-code <string>` | RegionCode | `my-derp` | Short code (displayed in `tailscale status`) |
+| `--region-name <string>` | RegionName | `My IP DERP` | Human-readable name |
+
+##### Operational Modes
+
+| Parameter | Description | System Impact | When to Use |
+|-----------|-------------|---------------|-------------|
+| `--check` / `--dry-run` | Check only, no system changes | ❌ None | Diagnose issues, verify parameters |
+| `--repair` | Fix configuration (certs/service) | 🔧 Service restart | Certificate expiry, config drift |
+| `--force` | Force complete reinstall | 🔄 Full rebuild | Version upgrade, complete reset |
+
+##### Operations & Monitoring
+
+| Parameter | Description | Output | Use Case |
+|-----------|-------------|--------|----------|
+| `--health-check` | Output health status summary | Text + exit code | cron periodic checks, alerting |
+| `--metrics-textfile <path>` | Export Prometheus metrics | `.prom` file | With node_exporter monitoring |
+
+**Prometheus Metrics Example:**
+
+```prometheus
+derper_up 1                          # Service running status
+derper_tls_listen 1                  # TLS port listening
+derper_stun_listen 1                 # STUN port listening
+derper_cert_days_remaining 287       # Certificate remaining days
+derper_verify_clients 1              # Client verification enabled
+derper_process_rss_bytes 3145728     # Process memory usage (bytes)
+```
+
+##### Uninstall & Cleanup
+
+| Parameter | Description | Deleted Content | Retained Content |
+|-----------|-------------|-----------------|------------------|
+| `--uninstall` | Stop and remove service | systemd unit | Binary, certificates |
+| `--uninstall --purge` | + Remove installation directory | + `/opt/derper` | Binary |
+| `--uninstall --purge-all` | + Remove binary | + `/usr/local/bin/derper` | - |
 
 ---
 
-## Idempotency / Reentrant & Repair
+### 🎬 Deployment Workflow Demo
 
-- Default behavior: First perform status detection, skip if "pure IP mode" requirements met; otherwise repair on-demand (install missing components, regenerate certificates, rewrite service).
-- Check mode:
-  - Check only, no system changes: `bash scripts/deploy_derper_ip_selfsigned.sh --ip <your-public-ip> --check`
-  - Outputs tailscale/derper/ports/certificates/config status and suggested actions.
-- Repair mode (don't interrupt available dependencies):
-  - `sudo bash scripts/deploy_derper_ip_selfsigned.sh --ip <your-public-ip> --repair`
-  - Behavior: Re-sign certificates if needed, rewrite systemd unit and enable+restart.
-- Force reinstall:
-  - `sudo bash scripts/deploy_derper_ip_selfsigned.sh --ip <your-public-ip> --force`
-  - Behavior: Reinstall derper, re-sign certificates, rewrite and restart service.
-- Version threshold (optional):
-  - Specify tailscale minimum version via environment variable `REQUIRED_TS_VER` (default 1.66.3), visible in `--check/--dry-run` output.
+#### Complete Example: Zero to Production
 
----
+```bash
+# 1. Login to server with public IP
+ssh user@203.0.113.10
 
-## Configure derpMap in Tailscale Admin Console
+# 2. Install Tailscale client (if not installed)
+curl -fsSL https://tailscale.com/install.sh | sh
 
-Script auto-calculates SHA256 of certificate DER raw bytes and outputs ACL snippet like below (example, RegionID customizable):
+# 3. Start and login to Tailnet
+sudo systemctl enable --now tailscaled
+sudo tailscale up  # Copy login URL to browser
+
+# 4. Download deployment script
+git clone <repository-url>
+cd tailscale-derp-quick-deploy
+
+# 5. Pre-check (recommended)
+sudo bash scripts/deploy_derper_ip_selfsigned.sh \
+  --ip 203.0.113.10 \
+  --check
+
+# 6. Formal deployment (China network)
+sudo bash scripts/deploy_derper_ip_selfsigned.sh \
+  --ip 203.0.113.10 \
+  --derp-port 443 \
+  --dedicated-user \
+  --security-level standard \
+  --auto-ufw \
+  --goproxy https://goproxy.cn,direct \
+  --gosumdb sum.golang.google.cn
+
+# 7. Script will automatically:
+#    ✅ Install Go, derper, openssl, etc.
+#    ✅ Generate self-signed certificate (/opt/derper/certs/)
+#    ✅ Create and start systemd service
+#    ✅ Output derpMap configuration snippet
+```
+
+#### Output Example
+
+After successful deployment, you'll see:
 
 ```json
+==================== Paste to Tailscale Admin Console derpMap ====================
 {
   "derpMap": {
     "OmitDefaultRegions": false,
@@ -280,382 +296,674 @@ Script auto-calculates SHA256 of certificate DER raw bytes and outputs ACL snipp
           {
             "Name": "900a",
             "RegionID": 900,
-            "HostName": "<your-public-ip>",
-            "DERPPort": 30399,
-            "CertName": "sha256-raw:<fingerprint-from-script-output>"
+            "HostName": "203.0.113.10",
+            "DERPPort": 443,
+            "CertName": "sha256-raw:a1b2c3d4e5f6..."
           }
         ]
       }
     }
   }
 }
-```
+==================================================================================
 
-Paste this snippet to Tailscale admin console → Access Controls (ACL) and save, wait 10–60 seconds to propagate to clients.
-
-> Note: Using `CertName` fixes certificate fingerprint, no need for `InsecureForTests`. If port changed to 443, change `DERPPort` to 443.
-
-### How to Retrieve Certificate Fingerprint Again
-
-```bash
-# Get from logs (printed when service starts)
-journalctl -u derper --no-pager | grep sha256-raw | tail -1
-
-# Or directly calculate from file fingerprint
-openssl x509 -in /opt/derper/certs/fullchain.pem -outform DER | sha256sum | awk '{print $1}'
+Complete: DERP service deployed and running.
+- Service status: systemctl status derper
+- Real-time logs: journalctl -u derper -f
+- Certificate location: /opt/derper/certs/
 ```
 
 ---
 
-## Security Best Practices
+### 🎯 Expected Results
 
-The script implements several security hardening measures by default:
+#### 1. Service Status
 
-### Flexible User Configuration
-
-**You can choose who runs derper** - the script supports three modes:
-
-1. **Dedicated `derper` user (default, most secure)**
-   - Automatically created system user with no login shell, no home directory
-   - Minimal permissions, isolated from other system activities
-   - Best practice for production environments
-
-2. **Current user (`--use-current-user`)**
-   - Simpler deployment, no user creation needed
-   - Suitable for testing or personal servers
-   - Still secure with systemd hardening (see below)
-
-3. **Specific user (`--user <username>`)**
-   - Use existing system users like `nobody`, `www-data`, etc.
-   - Flexible for integration with existing setups
-
-**Technical details:**
-- **Port ≥ 1024 (default 30399)**: Any non-root user can run derper without special capabilities
-- **Port < 1024 (e.g., 443)**: Script automatically grants `CAP_NET_BIND_SERVICE` via systemd, regardless of which user you choose
-- **Cross-distro compatibility**: Automatically detects `nologin` path (`/sbin/nologin` for RHEL/CentOS, `/usr/sbin/nologin` for Debian/Ubuntu, falls back to `/bin/false`)
-- **Robust user creation**: Validates user/group existence before and after creation, with clear error messages on failure
-
-### systemd Security Hardening
-
-The generated systemd service includes multiple protection layers:
-
-```ini
-# Prevent privilege escalation
-NoNewPrivileges=true
-
-# Filesystem protection
-ProtectSystem=strict        # Read-only /usr, /boot, /efi
-ProtectHome=true            # Inaccessible /home, /root, /run/user
-PrivateTmp=true             # Private /tmp and /var/tmp
-ReadWritePaths=/opt/derper  # Only allow writes to installation dir
-
-# Network restrictions
-RestrictAddressFamilies=AF_INET AF_INET6  # Only IPv4/IPv6
-
-# System call filtering
-SystemCallFilter=@system-service  # Whitelist safe syscalls only
-SystemCallErrorNumber=EPERM       # Deny with EPERM instead of killing
-```
-
-### Certificate Security
-
-- **Private key protection**: `privkey.pem` set to `600` (owner read/write only)
-- **Directory isolation**: Certificate directory (`/opt/derper/certs`) set to `750` with `derper:derper` ownership
-- **SHA256 verification**: Go toolchain downloads are integrity-checked before extraction
-
-### Network Security
-
-- **Client verification**: `-verify-clients` enabled by default (requires local tailscaled authentication)
-- **Firewall guidance**: Script provides instructions for UFW, firewalld, and iptables
-- **Port restriction**: Only opens necessary ports (DERP TLS + STUN UDP)
-
-### Additional Recommendations
-
-For production deployments, consider:
-
-1. **Use trusted CA certificates** instead of self-signed (via Let's Encrypt/ACME or your organization's CA)
-2. **Deploy on port 443** for better firewall traversal: `--derp-port 443`
-3. **Enable automatic updates** for derper binary and system packages
-4. **Monitor with Prometheus**: Use `--health-check --metrics-textfile` for alerting
-5. **Regular certificate rotation**: Current validity is 365 days by default
-
----
-
-## Common Verification Commands
+After deployment:
 
 ```bash
-# Service status and logs
-systemctl status derper
-journalctl -u derper -f
+# systemd service running normally
+$ systemctl status derper
+● derper.service - Tailscale DERP with self-signed IP cert
+     Loaded: loaded (/etc/systemd/system/derper.service; enabled)
+     Active: active (running) since Mon 2025-01-10 10:00:00 UTC
+```
 
-# Port listening (TCP 30399, UDP 3478)
-ss -tulpn | grep -E ':30399|:3478'
+#### 2. Port Listening Verification
 
-# TLS handshake (self-signed will warn untrusted, normal)
-openssl s_client -connect <your-public-ip>:30399 -servername <your-public-ip>
+```bash
+$ ss -tulpn | grep -E ':443|:3478'
+tcp   LISTEN  0  4096  *:443   *:*     users:(("derper",pid=1234))
+udp   LISTEN  0  4096  *:3478  *:*     users:(("derper",pid=1234))
+```
 
-# STUN port reachability (client/external host)
-nc -zvu <your-public-ip> 3478
+#### 3. Certificate Fingerprint Authentication
 
-# Client observe DERP:
-tailscale netcheck
+**Security Model:**
+```
+Client → Connect to 203.0.113.10:443
+       ↓
+       Verify certificate DER SHA256 matches CertName in ACL
+       ↓
+   ✅ Match → Establish connection
+   ❌ Mismatch → Reject connection (prevent MITM attacks)
+```
 
-# Check if "via DERP(my-derp)"
-tailscale ping -c 5 <peer-tailscale-ip>
+**Comparison with Traditional Solutions:**
+
+| Solution | Security | Configuration Complexity | Cost |
+|----------|----------|-------------------------|------|
+| **CertName Fingerprint (This Script)** | ⭐⭐⭐⭐⭐ | Low | Free |
+| InsecureForTests | ⭐ | Very Low | Free |
+| Let's Encrypt + Domain | ⭐⭐⭐⭐⭐ | Medium | Domain purchase required |
+| Commercial CA Certificate | ⭐⭐⭐⭐⭐ | High | Paid |
+
+#### 4. Client Experience
+
+On any Tailscale client:
+
+```bash
+# View DERP latency
+$ tailscale netcheck
+  * my-derp (203.0.113.10:443) = 15ms  ⭐ Fastest
+
+# Auto-select fastest relay when connecting to peers
+$ tailscale ping peer-device
+pong from peer-device (100.x.x.x) via DERP(my-derp) in 18ms
+```
+
+#### 5. Monitoring Integration
+
+With Grafana dashboard:
+
+```
+┌─────────────────────────────────────┐
+│  DERP Service Status                 │
+│  ✅ Running  Uptime: 15d 3h 42m     │
+├─────────────────────────────────────┤
+│  TLS Port (443)      ✅ Listening   │
+│  STUN Port (3478)    ✅ Listening   │
+│  Certificate Expiry  287 days       │
+│  Memory Usage        3.2 MiB        │
+└─────────────────────────────────────┘
 ```
 
 ---
 
-## Firewall Configuration (Multi-platform)
+### 🔍 Key Technical Highlights
 
-The script automatically detects and provides instructions for your firewall solution:
-
-### UFW (Ubuntu/Debian)
+#### 1. Idempotency Design
 
 ```bash
-# Manual execution
-ufw allow 30399/tcp
-ufw allow 3478/udp
+# First run: Complete installation
+$ sudo bash script.sh --ip X.X.X.X
+[Step] Installing dependencies...
+[Step] Building derper...
+✅ Service started
 
-# Or use --auto-ufw flag for automatic configuration
-sudo bash scripts/deploy_derper_ip_selfsigned.sh --ip <your-public-ip> --auto-ufw
+# Second run: Auto-skip
+$ sudo bash script.sh --ip X.X.X.X
+✅ Ready: Detected derper running in pure IP mode, skipping installation.
 ```
 
-### firewalld (RHEL/CentOS/Fedora)
+#### 2. Intelligent Fault Recovery
+
+The script automatically detects and fixes:
+- ✅ Certificate expired → Auto re-sign
+- ✅ Config drift → Rewrite systemd unit
+- ✅ Port conflicts → Early error with hints
+- ✅ Permission issues → Auto-configure tailscaled socket ACL
+
+#### 3. Cross-Version Compatibility
 
 ```bash
-firewall-cmd --permanent --add-port=30399/tcp
-firewall-cmd --permanent --add-port=3478/udp
-firewall-cmd --reload
-```
-
-### iptables (Direct rules)
-
-```bash
-# Add rules
-iptables -I INPUT -p tcp --dport 30399 -j ACCEPT
-iptables -I INPUT -p udp --dport 3478 -j ACCEPT
-
-# Save rules (Debian/Ubuntu with netfilter-persistent)
-netfilter-persistent save
-
-# Or save rules (RHEL/CentOS with iptables-services)
-service iptables save
-```
-
-**Note**: Don't forget to also open these ports in your cloud provider's security groups (AWS, Alibaba Cloud, etc.).
-
----
-
-## Troubleshooting
-
-### Get Certificate Fingerprint (logs/online handshake quick reference)
-
-When need to fill `CertName` (sha256-raw:<hex>) in ACL or suspect certificate mismatch, use these two methods to quickly get current fingerprint:
-
-1) Extract from systemd logs (derper prints on service start)
-
-```bash
-journalctl -u derper --no-pager | grep -oE 'sha256-raw:[0-9a-f]+' | tail -1
-```
-
-2) Online TLS handshake capture current certificate and calculate (no need to login server filesystem)
-
-Linux (using sha256sum):
-
-```bash
-openssl s_client -connect <your-public-ip>:<DERP_PORT> -servername <your-public-ip> -showcerts </dev/null \
-  | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' \
-  | openssl x509 -outform DER \
-  | sha256sum | awk '{print $1}'
-```
-
-macOS (using shasum):
-
-```bash
-openssl s_client -connect <your-public-ip>:<DERP_PORT> -servername <your-public-ip> -showcerts </dev/null \
-  | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' \
-  | openssl x509 -outform DER \
-  | shasum -a 256 | awk '{print $1}'
-```
-
-Additional: If certificate file generated locally, can also directly calculate from file (same as "How to Retrieve Certificate Fingerprint Again"):
-
-```bash
-openssl x509 -in /opt/derper/certs/fullchain.pem -outform DER | sha256sum | awk '{print $1}'
-```
-
-Tip: Replace `<DERP_PORT>` with actual port (default 30399). If handshake fails, check cloud security groups/local firewall opening, `derper` running status, and port occupation.
-
----
-
-## Monitoring & Alerting (Health Check + Prometheus)
-
-### Health Check (for cron periodic execution)
-
-```bash
-# Only output health summary (no system changes)
-sudo bash scripts/deploy_derper_ip_selfsigned.sh --ip <your-public-ip> --health-check
-
-# Also export Prometheus text metrics (for node_exporter textfile collector to scrape)
-sudo bash scripts/deploy_derper_ip_selfsigned.sh \
-  --ip <your-public-ip> \
-  --health-check \
-  --metrics-textfile /var/lib/node_exporter/textfile_collector/derper.prom
-```
-
-Exit code semantics (for shell/monitoring decision):
-
-```text
-0  Key health items normal (service running + TLS/UDP ports both listening)
-1  At least one critical health check failed (service or port unhealthy)
-```
-
-Example (alert only on anomaly):
-
-```bash
-if ! sudo bash scripts/deploy_derper_ip_selfsigned.sh --ip <your-public-ip> --health-check >/tmp/derper_health.txt 2>&1; then
-  echo "[ALERT] DERP health check failed" >&2
-  tail -n +1 /tmp/derper_health.txt >&2
+# Auto-adapt new/old version parameters
+if derper_supports_listen_a; then
+    listen_flag="-a :${DERP_PORT}"      # New version
+elif derper_supports_https_port; then
+    listen_flag="-https-port ${DERP_PORT}"  # Old version
 fi
 ```
 
-Example output (excerpt):
+---
 
-```text
-✅ Service: derper is running
-✅ Port: TLS 30399/tcp is listening
-✅ Port: STUN 3478/udp is listening
-✅ Certificate: 287 days remaining
-ℹ️  Resource: derper memory RSS ~3 MiB
-```
+### 📊 Typical Application Scenarios
 
-Prometheus metrics sample (text file content):
-
-```text
-derper_up 1
-derper_tls_listen 1
-derper_stun_listen 1
-derper_cert_days_remaining 287
-derper_verify_clients 1
-derper_pure_ip_config_ok 1
-derper_process_rss_bytes 3145728
-```
-
-Notes:
-- This script's built-in is "textfile export" method, recommended with `node_exporter`'s `--collector.textfile`;
-- If you've deployed `node_exporter` (default listens 9100), Prometheus directly scrapes its 9100 port, while enabling textfile collection of above file;
-- To change file path, adjust `node_exporter`'s `--collector.textfile.directory` parameter accordingly.
-
-crontab example (refresh metrics every 1 minute):
-
-```cron
-* * * * * root bash /path/scripts/deploy_derper_ip_selfsigned.sh --ip <your-public-ip> --health-check --metrics-textfile /var/lib/node_exporter/textfile_collector/derper.prom >/var/log/derper_health.log 2>&1
-```
+| Scenario | Recommended Configuration | Expected Results |
+|----------|---------------------------|------------------|
+| **Personal Learning** | `--use-current-user --security-level basic` | 5-min deployment, < 5MB resource usage |
+| **Home Network** | `--derp-port 443 --auto-ufw` | High traversal rate, auto-acceleration for family devices |
+| **Small Teams** | `--dedicated-user --health-check` | Stable operation with monitoring alerts |
+| **Production** | `--security-level paranoid --metrics-textfile` | Enterprise-grade security, full observability |
 
 ---
 
-## Running `tailscaled` (for client verification)
+### ⚠️ Important Notes
 
-If script/service enables `-verify-clients`, local machine needs `tailscaled` running and logged into Tailnet:
+#### Must Read
+
+1. **This script generates self-signed certificates**, verified only by fingerprint, not trusted by browsers
+   - ✅ Suitable for: Tailscale internal relay (verified via CertName)
+   - ❌ Not suitable for: Public web services
+
+2. **Production Environment Recommendations**:
+   - Use port 443 to improve traversal rate
+   - Enable `--dedicated-user` for permission isolation
+   - Configure Prometheus monitoring
+   - Regularly backup certificate directory (fingerprint changes require ACL updates)
+
+3. **Certificate Fingerprint Pinning Mechanism**:
+   - Once `CertName` is configured in ACL, subsequent certificate replacement (re-signing, rotation) will cause connection failures
+   - Solution: Re-run script to get new fingerprint, update ACL
+
+---
+
+### 🎓 Summary
+
+This project compresses the originally manual **20+ steps DERP deployment process** into **a single command** through an intelligent **2100+ line script**, while ensuring:
+
+- ✅ **Security**: Enterprise-grade systemd hardening + least-privilege execution
+- ✅ **Stability**: Idempotent design + automatic fault recovery
+- ✅ **Observability**: Health checks + Prometheus metrics
+- ✅ **Maintainability**: Full coverage of repair/force/uninstall modes
+
+Whether you're an **individual user quickly setting up a testing environment** or an **enterprise team building a production relay network**, you can complete deployment and put it into use within 5 minutes.
+
+---
+
+### 📚 Further Reading
+
+- **Detailed Technical Documentation**:
+  - [Changelog (English)](docs/CHANGELOG_EN.md) | [更新日志（中文）](docs/CHANGELOG_CN.md)
+  - [Technical Reference (English)](docs/REFERENCE_EN.md) | [技术参考（中文）](docs/REFERENCE_CN.md)
+
+---
+
+<a id="中文"></a>
+
+## 中文
+
+### 📋 项目概述
+
+本项目提供了一个**全自动化的 Tailscale DERP 中继服务部署方案**，专门针对**仅有公网 IP、无域名**的场景设计。主要解决以下痛点：
+
+#### 核心目标
+
+1. **零域名部署**：无需购买域名，仅凭公网 IP 即可搭建 DERP 中继
+2. **安全优先**：自动生成基于 IP 的自签证书，使用证书指纹（`CertName`）验证，无需不安全的 `InsecureForTests` 标记
+3. **开箱即用**：一条命令完成从依赖安装到服务启动的全流程
+4. **生产级质量**：内置安全加固、健康检查、监控指标导出等企业级特性
+
+#### 适用场景
+
+- 🧪 **测试环境**：快速搭建临时中继节点
+- 🏠 **家庭网络**：利用家宽公网 IP 搭建私有中继
+- 👥 **小团队**：低成本构建内部 Tailscale 加速节点
+- 🚀 **快速原型**：无需等待 DNS/证书配置，立即验证网络拓扑
+
+---
+
+### 🎯 核心特性
+
+#### 1. 智能化部署
+
+- ✅ **幂等设计**：多次运行安全，自动识别已有配置
+- ✅ **参数自适应**：自动检测新旧版本 derper 参数差异（`-a` vs `-https-port`）
+- ✅ **智能修复**：`--repair` 模式仅修复配置，不中断服务
+
+#### 2. 安全加固
+
+- 🔒 **分级安全策略**：basic/standard/paranoid 三级 systemd 加固
+- 🔒 **灵活用户管理**：支持当前用户/专用用户/自定义用户三种模式
+- 🔒 **客户端校验**：默认启用 `-verify-clients`，拒绝未授权访问
+- 🔒 **权限最小化**：通过 `CAP_NET_BIND_SERVICE` 能力授予，无需 root 运行
+
+#### 3. 企业级运维
+
+- 📊 **健康检查**：内置 `--health-check` 输出服务状态摘要
+- 📊 **Prometheus 集成**：导出 textfile 格式指标，无缝对接监控体系
+- 🔧 **多模式运行**：check/repair/force 三种模式满足不同场景
+- 🗑️ **完整卸载**：`--uninstall` 支持保留/清理/彻底删除三级选项
+
+#### 4. 跨环境兼容
+
+- 🐧 **多发行版支持**：Debian/Ubuntu/RHEL/CentOS/Fedora 等
+- 🔥 **防火墙适配**：自动识别 UFW/firewalld/iptables
+- 🌐 **国内网络优化**：内置 GOPROXY/GOSUMDB 镜像配置
+
+---
+
+### 🚀 使用方法
+
+#### 快速开始（三步部署）
+
+##### 第一步：登录 Tailscale（必需）
 
 ```bash
+# 启动 tailscaled 守护进程
 sudo systemctl enable --now tailscaled
+
+# 登录 Tailnet（浏览器授权）
 sudo tailscale up
-# Or: sudo tailscale up --authkey tskey-xxxx
+
+# 或使用预生成 Auth Key（自动化部署）
+sudo tailscale up --authkey tskey-xxxxxxxxxxxxxxxxxxxx
 ```
 
-If temporarily unable to login, can append `--no-verify-clients` when running script (testing only).
-
----
-
-## Uninstall
+##### 第二步：预检查（推荐）
 
 ```bash
-# Stop and uninstall systemd service (keep binary and certificates)
-sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall
-
-# Uninstall and cleanup installation directory (certificates etc.)
-sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall --purge
-
-# Complete cleanup (including binary /usr/local/bin/derper)
-sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall --purge-all
+sudo bash scripts/deploy_derper_ip_selfsigned.sh \
+  --ip <你的公网IP> \
+  --check
 ```
 
-Note: Uninstall doesn't affect Tailscale itself (tailscaled, clients etc.). To remove together, use distro's normal method.
+**预检会输出：**
+- 公网 IP 探测结果
+- 端口占用情况
+- Tailscale 安装与登录状态
+- 系统依赖完整性
+- 给出修复建议
 
----
+##### 第三步：正式部署
 
-## Common Issues & Troubleshooting
-
-- Go proxy timeout:
-  - Use China mainland proxy and checksum mirror, e.g.:
-    ```bash
-    --goproxy https://goproxy.cn,direct --gosumdb sum.golang.google.cn
-    ```
-- Go version insufficient:
-  - New Tailscale requires Go ≥ 1.25. Script defaults to `--gotoolchain auto`, will auto-fetch higher version toolchain.
-- derper parameter incompatibility:
-  - New version removes `-https-port`, uses `-a :<PORT>`. Script auto-adapts, no manual changes needed.
-- `-verify-clients` failure:
-  - Confirm `tailscaled` normal and `/run/tailscale/tailscaled.sock` visible; or use `--no-verify-clients` in script temporarily.
-- IPv6 health warning (`ip6tables MARK`):
-  - Try: `sudo modprobe xt_mark && sudo systemctl restart tailscaled`
-  - Or switch to legacy backend:
-    ```bash
-    sudo update-alternatives --set iptables /usr/sbin/iptables-legacy
-    sudo update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy
-    sudo systemctl restart tailscaled
-    ```
-- Port blocked:
-  - Confirm "cloud security groups + local firewall (like UFW)" opened `DERP_PORT/tcp` and `3478/udp`.
-
----
-
-## Change Port to 443 (Optional)
-
-Some networks are friendlier to `443/tcp`:
-
-1) Modify service listening port: Run script with `--derp-port 443`.
-2) In ACL, change `DERPPort` to `443`.
-3) Open cloud security groups/local firewall's `443/tcp`.
-
-> Note: Still uses "IP-based self-signed certificate + CertName fingerprint" for verification.
-
----
-
-## Maintenance & Upgrade
+**方案 A：个人/测试环境（使用当前用户，最简单）**
 
 ```bash
-# View/restart service
-systemctl status derper
-systemctl restart derper
-
-# Upgrade derper binary (keep existing service and certificates)
-GOTOOLCHAIN=auto go install tailscale.com/cmd/derper@latest
-systemctl restart derper
-
-# Backup certificates (fingerprint change requires ACL update)
-tar -C /opt/derper -czf derper-certs-backup.tgz certs/
+sudo bash scripts/deploy_derper_ip_selfsigned.sh \
+  --ip <你的公网IP> \
+  --use-current-user \
+  --security-level basic \
+  --auto-ufw
 ```
 
-Uninstall (use with caution):
+**方案 B：生产环境（专用用户 + 高安全）**
 
 ```bash
-sudo systemctl disable --now derper
-sudo rm -f /etc/systemd/system/derper.service
-sudo systemctl daemon-reload
-sudo rm -rf /opt/derper
-sudo rm -f /usr/local/bin/derper
+sudo bash scripts/deploy_derper_ip_selfsigned.sh \
+  --ip <你的公网IP> \
+  --dedicated-user \
+  --security-level paranoid \
+  --derp-port 443 \
+  --auto-ufw \
+  --goproxy https://goproxy.cn,direct \
+  --gosumdb sum.golang.google.cn
+```
+
+**方案 C：向导模式（新手友好）** 🆕
+
+```bash
+sudo bash scripts/deploy_derper_ip_selfsigned.sh wizard
+```
+
+向导会交互式询问：
+1. 使用场景（个人/团队/生产）
+2. 账户策略（当前用户/专用用户）
+3. 端口选择（443/30399）
+4. 是否启用客户端验证
+
+然后自动生成适合你的部署命令。
+
+---
+
+### ⚙️ 参数详解
+
+#### 默认参数（无需显式指定）
+
+```bash
+DERP_PORT="30399"              # DERP TLS 端口
+STUN_PORT="3478"               # STUN UDP 端口
+CERT_DAYS="365"                # 证书有效期（1 年）
+INSTALL_DIR="/opt/derper"      # 安装目录
+BIN_PATH="/usr/local/bin/derper"
+VERIFY_CLIENTS_MODE="on"       # 启用客户端校验（安全默认）
+SECURITY_LEVEL="standard"      # 标准安全级别
+RUN_USER="${SUDO_USER:-$USER}" # 使用当前登录用户
+```
+
+#### 核心参数
+
+##### 网络配置
+
+| 参数 | 说明 | 默认值 | 示例 |
+|------|------|--------|------|
+| `--ip <IPv4>` | 服务器公网 IP | 自动探测 | `--ip 203.0.113.10` |
+| `--derp-port <int>` | DERP TLS 端口 | 30399 | `--derp-port 443` |
+| `--stun-port <int>` | STUN UDP 端口 | 3478 | `--stun-port 3478` |
+| `--auto-ufw` | 自动配置 UFW 规则 | 关闭 | `--auto-ufw` |
+
+**端口选择建议：**
+- **30399**（默认）：避免与 Web 服务冲突，适合多服务器
+- **443**：防火墙穿透性最佳，但需注意是否与 HTTPS 服务冲突
+
+##### Go 构建配置（国内必备）
+
+| 参数 | 说明 | 默认值 | 推荐值（国内） |
+|------|------|--------|----------------|
+| `--goproxy <URL>` | Go 模块代理 | 继承环境 | `https://goproxy.cn,direct` |
+| `--gosumdb <VALUE>` | Go 校验数据库 | 继承环境 | `sum.golang.google.cn` |
+| `--gotoolchain <MODE>` | 工具链策略 | `auto` | `auto`（自动获取 ≥1.25）|
+
+##### 安全与账户管理
+
+| 参数 | 说明 | 默认行为 | 使用场景 |
+|------|------|----------|----------|
+| `--use-current-user` | 使用当前登录用户 | ✅ 默认 | 个人服务器、测试环境 |
+| `--dedicated-user` | 创建专用 `derper` 用户 | 关闭 | **生产环境强烈推荐** |
+| `--user <username>` | 指定已有用户 | - | 集成到现有环境（如 `nobody`） |
+| `--security-level <level>` | 安全加固级别 | `standard` | `basic`/`standard`/`paranoid` |
+
+**安全级别对比：**
+
+| 级别 | systemd 保护项 | 兼容性 | 适用场景 |
+|------|----------------|--------|----------|
+| **basic** | 最小保护（NoNewPrivileges + ProtectSystem） | 最佳 | 旧内核、嵌入式设备 |
+| **standard** | 标准加固（+PrivateTmp +RestrictAddressFamilies） | 良好 | **推荐默认** |
+| **paranoid** | 最严格（+ProtectProc +RestrictNamespaces） | 需要 Linux 5.8+、systemd 247+ | 高安全要求环境 |
+
+##### 客户端验证
+
+| 参数 | 说明 | 默认 | 安全影响 |
+|------|------|------|----------|
+| `--force-verify-clients` | 强制启用客户端校验 | ✅ 默认 | 仅允许 Tailnet 内设备连接 |
+| `--no-verify-clients` | 禁用客户端校验 | 关闭 | ⚠️ 任何人可连接（仅测试用） |
+
+##### ACL 区域配置
+
+| 参数 | 说明 | 默认值 | 用途 |
+|------|------|--------|------|
+| `--region-id <int>` | ACL derpMap 的 RegionID | 900 | 唯一标识你的中继节点 |
+| `--region-code <string>` | RegionCode | `my-derp` | 短代码（在 `tailscale status` 中显示） |
+| `--region-name <string>` | RegionName | `My IP DERP` | 人类可读名称 |
+
+##### 运行模式
+
+| 参数 | 说明 | 系统影响 | 使用时机 |
+|------|------|----------|----------|
+| `--check` / `--dry-run` | 仅检查，不修改系统 | ❌ 无 | 诊断问题、验证参数 |
+| `--repair` | 修复配置（证书/服务） | 🔧 重启服务 | 证书过期、配置漂移 |
+| `--force` | 强制全量重装 | 🔄 完全重建 | 版本升级、彻底重置 |
+
+##### 运维与监控
+
+| 参数 | 说明 | 输出 | 适用场景 |
+|------|------|------|----------|
+| `--health-check` | 输出健康状态摘要 | 文本 + 退出码 | cron 定时检查、告警脚本 |
+| `--metrics-textfile <path>` | 导出 Prometheus 指标 | `.prom` 文件 | 配合 node_exporter 监控 |
+
+**Prometheus 指标示例：**
+
+```prometheus
+derper_up 1                          # 服务是否运行
+derper_tls_listen 1                  # TLS 端口是否监听
+derper_stun_listen 1                 # STUN 端口是否监听
+derper_cert_days_remaining 287       # 证书剩余天数
+derper_verify_clients 1              # 是否启用客户端校验
+derper_process_rss_bytes 3145728     # 进程内存占用（字节）
+```
+
+##### 卸载清理
+
+| 参数 | 说明 | 删除内容 | 保留内容 |
+|------|------|----------|----------|
+| `--uninstall` | 停止并删除服务 | systemd 单元 | 二进制、证书 |
+| `--uninstall --purge` | + 删除安装目录 | + `/opt/derper` | 二进制 |
+| `--uninstall --purge-all` | + 删除二进制 | + `/usr/local/bin/derper` | - |
+
+---
+
+### 🎬 部署流程演示
+
+#### 完整示例：从零到可用
+
+```bash
+# 1. 登录服务器，确保有公网 IP
+ssh user@203.0.113.10
+
+# 2. 安装 Tailscale 客户端（如未安装）
+curl -fsSL https://tailscale.com/install.sh | sh
+
+# 3. 启动并登录 Tailnet
+sudo systemctl enable --now tailscaled
+sudo tailscale up  # 复制登录 URL 到浏览器
+
+# 4. 下载部署脚本
+git clone <repository-url>
+cd tailscale-derp-quick-deploy
+
+# 5. 预检查（推荐）
+sudo bash scripts/deploy_derper_ip_selfsigned.sh \
+  --ip 203.0.113.10 \
+  --check
+
+# 6. 正式部署（国内网络）
+sudo bash scripts/deploy_derper_ip_selfsigned.sh \
+  --ip 203.0.113.10 \
+  --derp-port 443 \
+  --dedicated-user \
+  --security-level standard \
+  --auto-ufw \
+  --goproxy https://goproxy.cn,direct \
+  --gosumdb sum.golang.google.cn
+
+# 7. 脚本会自动完成：
+#    ✅ 安装 Go、derper、openssl 等依赖
+#    ✅ 生成自签证书（/opt/derper/certs/）
+#    ✅ 创建 systemd 服务并启动
+#    ✅ 输出 derpMap 配置片段
+```
+
+#### 输出示例
+
+脚本成功后会输出类似内容：
+
+```json
+==================== 推荐粘贴到 Tailscale 管理后台的 derpMap 片段 ====================
+{
+  "derpMap": {
+    "OmitDefaultRegions": false,
+    "Regions": {
+      "900": {
+        "RegionID": 900,
+        "RegionCode": "my-derp",
+        "RegionName": "My IP DERP",
+        "Nodes": [
+          {
+            "Name": "900a",
+            "RegionID": 900,
+            "HostName": "203.0.113.10",
+            "DERPPort": 443,
+            "CertName": "sha256-raw:a1b2c3d4e5f6..."
+          }
+        ]
+      }
+    }
+  }
+}
+====================================================================================
+
+完成：DERP 服务已部署并运行。
+- 服务状态：systemctl status derper
+- 实时日志：journalctl -u derper -f
+- 证书位置：/opt/derper/certs/
 ```
 
 ---
 
-## Checklist
+### 🎯 达成效果
 
-- [ ] Server opens `DERP_PORT/tcp` and `3478/udp` (cloud security groups + local firewall).
-- [ ] Run script and record output `CertName` fingerprint.
-- [ ] In Tailscale admin console ACL, paste `derpMap` (using `CertName`).
-- [ ] On clients, run `tailscale netcheck`, `tailscale ping` to verify "via DERP(my-derp)".
-- [ ] Backup `/opt/derper/certs/` to prevent fingerprint change from certificate changes.
+#### 1. 服务状态
 
+部署完成后，你会获得：
+
+```bash
+# systemd 服务正常运行
+$ systemctl status derper
+● derper.service - Tailscale DERP with self-signed IP cert
+     Loaded: loaded (/etc/systemd/system/derper.service; enabled)
+     Active: active (running) since Mon 2025-01-10 10:00:00 UTC
+```
+
+#### 2. 端口监听验证
+
+```bash
+$ ss -tulpn | grep -E ':443|:3478'
+tcp   LISTEN  0  4096  *:443   *:*     users:(("derper",pid=1234))
+udp   LISTEN  0  4096  *:3478  *:*     users:(("derper",pid=1234))
+```
+
+#### 3. 证书指纹认证
+
+**安全模型：**
+```
+客户端 → 连接 203.0.113.10:443
+       ↓
+       验证证书 DER 的 SHA256 是否匹配 ACL 中的 CertName
+       ↓
+   ✅ 匹配 → 建立连接
+   ❌ 不匹配 → 拒绝连接（防中间人攻击）
+```
+
+**对比传统方案：**
+
+| 方案 | 安全性 | 配置复杂度 | 成本 |
+|------|--------|------------|------|
+| **CertName 指纹（本脚本）** | ⭐⭐⭐⭐⭐ | 低 | 免费 |
+| InsecureForTests | ⭐ | 极低 | 免费 |
+| Let's Encrypt + 域名 | ⭐⭐⭐⭐⭐ | 中 | 需购买域名 |
+| 商业 CA 证书 | ⭐⭐⭐⭐⭐ | 高 | 付费 |
+
+#### 4. 客户端体验
+
+在任意 Tailscale 客户端：
+
+```bash
+# 查看 DERP 延迟
+$ tailscale netcheck
+  * my-derp (203.0.113.10:443) = 15ms  ⭐ 最快
+
+# 连接对端时自动选择最快中继
+$ tailscale ping peer-device
+pong from peer-device (100.x.x.x) via DERP(my-derp) in 18ms
+```
+
+#### 5. 监控集成效果
+
+配合 Grafana 仪表盘：
+
+```
+┌─────────────────────────────────────┐
+│  DERP 服务状态                       │
+│  ✅ 运行中  Uptime: 15d 3h 42m      │
+├─────────────────────────────────────┤
+│  TLS 端口（443）     ✅ 监听        │
+│  STUN 端口（3478）   ✅ 监听        │
+│  证书有效期          287 天         │
+│  内存占用            3.2 MiB        │
+└─────────────────────────────────────┘
+```
+
+---
+
+### 🔍 关键技术亮点
+
+#### 1. 幂等性设计
+
+```bash
+# 第一次运行：完整安装
+$ sudo bash script.sh --ip X.X.X.X
+[步骤] 安装依赖...
+[步骤] 构建 derper...
+✅ 服务已启动
+
+# 第二次运行：自动跳过
+$ sudo bash script.sh --ip X.X.X.X
+✅ 已就绪：检测到 derper 正在以纯 IP 模式运行，跳过安装。
+```
+
+#### 2. 智能故障恢复
+
+脚本会自动检测并修复：
+- ✅ 证书过期 → 自动重签
+- ✅ 配置漂移 → 重写 systemd 单元
+- ✅ 端口冲突 → 提前报错并提示
+- ✅ 权限问题 → 自动配置 tailscaled socket ACL
+
+#### 3. 跨版本兼容
+
+```bash
+# 自动适配新旧版本参数
+if derper_supports_listen_a; then
+    listen_flag="-a :${DERP_PORT}"      # 新版
+elif derper_supports_https_port; then
+    listen_flag="-https-port ${DERP_PORT}"  # 旧版
+fi
+```
+
+---
+
+### 📊 典型应用场景对比
+
+| 场景 | 推荐配置 | 预期效果 |
+|------|----------|----------|
+| **个人学习** | `--use-current-user --security-level basic` | 5分钟部署，资源占用 < 5MB |
+| **家庭网络** | `--derp-port 443 --auto-ufw` | 穿透率高，家人设备自动加速 |
+| **小团队** | `--dedicated-user --health-check` | 稳定运行，配合监控告警 |
+| **生产环境** | `--security-level paranoid --metrics-textfile` | 企业级安全，全链路可观测 |
+
+---
+
+### ⚠️ 重要说明
+
+#### 必须阅读
+
+1. **本脚本生成的是自签证书**，仅通过指纹验证，不被浏览器信任
+   - ✅ 适合：Tailscale 内部中继（通过 CertName 验证）
+   - ❌ 不适合：公开 Web 服务
+
+2. **生产环境建议**：
+   - 使用 443 端口提升穿透率
+   - 启用 `--dedicated-user` 隔离权限
+   - 配置 Prometheus 监控
+   - 定期备份证书目录（指纹变化需更新 ACL）
+
+3. **证书指纹固定机制**：
+   - 一旦在 ACL 中配置 `CertName`，后续证书更换（如重签、轮换）会导致连接失败
+   - 解决方法：重新运行脚本获取新指纹，更新 ACL
+
+---
+
+### 🎓 总结
+
+这个项目通过一个 **2100+ 行的智能脚本**，将原本需要手动执行 20+ 步骤的 DERP 部署流程，压缩为**一条命令**，同时保证：
+
+- ✅ **安全性**：企业级 systemd 加固 + 最小权限运行
+- ✅ **稳定性**：幂等设计 + 自动故障恢复
+- ✅ **可观测**：健康检查 + Prometheus 指标
+- ✅ **易维护**：repair/force/uninstall 模式全覆盖
+
+无论你是**个人用户快速搭建测试环境**，还是**企业团队构建生产级中继网络**，都能在 5 分钟内完成部署并投入使用。
+
+---
+
+### 📚 进一步阅读
+
+- **详细技术文档**：
+  - [更新日志（中文）](docs/CHANGELOG_CN.md) | [Changelog (English)](docs/CHANGELOG_EN.md)
+  - [技术参考（中文）](docs/REFERENCE_CN.md) | [Technical Reference (English)](docs/REFERENCE_EN.md)
+
+---
+
+## 📄 License
+
+MIT License - See [LICENSE](LICENSE) file for details
+
+## 🤝 Contributing
+
+Contributions are welcome! Please feel free to submit a Pull Request.
+
+## 📮 Support
+
+- Issues: [GitHub Issues](../../issues)
+- Documentation: [docs/](docs/)
+- Test Suite: [tests/](tests/)
