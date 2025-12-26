@@ -24,6 +24,11 @@ GOPROXY_ARG=""                 # 例：https://goproxy.cn,direct
 GOSUMDB_ARG=""                 # 例：sum.golang.google.cn
 GOTOOLCHAIN_ARG="auto"         # auto|local（默认 auto 以满足 >=1.25）
 
+# Go 版本配置（用于 ensure_go 自动安装）
+GO_VERSION="1.22.6"
+GO_SHA256_AMD64="999805bed7d9039ec3da1a53bfbcafc13e367da52aa823cb60b68ba22d44c616"
+GO_SHA256_ARM64="c15fa895341b8eaf7f219fada25c36a610eb042985dc1a912410c1c90098eaf2"
+
 # 客户端校验：on=强制启用；off=禁用（默认 on）
 VERIFY_CLIENTS_MODE="on"
 
@@ -427,26 +432,26 @@ validate_settings() {
   # 端口合法性
   if ! [[ "${DERP_PORT}" =~ ^[0-9]+$ ]] || (( DERP_PORT < 1 || DERP_PORT > 65535 )); then
     echo "[错误] --derp-port 必须为 1-65535 的整数，当前：${DERP_PORT}" >&2
-    exit 1
+    return 1
   fi
   if ! [[ "${STUN_PORT}" =~ ^[0-9]+$ ]] || (( STUN_PORT < 1 || STUN_PORT > 65535 )); then
     echo "[错误] --stun-port 必须为 1-65535 的整数，当前：${STUN_PORT}" >&2
-    exit 1
+    return 1
   fi
   if ! [[ "${CERT_DAYS}" =~ ^[0-9]+$ ]] || (( CERT_DAYS < 1 )); then
     echo "[错误] --cert-days 必须为正整数，当前：${CERT_DAYS}" >&2
-    exit 1
+    return 1
   fi
   # IPv4 合法性校验：格式 + 每段范围 0-255
   if ! [[ "${IP_ADDR}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
     echo "[错误] 公网 IP 不合法：${IP_ADDR}" >&2
-    exit 1
+    return 1
   fi
   IFS='.' read -r o1 o2 o3 o4 <<< "${IP_ADDR}"
   for _oct in "$o1" "$o2" "$o3" "$o4"; do
     if ! [[ "$_oct" =~ ^[0-9]+$ ]] || (( _oct < 0 || _oct > 255 )); then
       echo "[错误] 公网 IP 字段超出范围（0-255）：${IP_ADDR}" >&2
-      exit 1
+      return 1
     fi
   done
 }
@@ -466,7 +471,7 @@ detect_public_ip() {
   fi
   if [[ -z "${IP_ADDR}" ]]; then
     echo "[错误] 无法自动探测公网 IP，请使用 --ip 明确指定。" >&2
-    exit 1
+    return 1
   fi
   echo "[信息] 使用公网 IP：${IP_ADDR}"
 }
@@ -692,24 +697,24 @@ ensure_go() {
     return 0
   fi
   # 兜底：按架构安装官方二进制（最新稳定工具链可再由 GOTOOLCHAIN 自动拉取）。
-  local arch os url tarball gov sha256_expected
+  local arch os url tarball sha256_expected
   os="linux"
   case "$(uname -m)" in
     x86_64|amd64) 
       arch="amd64"
-      sha256_expected="999805bed7d9039ec3da1a53bfbcafc13e367da52aa823cb60b68ba22d44c616"
+      sha256_expected="${GO_SHA256_AMD64}"
       ;;
     aarch64|arm64) 
       arch="arm64"
-      sha256_expected="c15fa895341b8eaf7f219fada25c36a610eb042985dc1a912410c1c90098eaf2"
+      sha256_expected="${GO_SHA256_ARM64}"
       ;;
     *) echo "[错误] 未支持的架构 $(uname -m)，请自行安装 Go >= 1.21" >&2; exit 1;;
   esac
-  gov="1.22.6"
-  url="https://go.dev/dl/go${gov}.${os}-${arch}.tar.gz"
-  tarball="/tmp/go${gov}.${os}-${arch}.tar.gz"
+  
+  url="https://go.dev/dl/go${GO_VERSION}.${os}-${arch}.tar.gz"
+  tarball="/tmp/go${GO_VERSION}.${os}-${arch}.tar.gz"
   command -v curl >/dev/null 2>&1 || install_deps
-  echo "[步骤] 下载安装 Go ${gov} (${arch}) 作为基础工具链…"
+  echo "[步骤] 下载安装 Go ${GO_VERSION} (${arch}) 作为基础工具链…"
   curl -fsSL "$url" -o "$tarball"
   
   # SHA256 完整性校验
@@ -1064,8 +1069,8 @@ write_systemd_service() {
   local tailscaled_socket_unit_has_override=0
   local tailscaled_socket_override_group=""
   local need_add_user_to_tailscale_group=0
+  local socket_path=""  # 在函数级别初始化，避免后续引用时未定义
   if [[ "${VERIFY_CLIENTS_MODE}" == "on" ]]; then
-    local socket_path=""
     if [[ -S /run/tailscale/tailscaled.sock ]]; then
       socket_path="/run/tailscale/tailscaled.sock"
     elif [[ -S /var/run/tailscale/tailscaled.sock ]]; then
@@ -1276,6 +1281,20 @@ EOT
     fi
   fi
 
+  # 动态构建 ExecStart 命令参数（避免空变量导致的格式问题）
+  local exec_args=("${BIN_PATH}")
+  [[ -n "${config_flag}" ]] && exec_args+=("${config_flag}")
+  exec_args+=("-hostname" "${IP_ADDR}")
+  exec_args+=("-certmode" "manual")
+  exec_args+=("-certdir" "${INSTALL_DIR}/certs")
+  exec_args+=("-http-port" "-1")
+  exec_args+=("${listen_flag}")
+  exec_args+=("${stun_flag}")
+  [[ -n "${verify_flag}" ]] && exec_args+=("${verify_flag}")
+  
+  # 将参数数组转换为单行命令字符串
+  local exec_start_line="${exec_args[*]}"
+
   # 根据 verify-clients 与已探测的 socket 路径，设置本地 API 环境变量
   local localapi_env_line=""
   if [[ "${VERIFY_CLIENTS_MODE}" == "on" ]]; then
@@ -1346,6 +1365,20 @@ MemoryDenyWriteExecute=true"
       ;;
   esac
 
+  # 构建 supplementary groups 行（避免空行）
+  local supplementary_groups_section=""
+  if [[ -n "${supplementary_groups_line}" ]]; then
+    supplementary_groups_section="
+${supplementary_groups_line}"
+  fi
+
+  # 构建 localapi 环境变量行（避免空行）
+  local localapi_env_section=""
+  if [[ -n "${localapi_env_line}" ]]; then
+    localapi_env_section="
+${localapi_env_line}"
+  fi
+
   cat >"${SERVICE_PATH}" <<SERVICE
 [Unit]
 Description=Tailscale DERP (derper) with self-signed IP cert
@@ -1355,22 +1388,12 @@ Wants=network-online.target tailscaled.service
 [Service]
 Type=simple
 User=${RUN_USER}
-Group=${run_group}
-${supplementary_groups_line}
+Group=${run_group}${supplementary_groups_section}
 
 # 环境变量（支持敏感配置）
-EnvironmentFile=-/etc/derper/derper.env
-${localapi_env_line}
+EnvironmentFile=-/etc/derper/derper.env${localapi_env_section}
 
-ExecStart=${BIN_PATH} \\
-  ${config_flag} \\
-  -hostname ${IP_ADDR} \\
-  -certmode manual \\
-  -certdir ${INSTALL_DIR}/certs \\
-  -http-port -1 \\
-  ${listen_flag} \\
-  ${stun_flag} \\
-  ${verify_flag}
+ExecStart=${exec_start_line}
 Restart=on-failure
 RestartSec=2
 LimitNOFILE=65535
@@ -1695,15 +1718,19 @@ health_check_report() {
 
   # 导出 Prometheus 文本（可被 node_exporter textfile collector 收集）
   if [[ -n "${METRICS_TEXTFILE}" ]]; then
-    write_prometheus_metrics "${METRICS_TEXTFILE}" "$days_left" "$rss_kb"
-    echo "[信息] 已写入 Prometheus 指标：${METRICS_TEXTFILE}"
+    if write_prometheus_metrics "${METRICS_TEXTFILE}" "$days_left" "$rss_kb"; then
+      echo "[信息] 已写入 Prometheus 指标：${METRICS_TEXTFILE}"
+    else
+      echo "[警告] Prometheus 指标写入失败：${METRICS_TEXTFILE}（建议使用 sudo 或选择可写路径）" >&2
+    fi
   fi
 }
 
 write_prometheus_metrics() {
   local path="$1" days_left="$2" rss_kb="$3"
   mkdir -p "$(dirname "$path")" 2>/dev/null || true
-  {
+  local tmp="${path}.tmp"
+  if ! {
     echo "# HELP derper_up Whether derper service is up (1)"
     echo "# TYPE derper_up gauge"
     [[ $DERPER_RUNNING -eq 1 ]] && echo "derper_up 1" || echo "derper_up 0"
@@ -1739,8 +1766,15 @@ write_prometheus_metrics() {
     else
       echo "derper_process_rss_bytes 0"
     fi
-  } >"$path".tmp
-  mv -f "$path".tmp "$path"
+  } >"$tmp"; then
+    echo "[警告] 写入 Prometheus 指标失败：$tmp（权限或路径问题）" >&2
+    return 1
+  fi
+  if ! mv -f "$tmp" "$path" 2>/dev/null; then
+    echo "[警告] 写入 Prometheus 指标失败：无法覆盖 $path" >&2
+    rm -f "$tmp" 2>/dev/null || true
+    return 1
+  fi
 }
 
 uninstall_derper() {
@@ -1838,6 +1872,13 @@ EOT
   echo "   b) 否（仅测试环境）"
   read -p "   请选择 (a/b): " verify_choice
   
+  # 问题5：网络环境
+  echo ""
+  echo "5. 服务器是否位于中国大陆？（用于 Go 代理加速）"
+  echo "   a) 是（推荐，配置 goproxy.cn）"
+  echo "   b) 否（全球环境）"
+  read -p "   请选择 (a/b): " region_choice
+  
   # 生成命令（使用模板替换，不用 eval）
   # 注意：每个参数必须是独立的数组元素，以便 exec 正确执行
   local cmd_parts=()
@@ -1871,11 +1912,13 @@ EOT
   # 自动防火墙
   cmd_parts+=("--auto-ufw")
   
-  # 如果是国内，添加代理建议
-  if [[ -n "${LANG}" ]] && [[ "${LANG}" =~ zh ]]; then
-    cmd_parts+=("--goproxy" "https://goproxy.cn,direct")
-    cmd_parts+=("--gosumdb" "sum.golang.google.cn")
-  fi
+  # 网络环境（代理）
+  case "$region_choice" in
+    a|y|Y)
+      cmd_parts+=("--goproxy" "https://goproxy.cn,direct")
+      cmd_parts+=("--gosumdb" "sum.golang.google.cn")
+      ;;
+  esac
   
   # 组装完整命令（人类可读，使用 shell 安全转义）
   local full_cmd
@@ -1918,7 +1961,7 @@ EOT
     # 验证每个字段范围（0-255）
     IFS='.' read -ra octets <<< "$user_ip"
     for octet in "${octets[@]}"; do
-      if [[ "$octet" -gt 255 ]]; then
+      if (( octet < 0 || octet > 255 )); then
         echo "[错误] IP 地址字段超出范围（0-255），请重新输入" >&2
         exit 1
       fi
@@ -2008,8 +2051,10 @@ main() {
   fi
 
   if [[ "${DRY_RUN}" -eq 1 || "${CHECK_ONLY}" -eq 1 ]]; then
+    local ip_show="<未探测到>"
+    [[ -n "${IP_ADDR}" ]] && ip_show="${IP_ADDR}"
     echo "[检查] 参数与环境状态总结："
-    echo "- 公网 IP：${IP_ADDR}"
+    echo "- 公网 IP：${ip_show}"
     echo "- DERP 端口：${DERP_PORT}/tcp；STUN 端口：${STUN_PORT}/udp"
     echo "- tailscale：安装=${TS_INSTALLED} 运行=${TS_RUNNING} 版本=${TS_VERSION:-<未知>} (>=${REQUIRED_TS_VER}) 满足=${TS_VER_OK}"
     echo "- derper：二进制=${DERPER_BIN} 服务文件=${DERPER_SERVICE_PRESENT} 运行=${DERPER_RUNNING}"

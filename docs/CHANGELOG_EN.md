@@ -1,5 +1,42 @@
 # Changelog
 
+## [2.0.2] - 2025-12-26
+
+### 🔧 Bug Fixes
+
+1. **`--check/--health-check` Mode Fault Tolerance Improvement**
+   - Fixed `detect_public_ip()` and `validate_settings()` using `exit` internally, which prevented subsequent check information from being output
+   - Changed to use `return` to let the caller decide whether to exit; `--check` mode can now output complete diagnostic information even if detection fails
+
+2. **Prometheus Metrics Write Error Handling**
+   - Fixed `--metrics-textfile` triggering `set -e` and exiting directly when target path is not writable
+   - `write_prometheus_metrics()` now returns error code + outputs warning on failure, no longer causes entire script to abort
+   - Caller decides whether to print "write success" or "write failed" message based on return value
+
+3. **systemd Unit File Generation Optimization**
+   - Fixed empty variables (e.g., `config_flag`, `verify_flag`) causing extra backslash continuations in ExecStart line
+   - Uses array to dynamically build command parameters, generating cleaner single-line ExecStart
+   - Fixed extra empty lines when `SupplementaryGroups` is empty
+
+4. **Variable Scope Fix**
+   - `socket_path` variable promoted to function-level initialization to avoid potential undefined reference issues
+
+### 🎨 User Experience Improvements
+
+1. **`--check` Output Optimization**
+   - Displays `<not detected>` instead of blank when public IP is empty, avoiding user confusion
+
+2. **Wizard Mode IP Validation Enhancement**
+   - IP field range check changed to `(( octet < 0 || octet > 255 ))` for more complete logic
+
+### 📝 Technical Details
+
+- All changes are **backward compatible**, no changes to existing parameters or usage
+- Syntax check `bash -n` passed
+- Total script lines: ~2180
+
+---
+
 ## [2.0.0] - 2025-11-10
 
 ### 🎯 Major Improvements
@@ -268,6 +305,6 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 ---
 
 **Contributors**: Thanks to architects for professional advice  
-**Update Date**: 2025-11-10  
-**Version**: 2.0.0
+**Update Date**: 2025-12-26  
+**Version**: 2.0.2
 

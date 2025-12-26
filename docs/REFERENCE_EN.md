@@ -2,7 +2,8 @@
 
 > This is the detailed English reference. For the simplified Chinese quickstart now used as the main README, go to `../README.md`. For the detailed Chinese reference, see `REFERENCE_CN.md` in this folder.
 
-> **Script File**: `deploy_derper_ip_selfsigned.sh`
+> **Script File**: `deploy_derper_ip_selfsigned.sh`  
+> **Current Version**: 2.0.2 (2025-12-26)
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
 ![systemd](https://img.shields.io/badge/Service-systemd-orange?logo=systemd&logoColor=white)
@@ -89,6 +90,8 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh --ip <your-public-ip> --check
 ```
 
 Note: Pre-check won't modify system or open ports, only outputs current environment and parameter check results, plus suggested next actions. If it shows tailscaled not logged in, port conflicts, or missing dependencies, handle them first as instructed.
+
+> 💡 **v2.0.2 Improvement**: Even if public IP detection fails, `--check` mode will continue to output complete diagnostic information for easier troubleshooting.
 
 3) Run deployment script (formal installation/repair; example for China mainland, with `-verify-clients` enabled by default)
 
@@ -513,6 +516,8 @@ Exit code semantics (for shell/monitoring decision):
 0  Key health items normal (service running + TLS/UDP ports both listening)
 1  At least one critical health check failed (service or port unhealthy)
 ```
+
+> 💡 **v2.0.2 Improvement**: `--metrics-textfile` write failure no longer causes script abort; outputs warning and continues execution.
 
 Example (alert only on anomaly):
 
