@@ -1,5 +1,32 @@
 # Changelog
 
+## [2.0.3] - 2026-01-25
+
+### 🔧 Bug Fixes
+
+1. **Missing Parameter Value Friendly Error**
+   - Fixed script crashing with `shift 2` error when parameters like `--ip`, `--derp-port` are used without providing a value
+   - Added `require_arg_value()` function to uniformly validate all parameters that require values and print clear error + usage
+   - Now outputs friendly `[Error] Parameter --ip requires a value` instead of mysterious shift error
+
+2. **IP Address Octal Parsing Issue**
+   - Fixed IP address fields starting with 0 (e.g., `192.168.08.1`) being interpreted as octal by bash arithmetic, causing parsing errors
+   - Values like `08` or `09` would be rejected by bash as invalid octal numbers
+   - Using `$((10#$octet))` to force decimal parsing, completely avoiding this issue
+   - Affected: IP validation logic in `validate_settings()` and `deployment_wizard()`
+
+3. **`--security-level` Invalid Value Handling**
+   - Fixed invalid security level (e.g., `--security-level invalid`) silently falling back to `standard`
+   - Now explicitly errors: `[Error] Invalid security level: invalid` and lists available options
+
+### 📝 Technical Details
+
+- All changes are **backward compatible**, no changes to existing parameters or usage
+- Syntax check `bash -n` passed
+- Total script lines: ~2210
+
+---
+
 ## [2.0.2] - 2025-12-26
 
 ### 🔧 Bug Fixes
@@ -305,6 +332,6 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 ---
 
 **Contributors**: Thanks to architects for professional advice  
-**Update Date**: 2025-12-26  
-**Version**: 2.0.2
+**Update Date**: 2026-01-25  
+**Version**: 2.0.3
 

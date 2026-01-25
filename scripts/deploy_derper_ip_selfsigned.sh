@@ -246,31 +246,47 @@ EOT
 }
 
 parse_args() {
+  require_arg_value() {
+    local opt="$1"
+    local val="${2-}"
+    if [[ -z "${val}" || "${val}" == --* ]]; then
+      echo "[错误] 参数 ${opt} 需要一个值" >&2
+      usage
+      exit 1
+    fi
+  }
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --ip)
-        IP_ADDR=${2:-}
+        require_arg_value "$1" "${2-}"
+        IP_ADDR="$2"
         shift 2;;
       --derp-port)
-        DERP_PORT=${2:-}
+        require_arg_value "$1" "${2-}"
+        DERP_PORT="$2"
         shift 2;;
       --stun-port)
-        STUN_PORT=${2:-}
+        require_arg_value "$1" "${2-}"
+        STUN_PORT="$2"
         shift 2;;
       --cert-days)
-        CERT_DAYS=${2:-}
+        require_arg_value "$1" "${2-}"
+        CERT_DAYS="$2"
         shift 2;;
       --auto-ufw)
         AUTO_UFW=1
         shift 1;;
       --goproxy)
-        GOPROXY_ARG=${2:-}
+        require_arg_value "$1" "${2-}"
+        GOPROXY_ARG="$2"
         shift 2;;
       --gosumdb)
-        GOSUMDB_ARG=${2:-}
+        require_arg_value "$1" "${2-}"
+        GOSUMDB_ARG="$2"
         shift 2;;
       --gotoolchain)
-        GOTOOLCHAIN_ARG=${2:-auto}
+        require_arg_value "$1" "${2-}"
+        GOTOOLCHAIN_ARG="$2"
         shift 2;;
       --no-verify-clients)
         VERIFY_CLIENTS_MODE="off"
@@ -279,16 +295,20 @@ parse_args() {
         VERIFY_CLIENTS_MODE="on"
         shift 1;;
       --region-id)
-        REGION_ID=${2:-}
+        require_arg_value "$1" "${2-}"
+        REGION_ID="$2"
         shift 2;;
       --region-code)
-        REGION_CODE=${2:-}
+        require_arg_value "$1" "${2-}"
+        REGION_CODE="$2"
         shift 2;;
       --region-name)
-        REGION_NAME=${2:-}
+        require_arg_value "$1" "${2-}"
+        REGION_NAME="$2"
         shift 2;;
       --user)
-        RUN_USER=${2:-}
+        require_arg_value "$1" "${2-}"
+        RUN_USER="$2"
         shift 2;;
       --use-current-user)
         USE_CURRENT_USER=1
@@ -301,7 +321,8 @@ parse_args() {
         RUN_USER="derper"
         shift 1;;
       --security-level)
-        SECURITY_LEVEL=${2:-standard}
+        require_arg_value "$1" "${2-}"
+        SECURITY_LEVEL="$2"
         shift 2;;
       --relax-socket-perms)
         RELAX_SOCKET_PERMS=1
@@ -325,7 +346,8 @@ parse_args() {
         HEALTH_CHECK=1
         shift 1;;
       --metrics-textfile)
-        METRICS_TEXTFILE=${2:-}
+        require_arg_value "$1" "${2-}"
+        METRICS_TEXTFILE="$2"
         shift 2;;
       --uninstall)
         UNINSTALL=1
@@ -449,7 +471,13 @@ validate_settings() {
   fi
   IFS='.' read -r o1 o2 o3 o4 <<< "${IP_ADDR}"
   for _oct in "$o1" "$o2" "$o3" "$o4"; do
-    if ! [[ "$_oct" =~ ^[0-9]+$ ]] || (( _oct < 0 || _oct > 255 )); then
+    if ! [[ "$_oct" =~ ^[0-9]+$ ]]; then
+      echo "[错误] 公网 IP 字段必须为数字：${IP_ADDR}" >&2
+      return 1
+    fi
+    # 去除前导零避免 bash 八进制解析（10#强制十进制）
+    local _oct_dec=$((10#$_oct))
+    if (( _oct_dec < 0 || _oct_dec > 255 )); then
       echo "[错误] 公网 IP 字段超出范围（0-255）：${IP_ADDR}" >&2
       return 1
     fi
@@ -1355,13 +1383,18 @@ MemoryDenyWriteExecute=true"
       hardening_options="$hardening_basic"
       echo "[信息] 使用 basic 安全级别（最大兼容性）"
       ;;
+    standard)
+      hardening_options="$hardening_standard"
+      echo "[信息] 使用 standard 安全级别（推荐）"
+      ;;
     paranoid)
       hardening_options="$hardening_paranoid"
       echo "[信息] 使用 paranoid 安全级别（最严格加固）"
       ;;
-    standard|*)
-      hardening_options="$hardening_standard"
-      echo "[信息] 使用 standard 安全级别（推荐）"
+    *)
+      echo "[错误] 无效的安全级别：${SECURITY_LEVEL}" >&2
+      echo "  可选值：basic | standard | paranoid" >&2
+      exit 1
       ;;
   esac
 
@@ -1961,7 +1994,9 @@ EOT
     # 验证每个字段范围（0-255）
     IFS='.' read -ra octets <<< "$user_ip"
     for octet in "${octets[@]}"; do
-      if (( octet < 0 || octet > 255 )); then
+      # 去除前导零避免 bash 八进制解析（10#强制十进制）
+      local octet_dec=$((10#$octet))
+      if (( octet_dec < 0 || octet_dec > 255 )); then
         echo "[错误] IP 地址字段超出范围（0-255），请重新输入" >&2
         exit 1
       fi

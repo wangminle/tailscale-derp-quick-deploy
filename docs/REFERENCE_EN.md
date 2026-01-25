@@ -3,7 +3,7 @@
 > This is the detailed English reference. For the simplified Chinese quickstart now used as the main README, go to `../README.md`. For the detailed Chinese reference, see `REFERENCE_CN.md` in this folder.
 
 > **Script File**: `deploy_derper_ip_selfsigned.sh`  
-> **Current Version**: 2.0.2 (2025-12-26)
+> **Current Version**: 2.0.3 (2026-01-25)
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
 ![systemd](https://img.shields.io/badge/Service-systemd-orange?logo=systemd&logoColor=white)
