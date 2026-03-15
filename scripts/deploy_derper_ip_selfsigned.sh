@@ -591,11 +591,11 @@ check_pure_ip_from_unit() {
   local content="$1"
   [[ -z "$content" ]] && PURE_IP_OK=0 && return 0
   echo "$content" | grep -E -- '-hostname[[:space:]]+([0-9]{1,3}\.){3}[0-9]{1,3}' >/dev/null 2>&1 || return 0
-  echo "$content" | grep -q -- '-certmode[[:space:]]+manual' || return 0
+  echo "$content" | grep -qE -- '-certmode[[:space:]]+manual' || return 0
   echo "$content" | grep -q -- '-certdir[[:space:]]' || return 0
-  echo "$content" | grep -q -- '-http-port[[:space:]]+-1' || return 0
-  if echo "$content" | grep -q -- '-https-port[[:space:]]+[0-9]'; then :; else
-    echo "$content" | grep -q -- '-a[[:space:]]+:[0-9]' || return 0
+  echo "$content" | grep -qE -- '-http-port[[:space:]]+-1' || return 0
+  if echo "$content" | grep -qE -- '-https-port[[:space:]]+[0-9]'; then :; else
+    echo "$content" | grep -qE -- '-a[[:space:]]+:[0-9]' || return 0
   fi
   echo "$content" | grep -q -- '-stun' || return 0
   PURE_IP_OK=1
@@ -2038,7 +2038,7 @@ EOT
 
 main() {
   # 特殊子命令处理
-  if [[ "$1" == "wizard" ]]; then
+  if [[ "${1:-}" == "wizard" ]]; then
     deployment_wizard
     exit 0
   fi
