@@ -176,16 +176,11 @@ Solution 4: Temporarily relax permissions (not recommended, emergency only)
 
 ### 📚 New Documentation
 
-1. **[Account & Security Strategy Guide](docs/ACCOUNT_AND_SECURITY.md)**
+1. **Account & Security Strategy Guide** (Planned)
    - Three account mode comparison
    - Security level details
    - Common troubleshooting
    - Best practice checklist
-
-2. **[Test Suite](tests/README.md)**
-   - Integration test scripts
-   - 10+ test cases
-   - CI integration examples
 
 ### 🔧 Parameter Changes
 

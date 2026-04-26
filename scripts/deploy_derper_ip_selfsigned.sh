@@ -29,6 +29,9 @@ GO_VERSION="1.22.6"
 GO_SHA256_AMD64="999805bed7d9039ec3da1a53bfbcafc13e367da52aa823cb60b68ba22d44c616"
 GO_SHA256_ARM64="c15fa895341b8eaf7f219fada25c36a610eb042985dc1a912410c1c90098eaf2"
 
+# derper 版本（默认 latest，可通过 --derper-version 指定确定性版本）
+DERPER_VERSION="${DERPER_VERSION:-latest}"
+
 # 客户端校验：on=强制启用；off=禁用（默认 on）
 VERIFY_CLIENTS_MODE="on"
 
@@ -38,7 +41,17 @@ REGION_CODE="my-derp"
 REGION_NAME="My IP DERP"
 
 # 运行用户配置（可自定义）
-RUN_USER="${SUDO_USER:-$USER}"  # 默认使用当前用户（个人环境友好）
+# 验证 SUDO_USER 是否为合法的 POSIX 用户名（防止注入，CWE-20）
+if [[ -n "${SUDO_USER:-}" ]]; then
+  if [[ "${SUDO_USER}" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+    RUN_USER="${SUDO_USER}"
+  else
+    echo "[警告] SUDO_USER 包含非法字符（${SUDO_USER}），已忽略，使用 \$USER。" >&2
+    RUN_USER="$USER"
+  fi
+else
+  RUN_USER="$USER"
+fi
 USE_CURRENT_USER=1       # 默认使用当前用户
 CREATE_DEDICATED_USER=0  # 是否强制创建专用用户
 RELAX_SOCKET_PERMS=0     # 是否允许放宽 socket 权限（不推荐）
@@ -46,6 +59,7 @@ NON_INTERACTIVE=0        # 非交互模式（CI/自动化）
 SECURITY_LEVEL="standard" # 安全加固级别：basic|standard|paranoid
 
 IP_ADDR=""
+_tmpdir=""               # 安全临时目录（main 中初始化，trap EXIT 自动清理）
 AUTO_UFW=0               # 是否自动放行 UFW
 DRY_RUN=0                # 只做检查，不执行安装/写入
 FORCE=0                  # 强制全量重装
@@ -99,6 +113,7 @@ usage() {
   --check, --dry-run      仅进行状态与参数检查，不执行安装/写服务/放行端口等操作。
   --repair                仅修复/重写配置（systemd/证书等），不中断可用的依赖；不重装 derper。
   --force                 强制全量重装（重新安装 derper、重签证书、重写服务）。
+  --derper-version VER    指定 derper 版本（默认 latest），例如 v1.74.1 以确保可复现构建。
 
   --health-check          输出健康检查摘要（适合 cron 周期探测；不更改系统）。
   --metrics-textfile P    将健康检查结果以 Prometheus 文本格式写入到文件 P。
@@ -342,6 +357,10 @@ parse_args() {
       --force)
         FORCE=1
         shift 1;;
+      --derper-version)
+        require_arg_value "$1" "${2-}"
+        DERPER_VERSION="$2"
+        shift 2;;
       --health-check)
         HEALTH_CHECK=1
         shift 1;;
@@ -482,6 +501,37 @@ validate_settings() {
       return 1
     fi
   done
+
+  # 检测私有/保留地址（仅警告，不阻断，兼容内网测试场景）
+  local o1_dec=$((10#$o1)) o2_dec=$((10#$o2))
+  if (( o1_dec == 10 )) || \
+     (( o1_dec == 172 && o2_dec >= 16 && o2_dec <= 31 )) || \
+     (( o1_dec == 192 && o2_dec == 168 )) || \
+     (( o1_dec == 127 )) || \
+     (( o1_dec == 169 && o2_dec == 254 )); then
+    echo "[警告] IP ${IP_ADDR} 似乎是私有/保留地址，DERP 服务需要公网 IP 才能被远程客户端访问。" >&2
+    echo "  如果你确定这是你的场景（例如内网测试），可忽略此警告。" >&2
+  fi
+
+  # Region 字段白名单校验（防止 JSON 注入）
+  if [[ ! "${REGION_CODE}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    echo "[错误] --region-code 仅允许字母、数字、连字符、下划线：${REGION_CODE}" >&2
+    return 1
+  fi
+  if [[ ! "${REGION_NAME}" =~ ^[a-zA-Z0-9\ _-]+$ ]]; then
+    echo "[错误] --region-name 仅允许字母、数字、空格、连字符、下划线：${REGION_NAME}" >&2
+    return 1
+  fi
+  if ! [[ "${REGION_ID}" =~ ^[0-9]+$ ]] || (( REGION_ID < 1 )); then
+    echo "[错误] --region-id 必须为正整数：${REGION_ID}" >&2
+    return 1
+  fi
+
+  # 安全级别前置校验（避免执行完所有安装步骤后才报错）
+  case "${SECURITY_LEVEL}" in
+    basic|standard|paranoid) ;;
+    *) echo "[错误] --security-level 必须为 basic|standard|paranoid，当前：${SECURITY_LEVEL}" >&2; return 1 ;;
+  esac
 }
 
 detect_public_ip() {
@@ -504,13 +554,40 @@ detect_public_ip() {
   echo "[信息] 使用公网 IP：${IP_ADDR}"
 }
 
+# 兼容 timeout：优先使用系统 timeout，缺失时用后台进程模拟
+_timeout_run() {
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+  else
+    "$@" &
+    local pid=$!
+    ( sleep "$secs" && kill "$pid" 2>/dev/null ) &
+    local killer=$!
+    wait "$pid" 2>/dev/null
+    local rc=$?
+    kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null || true
+    return $rc
+  fi
+}
+
 # 版本比较：ver_ge A B => A >= B ?
 ver_ge() {
   if sort -V </dev/null &>/dev/null; then
     local a="$1" b="$2"
     [[ "$(printf '%s\n%s\n' "$a" "$b" | sort -V | tail -1)" == "$a" ]]
   else
-    [[ "$1" == "$2" ]] || [[ "$1" > "$2" ]]
+    # 纯 bash 语义化版本逐段数字比较（修复字典序 "1.10" < "1.9" 的问题）
+    local IFS='.'
+    local -a va=($1) vb=($2)
+    local i max=$(( ${#va[@]} > ${#vb[@]} ? ${#va[@]} : ${#vb[@]} ))
+    for ((i=0; i<max; i++)); do
+      local na=$((10#${va[i]:-0}))
+      local nb=$((10#${vb[i]:-0}))
+      if ((na > nb)); then return 0; fi
+      if ((na < nb)); then return 1; fi
+    done
+    return 0  # 相等
   fi
 }
 
@@ -578,11 +655,11 @@ read_derper_unit_content() {
 check_ports_status() {
   PORT_TLS_OK=0; PORT_STUN_OK=0
   if command -v ss >/dev/null 2>&1; then
-    ss -ltnp 2>/dev/null | grep -E ":${DERP_PORT}\b" >/dev/null 2>&1 && PORT_TLS_OK=1 || true
-    ss -lunp 2>/dev/null | grep -E ":${STUN_PORT}\b" >/dev/null 2>&1 && PORT_STUN_OK=1 || true
+    ss -ltnp 2>/dev/null | grep -E ":${DERP_PORT}([^0-9]|$)" >/dev/null 2>&1 && PORT_TLS_OK=1 || true
+    ss -lunp 2>/dev/null | grep -E ":${STUN_PORT}([^0-9]|$)" >/dev/null 2>&1 && PORT_STUN_OK=1 || true
   elif command -v netstat >/dev/null 2>&1; then
-    netstat -ltnp 2>/dev/null | grep -E ":${DERP_PORT}\b" >/dev/null 2>&1 && PORT_TLS_OK=1 || true
-    netstat -lunp 2>/dev/null | grep -E ":${STUN_PORT}\b" >/dev/null 2>&1 && PORT_STUN_OK=1 || true
+    netstat -ltnp 2>/dev/null | grep -E ":${DERP_PORT}([^0-9]|$)" >/dev/null 2>&1 && PORT_TLS_OK=1 || true
+    netstat -lunp 2>/dev/null | grep -E ":${STUN_PORT}([^0-9]|$)" >/dev/null 2>&1 && PORT_STUN_OK=1 || true
   fi
 }
 
@@ -658,14 +735,16 @@ install_deps() {
   command -v git >/dev/null 2>&1      || need_pkgs+=(git)
   # 可选但常用：nc/ss，用于自检；缺失不强制
   if ! command -v nc >/dev/null 2>&1; then
-    if command -v apt >/dev/null 2>&1; then need_pkgs+=(netcat-openbsd); fi
-    if command -v dnf >/dev/null 2>&1; then need_pkgs+=(nmap-ncat); fi
-    if command -v yum >/dev/null 2>&1; then need_pkgs+=(nmap-ncat); fi
+    if command -v apt >/dev/null 2>&1; then need_pkgs+=(netcat-openbsd);
+    elif command -v dnf >/dev/null 2>&1; then need_pkgs+=(nmap-ncat);
+    elif command -v yum >/dev/null 2>&1; then need_pkgs+=(nmap-ncat);
+    fi
   fi
   if ! command -v ss >/dev/null 2>&1; then
-    if command -v apt >/dev/null 2>&1; then need_pkgs+=(iproute2); fi
-    if command -v dnf >/dev/null 2>&1; then need_pkgs+=(iproute); fi
-    if command -v yum >/dev/null 2>&1; then need_pkgs+=(iproute); fi
+    if command -v apt >/dev/null 2>&1; then need_pkgs+=(iproute2);
+    elif command -v dnf >/dev/null 2>&1; then need_pkgs+=(iproute);
+    elif command -v yum >/dev/null 2>&1; then need_pkgs+=(iproute);
+    fi
   fi
 
   if [[ ${#need_pkgs[@]} -eq 0 ]]; then
@@ -676,19 +755,19 @@ install_deps() {
   echo "[步骤] 按需安装依赖：${need_pkgs[*]} …"
   local install_failed=0
   if command -v apt >/dev/null 2>&1; then
-    if ! DEBIAN_FRONTEND=noninteractive apt update -y 2>/tmp/apt_update.err; then
+    if ! DEBIAN_FRONTEND=noninteractive apt update -y 2>"${_tmpdir}/apt_update.err"; then
       echo "[警告] apt update 失败，可能影响依赖安装" >&2
-      sed -n '1,20p' /tmp/apt_update.err >&2 || true
+      sed -n '1,20p' "${_tmpdir}/apt_update.err" >&2 || true
     fi
-    if ! DEBIAN_FRONTEND=noninteractive apt install -y "${need_pkgs[@]}" 2>/tmp/apt_install.err; then
+    if ! DEBIAN_FRONTEND=noninteractive apt install -y "${need_pkgs[@]}" 2>"${_tmpdir}/apt_install.err"; then
       install_failed=1
     fi
   elif command -v dnf >/dev/null 2>&1; then
-    if ! dnf install -y "${need_pkgs[@]}" 2>/tmp/dnf_install.err; then
+    if ! dnf install -y "${need_pkgs[@]}" 2>"${_tmpdir}/dnf_install.err"; then
       install_failed=1
     fi
   elif command -v yum >/dev/null 2>&1; then
-    if ! yum install -y "${need_pkgs[@]}" 2>/tmp/yum_install.err; then
+    if ! yum install -y "${need_pkgs[@]}" 2>"${_tmpdir}/yum_install.err"; then
       install_failed=1
     fi
   else
@@ -740,7 +819,7 @@ ensure_go() {
   esac
   
   url="https://go.dev/dl/go${GO_VERSION}.${os}-${arch}.tar.gz"
-  tarball="/tmp/go${GO_VERSION}.${os}-${arch}.tar.gz"
+  tarball="${_tmpdir}/go${GO_VERSION}.${os}-${arch}.tar.gz"
   command -v curl >/dev/null 2>&1 || install_deps
   echo "[步骤] 下载安装 Go ${GO_VERSION} (${arch}) 作为基础工具链…"
   curl -fsSL "$url" -o "$tarball"
@@ -752,9 +831,12 @@ ensure_go() {
     sha256_actual=$(sha256sum "$tarball" | awk '{print $1}')
   elif command -v shasum >/dev/null 2>&1; then
     sha256_actual=$(shasum -a 256 "$tarball" | awk '{print $1}')
+  elif command -v openssl >/dev/null 2>&1; then
+    sha256_actual=$(openssl dgst -sha256 "$tarball" | awk '{print $NF}')
   else
-    echo "[警告] 未找到 sha256sum/shasum，跳过完整性校验（不推荐）" >&2
-    sha256_actual="$sha256_expected"  # 跳过校验
+    echo "[错误] 无法校验 Go tarball 完整性：sha256sum/shasum/openssl 均不可用，已中止安装。" >&2
+    rm -f "$tarball"
+    exit 1
   fi
   
   if [[ "$sha256_actual" != "$sha256_expected" ]]; then
@@ -767,8 +849,18 @@ ensure_go() {
   fi
   echo "[信息] SHA256 校验通过"
   
-  rm -rf /usr/local/go
+  if [[ -d /usr/local/go ]]; then
+    local existing_go_ver
+    existing_go_ver=$(/usr/local/go/bin/go version 2>/dev/null | awk '{print $3}' || echo "未知")
+    echo "[警告] 将替换已有 Go 安装：$existing_go_ver → Go ${GO_VERSION}" >&2
+    if [[ "${NON_INTERACTIVE}" -ne 1 ]]; then
+      read -p "  确认删除 /usr/local/go 并重新安装？(y/n): " _go_confirm
+      [[ "$_go_confirm" == "y" ]] || { echo "[中止] 请手动安装 Go 后重试。" >&2; exit 1; }
+    fi
+    rm -rf /usr/local/go
+  fi
   tar -C /usr/local -xzf "$tarball"
+  rm -f "$tarball"
   mkdir -p /etc/profile.d
   echo 'export PATH=/usr/local/go/bin:$PATH' >/etc/profile.d/go.sh
   export PATH=/usr/local/go/bin:$PATH
@@ -782,9 +874,10 @@ install_derper() {
   local envs=("GOBIN=/usr/local/bin" "GO111MODULE=on" "GOTOOLCHAIN=${GOTOOLCHAIN_ARG}")
   if [[ -n "${GOPROXY_ARG}" ]]; then envs+=("GOPROXY=${GOPROXY_ARG}"); fi
   if [[ -n "${GOSUMDB_ARG}" ]]; then envs+=("GOSUMDB=${GOSUMDB_ARG}"); fi
-  if ! env "${envs[@]}" go install tailscale.com/cmd/derper@latest 2>/tmp/derper_install.err; then
+  echo "[信息] 安装 derper 版本：${DERPER_VERSION}"
+  if ! env "${envs[@]}" go install "tailscale.com/cmd/derper@${DERPER_VERSION}" 2>"${_tmpdir}/derper_install.err"; then
     echo "[错误] go install 失败：" >&2
-    sed -n '1,160p' /tmp/derper_install.err >&2 || true
+    sed -n '1,160p' "${_tmpdir}/derper_install.err" >&2 || true
     exit 1
   fi
   if [[ ! -x "${BIN_PATH}" ]]; then
@@ -898,7 +991,7 @@ generate_derper_config() {
 {}
 CONFIG
   
-  chmod 644 "${INSTALL_DIR}/derper.json"
+  chmod 640 "${INSTALL_DIR}/derper.json"
   echo "[信息] derper 配置文件生成于：${INSTALL_DIR}/derper.json"
   
   # 创建环境变量文件模板（用于敏感配置）
@@ -967,7 +1060,7 @@ live_cert_sha256_raw() {
   # 依赖 openssl；添加超时避免卡住
   command -v openssl >/dev/null 2>&1 || return 1
   local pem
-  pem=$(timeout 6 openssl s_client -connect "${IP_ADDR}:${DERP_PORT}" -servername "${IP_ADDR}" -showcerts </dev/null 2>/dev/null \
+  pem=$(_timeout_run 6 openssl s_client -connect "${IP_ADDR}:${DERP_PORT}" -servername "${IP_ADDR}" -showcerts </dev/null 2>/dev/null \
         | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p') || true
   [[ -n "$pem" ]] || return 1
   printf "%s\n" "$pem" | openssl x509 -outform DER 2>/dev/null | sha256_hex
@@ -1064,24 +1157,23 @@ setup_service_user() {
 
 write_systemd_service() {
   echo "[步骤] 写入 systemd 服务单元：${SERVICE_PATH}…"
-  local stun_flag
+  local stun_args=()
   if derper_supports_stun_port; then
-    stun_flag="-stun -stun-port ${STUN_PORT}"
+    stun_args=("-stun" "-stun-port" "${STUN_PORT}")
   else
-    stun_flag="-stun"
+    stun_args=("-stun")
     if [[ "${STUN_PORT}" != "3478" ]]; then
       echo "[提示] 检测到 derper 不支持自定义 STUN 端口，将使用默认 3478。" >&2
     fi
   fi
 
-  local listen_flag
+  local listen_args=()
   if derper_supports_listen_a; then
-    listen_flag="-a :${DERP_PORT}"
+    listen_args=("-a" ":${DERP_PORT}")
   elif derper_supports_https_port; then
-    listen_flag="-https-port ${DERP_PORT}"
+    listen_args=("-https-port" "${DERP_PORT}")
   else
-    # 极端兜底：仍尝试使用 -a
-    listen_flag="-a :${DERP_PORT}"
+    listen_args=("-a" ":${DERP_PORT}")
   fi
 
   # 根据配置决定是否启用客户端校验
@@ -1122,12 +1214,48 @@ write_systemd_service() {
           if getent group tailscale >/dev/null 2>&1; then
             echo "[步骤] 重启 tailscaled 尝试应用 tailscale 组到本地 API socket"
             if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet tailscaled 2>/dev/null; then
-              systemctl restart tailscaled 2>/dev/null || true
-              sleep 1
-              # 重读 socket 组与权限
-              tailscale_socket_group=$(stat -c '%G' "$socket_path" 2>/dev/null || echo "$tailscale_socket_group")
-              socket_perms=$(stat -c '%a' "$socket_path" 2>/dev/null || echo "$socket_perms")
-              echo "[信息] tailscaled 本地 API 刷新后：组=${tailscale_socket_group} 权限=${socket_perms}"
+              # 检测当前 SSH 连接是否经由 Tailscale（重启会断开连接）
+              local _via_tailscale=0
+              if [[ -n "${SSH_CONNECTION:-}" ]]; then
+                local _ssh_src_ip
+                _ssh_src_ip=$(echo "$SSH_CONNECTION" | awk '{print $1}')
+                if [[ "$_ssh_src_ip" == 100.* ]] || [[ "$_ssh_src_ip" == fd7a:115c:a1e0:* ]]; then
+                  _via_tailscale=1
+                fi
+              fi
+
+              local _do_restart=1
+              if [[ "$_via_tailscale" -eq 1 ]]; then
+                echo "[警告] 检测到当前 SSH 连接可能经由 Tailscale（源 IP: ${_ssh_src_ip}）。" >&2
+                echo "  重启 tailscaled 将断开此连接，可能导致脚本中断和服务器不可达。" >&2
+                if [[ "${NON_INTERACTIVE}" -eq 1 ]]; then
+                  echo "[跳过] 非交互模式下跳过 tailscaled 重启，将使用备选方案配置 socket 权限。" >&2
+                  _do_restart=0
+                else
+                  read -p "  是否确认重启 tailscaled？(yes/no): " _ts_restart_confirm
+                  if [[ "$_ts_restart_confirm" != "yes" ]]; then
+                    echo "[跳过] 已取消 tailscaled 重启，将使用备选方案。" >&2
+                    _do_restart=0
+                  fi
+                fi
+              fi
+
+              if [[ "$_do_restart" -eq 1 ]]; then
+                systemctl restart tailscaled 2>/dev/null || true
+                # 轮询等待 socket 恢复（替代固定 sleep，避免竞态）
+                local _wait_count=0
+                while [[ ! -S "$socket_path" ]] && ((_wait_count < 10)); do
+                  sleep 1
+                  ((_wait_count++))
+                done
+                if [[ ! -S "$socket_path" ]]; then
+                  echo "[警告] tailscaled 重启后 socket 未在 10 秒内恢复：$socket_path" >&2
+                fi
+                # 重读 socket 组与权限
+                tailscale_socket_group=$(stat -c '%G' "$socket_path" 2>/dev/null || echo "$tailscale_socket_group")
+                socket_perms=$(stat -c '%a' "$socket_path" 2>/dev/null || echo "$socket_perms")
+                echo "[信息] tailscaled 本地 API 刷新后：组=${tailscale_socket_group} 权限=${socket_perms}"
+              fi
             fi
           fi
         fi
@@ -1138,7 +1266,7 @@ write_systemd_service() {
           usermod -a -G tailscale "$RUN_USER" 2>/dev/null || true
         fi
         # 优先使用 systemd 覆盖 tailscaled.socket 的组与权限（更安全、持久）
-        if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q '^tailscaled\.socket'; then
+        if command -v systemctl >/dev/null 2>&1 && systemctl cat tailscaled.socket >/dev/null 2>&1; then
           # 选择一个合适的组：优先 tailscale 组，其次 derper 组
           if getent group tailscale >/dev/null 2>&1; then
             tailscaled_socket_override_group="tailscale"
@@ -1257,19 +1385,16 @@ EOT
         config_flag="-c ${INSTALL_DIR}/derper.json"
       fi
     fi
+    local manual_cmd="${BIN_PATH}"
+    [[ -n "${config_flag}" ]] && manual_cmd+=" ${config_flag}"
+    manual_cmd+=" -hostname ${IP_ADDR} -certmode manual -certdir ${INSTALL_DIR}/certs -http-port -1"
+    manual_cmd+=" ${listen_args[*]} ${stun_args[*]}"
+    [[ -n "${verify_flag}" ]] && manual_cmd+=" ${verify_flag}"
     cat >&2 <<EOT
 [阻断] 未检测到 systemd，无法写入服务单元：${SERVICE_PATH}
 
 你可以手动前台运行 derper（示例）：
-  ${BIN_PATH} \\
-    ${config_flag} \\
-    -hostname ${IP_ADDR} \\
-    -certmode manual \\
-    -certdir ${INSTALL_DIR}/certs \\
-    -http-port -1 \\
-    ${listen_flag} \\
-    ${stun_flag} \\
-    ${verify_flag}
+  ${manual_cmd}
 
 说明：若 derper 旧版本不支持 "-a" 或 "-stun-port"，请改用 "-https-port ${DERP_PORT}"，并去掉 "-stun-port"。
 EOT
@@ -1309,15 +1434,15 @@ EOT
     fi
   fi
 
-  # 动态构建 ExecStart 命令参数（避免空变量导致的格式问题）
+  # 动态构建 ExecStart 命令参数（每个参数独立为数组元素，避免空格拼接错误）
   local exec_args=("${BIN_PATH}")
   [[ -n "${config_flag}" ]] && exec_args+=("${config_flag}")
   exec_args+=("-hostname" "${IP_ADDR}")
   exec_args+=("-certmode" "manual")
   exec_args+=("-certdir" "${INSTALL_DIR}/certs")
   exec_args+=("-http-port" "-1")
-  exec_args+=("${listen_flag}")
-  exec_args+=("${stun_flag}")
+  exec_args+=("${listen_args[@]}")
+  exec_args+=("${stun_args[@]}")
   [[ -n "${verify_flag}" ]] && exec_args+=("${verify_flag}")
   
   # 将参数数组转换为单行命令字符串
@@ -1429,6 +1554,8 @@ EnvironmentFile=-/etc/derper/derper.env${localapi_env_section}
 ExecStart=${exec_start_line}
 Restart=on-failure
 RestartSec=2
+StartLimitBurst=5
+StartLimitIntervalSec=60
 LimitNOFILE=65535
 
 # 能力边界
@@ -1454,7 +1581,7 @@ SERVICE
     # 检查是否是 MemoryDenyWriteExecute 导致的问题（Go 程序常见）
     if [[ "${SECURITY_LEVEL}" == "paranoid" ]]; then
       echo "[步骤] 尝试禁用 MemoryDenyWriteExecute 选项重试" >&2
-      sed -i '/MemoryDenyWriteExecute/d' "${SERVICE_PATH}"
+      sed -i.bak '/MemoryDenyWriteExecute/d' "${SERVICE_PATH}" && rm -f "${SERVICE_PATH}.bak"
       systemctl daemon-reload
       
       if systemctl enable --now derper 2>/dev/null; then
@@ -1554,18 +1681,18 @@ runtime_checks() {
   echo "[步骤] 运行时快速自检…"
   echo "- 检查端口监听："
   if command -v ss >/dev/null 2>&1; then
-    ss -tulpn | sed -n '1,200p' | grep -E ":(${DERP_PORT}|${STUN_PORT})" || true
+    ss -tulpn | sed -n '1,200p' | grep -E ":(${DERP_PORT}|${STUN_PORT})([^0-9]|$)" || true
   elif command -v netstat >/dev/null 2>&1; then
-    netstat -tulpn | sed -n '1,200p' | grep -E ":(${DERP_PORT}|${STUN_PORT})" || true
+    netstat -tulpn | sed -n '1,200p' | grep -E ":(${DERP_PORT}|${STUN_PORT})([^0-9]|$)" || true
   fi
 
   echo "- 测试 HTTPS 握手（自签证书会提示不受信）："
   (command -v openssl >/dev/null 2>&1 && \
-    timeout 5 openssl s_client -connect ${IP_ADDR}:${DERP_PORT} -servername ${IP_ADDR} -brief </dev/null || true)
+    _timeout_run 5 openssl s_client -connect ${IP_ADDR}:${DERP_PORT} -servername ${IP_ADDR} -brief </dev/null || true)
 
   echo "- 测试 STUN 端口可达性（UDP）："
   if command -v nc >/dev/null 2>&1; then
-    (timeout 3 nc -zvu ${IP_ADDR} ${STUN_PORT} || true)
+    (_timeout_run 3 nc -zvu ${IP_ADDR} ${STUN_PORT} || true)
   else
     echo "  [提示] 未找到 nc，跳过 UDP 探测。"
   fi
@@ -1576,25 +1703,25 @@ check_port_conflicts() {
   echo "[步骤] 端口占用预检…"
   local conflict=0
   if command -v ss >/dev/null 2>&1; then
-    if ss -ltn 2>/dev/null | grep -E ":${DERP_PORT}\\b" >/dev/null; then
+    if ss -ltn 2>/dev/null | grep -E ":${DERP_PORT}([^0-9]|$)" >/dev/null; then
       echo "[错误] 检测到 TCP 端口 ${DERP_PORT} 已被占用。请更换 --derp-port 或释放占用进程：" >&2
-      ss -ltnp | sed -n '1,200p' | grep -E ":${DERP_PORT}\\b" || true
+      ss -ltnp | sed -n '1,200p' | grep -E ":${DERP_PORT}([^0-9]|$)" || true
       conflict=1
     fi
-    if ss -lun 2>/dev/null | grep -E ":${STUN_PORT}\\b" >/dev/null; then
+    if ss -lun 2>/dev/null | grep -E ":${STUN_PORT}([^0-9]|$)" >/dev/null; then
       echo "[错误] 检测到 UDP 端口 ${STUN_PORT} 已被占用。请更换 --stun-port 或释放占用进程：" >&2
-      ss -lunp | sed -n '1,200p' | grep -E ":${STUN_PORT}\\b" || true
+      ss -lunp | sed -n '1,200p' | grep -E ":${STUN_PORT}([^0-9]|$)" || true
       conflict=1
     fi
   elif command -v netstat >/dev/null 2>&1; then
-    if netstat -ltnp 2>/dev/null | grep -E ":${DERP_PORT}\\b" >/dev/null; then
+    if netstat -ltnp 2>/dev/null | grep -E ":${DERP_PORT}([^0-9]|$)" >/dev/null; then
       echo "[错误] 检测到 TCP 端口 ${DERP_PORT} 已被占用。请更换 --derp-port 或释放占用进程：" >&2
-      netstat -ltnp | sed -n '1,200p' | grep -E ":${DERP_PORT}\\b" || true
+      netstat -ltnp | sed -n '1,200p' | grep -E ":${DERP_PORT}([^0-9]|$)" || true
       conflict=1
     fi
-    if netstat -lunp 2>/dev/null | grep -E ":${STUN_PORT}\\b" >/dev/null; then
+    if netstat -lunp 2>/dev/null | grep -E ":${STUN_PORT}([^0-9]|$)" >/dev/null; then
       echo "[错误] 检测到 UDP 端口 ${STUN_PORT} 已被占用。请更换 --stun-port 或释放占用进程：" >&2
-      netstat -lunp | sed -n '1,200p' | grep -E ":${STUN_PORT}\\b" || true
+      netstat -lunp | sed -n '1,200p' | grep -E ":${STUN_PORT}([^0-9]|$)" || true
       conflict=1
     fi
   fi
@@ -1800,11 +1927,12 @@ write_prometheus_metrics() {
       echo "derper_process_rss_bytes 0"
     fi
   } >"$tmp"; then
-    echo "[警告] 写入 Prometheus 指标失败：$tmp（权限或路径问题）" >&2
+    echo "[警告] Prometheus 指标写入临时文件失败：$tmp（权限或路径问题）" >&2
     return 1
   fi
   if ! mv -f "$tmp" "$path" 2>/dev/null; then
-    echo "[警告] 写入 Prometheus 指标失败：无法覆盖 $path" >&2
+    echo "[警告] Prometheus 指标写入成功但无法移动到目标路径：$path" >&2
+    echo "  可能原因：跨文件系统、目录权限不足。请确保路径可写。" >&2
     rm -f "$tmp" 2>/dev/null || true
     return 1
   fi
@@ -1976,7 +2104,7 @@ $full_cmd
 是否立即执行？(y/n)
 EOT
   
-  # 保存到文件
+  # 保存到当前工作目录（用户需要在 EXIT 清理后仍能访问此文件）
   echo "$full_cmd" > derper_deploy_cmd.sh
   chmod +x derper_deploy_cmd.sh
   
@@ -2037,6 +2165,10 @@ EOT
 }
 
 main() {
+  # 创建安全临时目录（防止 /tmp 可预测路径符号链接攻击，CWE-377）
+  _tmpdir=$(mktemp -d /tmp/derper-deploy.XXXXXXXXXX)
+  trap 'rm -rf "$_tmpdir"' EXIT
+
   # 特殊子命令处理
   if [[ "${1:-}" == "wizard" ]]; then
     deployment_wizard

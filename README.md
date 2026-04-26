@@ -966,4 +966,3 @@ Contributions are welcome! Please feel free to submit a Pull Request.
 
 - Issues: [GitHub Issues](../../issues)
 - Documentation: [docs/](docs/)
-- Test Suite: [tests/](tests/)
