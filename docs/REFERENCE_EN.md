@@ -236,16 +236,16 @@ Common paths:
 --force                   Force full reinstall (reinstall derper, re-sign certs, rewrite service)
 
 # Operations & Maintenance
---health-check            Only output health check summary (no system changes, for cron/monitoring)
+--health-check            Only output health check summary (no system changes, for cron/monitoring; config drift/certificate problems return non-zero)
 --metrics-textfile <P>    Export health check as Prometheus text metrics to path P (use with node_exporter)
 --uninstall               Stop and uninstall derper systemd service (keep binary and certificates)
 --purge                   With --uninstall: additionally delete installation directory (/opt/derper)
---purge-all               With --uninstall: on top of --purge, also delete binary (/usr/local/bin/derper)
+--purge-all               With --uninstall: on top of --purge, also delete binary, /etc/derper/derper.env, and the script-created tailscaled socket drop-in; firewall rules and user/group accounts require manual confirmation
 ```
 
 > Compatibility: Script prioritizes new `-a :<PORT>` for listening; falls back to old parameter `-https-port <PORT>` if unsupported.
 
-> Idempotency note: If detects existing "pure IP mode" derper working properly (port listening healthy, cert matches IP and not expiring soon), defaults to skip installation.
+> Idempotency note: The script skips installation only when the existing pure-IP derper unit matches the requested parameters (IP, DERP/STUN ports, run user, security level, client verification), ports are healthy, and the certificate matches the IP and is not expiring soon; otherwise it repairs on demand.
 
 ---
 
@@ -547,6 +547,7 @@ derper_stun_listen 1
 derper_cert_days_remaining 287
 derper_verify_clients 1
 derper_pure_ip_config_ok 1
+derper_desired_config_ok 1
 derper_process_rss_bytes 3145728
 ```
 
@@ -586,7 +587,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall
 # Uninstall and cleanup installation directory (certificates etc.)
 sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall --purge
 
-# Complete cleanup (including binary /usr/local/bin/derper)
+# Complete cleanup (including binary, /etc/derper/derper.env, and the script-created tailscaled socket drop-in; firewall rules and user/group accounts are not auto-deleted)
 sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall --purge-all
 ```
 

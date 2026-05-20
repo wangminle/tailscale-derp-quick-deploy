@@ -1,5 +1,32 @@
 # 更新日志
 
+## [2.0.4] - 2026-05-19
+
+### 🔧 Bug 修复
+
+1. **恢复脚本可执行性**
+   - 将部署脚本恢复为 LF 行尾，修复 CRLF 导致 `bash -n` 和 `--help` 无法运行的问题。
+
+2. **幂等与修复逻辑增强**
+   - 默认跳过安装前会检查 unit 是否与本次目标参数一致，包括 IP、DERP/STUN 端口、运行用户、安全级别和客户端校验。
+   - `--repair` / `--force` 允许当前 derper 服务占用目标端口，避免把自身监听误判为冲突。
+   - 重写 systemd unit 后会 restart 已运行服务，确保证书和 ExecStart 变更立即生效。
+
+3. **健康检查和指标修正**
+   - `--health-check` 将配置漂移、证书异常纳入非 0 退出条件。
+   - Prometheus 增加 `derper_desired_config_ok`，`derper_verify_clients` 改为读取已部署 unit 的真实状态。
+
+4. **卸载范围说明与清理补全**
+   - `--uninstall --purge-all` 额外清理 `/etc/derper/derper.env` 和脚本创建的 tailscaled socket drop-in。
+   - 防火墙规则和用户/组账户仍需人工确认，避免误删用户自维护配置。
+
+### 🧪 测试
+
+- 新增 `tests/test_deploy_script.sh`，覆盖 LF 行尾、脚本可 source、配置漂移检测和自身端口占用豁免。
+- 当前仓库提供轻量回归测试脚本；尚未引入完整集成测试套件。
+
+---
+
 ## [2.0.3] - 2026-01-25
 
 ### 🔧 Bug 修复
@@ -322,7 +349,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 | 用户体验 | 纯命令行 | 向导模式 + 命令行 |
 | 自动化 | 需手动处理交互 | 非交互模式 |
 | 文档 | 基础说明 | 详细文档 + 故障处理 |
-| 测试 | 无 | 集成测试套件 |
+| 测试 | 无 | 轻量回归测试脚本 |
 
 ---
 

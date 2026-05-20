@@ -48,7 +48,7 @@ This project provides a **fully automated Tailscale DERP relay service deploymen
 - 📊 **Health Checks**: Built-in `--health-check` outputs service status summary
 - 📊 **Prometheus Integration**: Exports textfile format metrics for seamless monitoring integration
 - 🔧 **Multi-Mode Operation**: check/repair/force modes for different scenarios
-- 🗑️ **Complete Uninstall**: `--uninstall` supports three-level options (retain/cleanup/purge-all)
+- 🗑️ **Scoped Uninstall**: `--uninstall` supports three-level cleanup for service, install directory, binary, and script-created config
 
 #### 4. Cross-Environment Compatibility
 
@@ -223,7 +223,8 @@ derper_up 1                          # Service running status
 derper_tls_listen 1                  # TLS port listening
 derper_stun_listen 1                 # STUN port listening
 derper_cert_days_remaining 287       # Certificate remaining days
-derper_verify_clients 1              # Client verification enabled
+derper_verify_clients 1              # Client verification enabled in deployed unit
+derper_desired_config_ok 1           # Deployed unit matches requested parameters
 derper_process_rss_bytes 3145728     # Process memory usage (bytes)
 ```
 
@@ -233,7 +234,7 @@ derper_process_rss_bytes 3145728     # Process memory usage (bytes)
 |-----------|-------------|-----------------|------------------|
 | `--uninstall` | Stop and remove service | systemd unit | Binary, certificates |
 | `--uninstall --purge` | + Remove installation directory | + `/opt/derper` | Binary |
-| `--uninstall --purge-all` | + Remove binary | + `/usr/local/bin/derper` | - |
+| `--uninstall --purge-all` | + Remove binary and script-created config | + `/usr/local/bin/derper`, `/etc/derper/derper.env`, DERP tailscaled socket drop-in | Firewall rules, user/group accounts |
 
 ---
 
@@ -401,7 +402,7 @@ $ sudo bash script.sh --ip X.X.X.X
 [Step] Building derper...
 ✅ Service started
 
-# Second run: Auto-skip
+# Second run: Auto-skip when unit, ports, certificate, user, security level, and client verification match
 $ sudo bash script.sh --ip X.X.X.X
 ✅ Ready: Detected derper running in pure IP mode, skipping installation.
 ```
@@ -523,7 +524,7 @@ Whether you're an **individual user quickly setting up a testing environment** o
 - 📊 **健康检查**：内置 `--health-check` 输出服务状态摘要
 - 📊 **Prometheus 集成**：导出 textfile 格式指标，无缝对接监控体系
 - 🔧 **多模式运行**：check/repair/force 三种模式满足不同场景
-- 🗑️ **完整卸载**：`--uninstall` 支持保留/清理/彻底删除三级选项
+- 🗑️ **分级卸载**：`--uninstall` 支持服务、安装目录、二进制和脚本生成配置的三级清理
 
 #### 4. 跨环境兼容
 
@@ -698,7 +699,8 @@ derper_up 1                          # 服务是否运行
 derper_tls_listen 1                  # TLS 端口是否监听
 derper_stun_listen 1                 # STUN 端口是否监听
 derper_cert_days_remaining 287       # 证书剩余天数
-derper_verify_clients 1              # 是否启用客户端校验
+derper_verify_clients 1              # 已部署 unit 是否启用客户端校验
+derper_desired_config_ok 1           # 已部署 unit 是否与本次目标参数一致
 derper_process_rss_bytes 3145728     # 进程内存占用（字节）
 ```
 
@@ -708,7 +710,7 @@ derper_process_rss_bytes 3145728     # 进程内存占用（字节）
 |------|------|----------|----------|
 | `--uninstall` | 停止并删除服务 | systemd 单元 | 二进制、证书 |
 | `--uninstall --purge` | + 删除安装目录 | + `/opt/derper` | 二进制 |
-| `--uninstall --purge-all` | + 删除二进制 | + `/usr/local/bin/derper` | - |
+| `--uninstall --purge-all` | + 删除二进制和脚本生成配置 | + `/usr/local/bin/derper`、`/etc/derper/derper.env`、DERP 创建的 tailscaled socket drop-in | 防火墙规则、用户/组账户 |
 
 ---
 
@@ -876,7 +878,7 @@ $ sudo bash script.sh --ip X.X.X.X
 [步骤] 构建 derper...
 ✅ 服务已启动
 
-# 第二次运行：自动跳过
+# 第二次运行：若 unit、端口、证书、运行用户、安全级别和客户端校验均匹配，则自动跳过
 $ sudo bash script.sh --ip X.X.X.X
 ✅ 已就绪：检测到 derper 正在以纯 IP 模式运行，跳过安装。
 ```

@@ -65,6 +65,9 @@ DRY_RUN=0                # 只做检查，不执行安装/写入
 FORCE=0                  # 强制全量重装
 REPAIR=0                 # 仅修复配置（不重装 derper）
 CHECK_ONLY=0             # --check 别名（等价于 --dry-run）
+DESIRED_CONFIG_OK=0      # 当前 systemd unit 是否与本次目标参数一致
+DERPER_VERIFY_CLIENTS_EFFECTIVE=0 # 当前已部署 unit 是否启用了 -verify-clients
+CURRENT_DERPER_OWNS_PORTS=0       # 当前监听端口是否来自已运行的 derper 服务
 
 # 新增：健康检查 / 卸载 / 指标导出
 HEALTH_CHECK=0           # 输出健康检查结果（便于 cron 监控）
@@ -120,7 +123,9 @@ usage() {
                           建议结合 node_exporter 的 textfile collector 使用。
   --uninstall             停止并卸载 derper systemd 服务（保留二进制与证书）。
   --purge                 与 --uninstall 配合：额外删除 ${INSTALL_DIR}（证书等）。
-  --purge-all             与 --uninstall 配合：在 --purge 基础上，同时删除 ${BIN_PATH}。
+  --purge-all             与 --uninstall 配合：在 --purge 基础上，同时删除 ${BIN_PATH}、
+                          /etc/derper/derper.env 和脚本创建的 tailscaled socket drop-in。
+                          防火墙规则和用户/组账户需手动确认，不会自动删除。
 
 示例：
   sudo bash $0 --ip 203.0.113.10 --derp-port 30399 --auto-ufw \
@@ -514,6 +519,10 @@ validate_settings() {
   fi
 
   # Region 字段白名单校验（防止 JSON 注入）
+  if [[ ! "${RUN_USER}" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+    echo "[错误] --user 仅允许合法 POSIX 用户名（小写字母/数字/下划线/连字符，且以字母或下划线开头）：${RUN_USER}" >&2
+    return 1
+  fi
   if [[ ! "${REGION_CODE}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
     echo "[错误] --region-code 仅允许字母、数字、连字符、下划线：${REGION_CODE}" >&2
     return 1
@@ -663,6 +672,10 @@ check_ports_status() {
   fi
 }
 
+regex_escape() {
+  printf '%s' "$1" | sed -e 's/[][\/.^$*+?{}()|]/\\&/g'
+}
+
 check_pure_ip_from_unit() {
   PURE_IP_OK=0
   local content="$1"
@@ -678,8 +691,55 @@ check_pure_ip_from_unit() {
   PURE_IP_OK=1
 }
 
+unit_matches_desired_config() {
+  local content="$1"
+  [[ -n "$content" && -n "${IP_ADDR}" ]] || return 1
+
+  local ip_re certdir_re run_user_re
+  ip_re=$(regex_escape "$IP_ADDR")
+  certdir_re=$(regex_escape "${INSTALL_DIR}/certs")
+  run_user_re=$(regex_escape "$RUN_USER")
+
+  echo "$content" | grep -qE -- "-hostname[[:space:]]+${ip_re}([[:space:]]|$)" || return 1
+  echo "$content" | grep -qE -- '-certmode[[:space:]]+manual([[:space:]]|$)' || return 1
+  echo "$content" | grep -qE -- "-certdir[[:space:]]+${certdir_re}([[:space:]]|$)" || return 1
+  echo "$content" | grep -qE -- '-http-port[[:space:]]+-1([[:space:]]|$)' || return 1
+
+  if ! echo "$content" | grep -qE -- "(-a[[:space:]]+:${DERP_PORT}|-https-port[[:space:]]+${DERP_PORT})([[:space:]]|$)"; then
+    return 1
+  fi
+
+  echo "$content" | grep -qE -- '(^|[[:space:]])-stun([[:space:]]|$)' || return 1
+  if echo "$content" | grep -qE -- '-stun-port[[:space:]]+[0-9]'; then
+    echo "$content" | grep -qE -- "-stun-port[[:space:]]+${STUN_PORT}([[:space:]]|$)" || return 1
+  elif [[ "${STUN_PORT}" != "3478" ]]; then
+    return 1
+  fi
+
+  case "${VERIFY_CLIENTS_MODE}" in
+    on) echo "$content" | grep -qE -- '(^|[[:space:]])-verify-clients([[:space:]]|$)' || return 1 ;;
+    off) ! echo "$content" | grep -qE -- '(^|[[:space:]])-verify-clients([[:space:]]|$)' || return 1 ;;
+  esac
+
+  echo "$content" | grep -qE "^User=${run_user_re}$" || return 1
+  echo "$content" | grep -qF "# 安全加固（级别：${SECURITY_LEVEL}）" || return 1
+  return 0
+}
+
+current_derper_owns_ports() {
+  if [[ "${CURRENT_DERPER_OWNS_PORTS:-0}" -eq 1 ]]; then
+    return 0
+  fi
+  command -v systemctl >/dev/null 2>&1 || return 1
+  systemctl is-active --quiet derper 2>/dev/null || return 1
+  [[ "${PORT_TLS_OK:-0}" -eq 1 && "${PORT_STUN_OK:-0}" -eq 1 ]] || return 1
+  CURRENT_DERPER_OWNS_PORTS=1
+  return 0
+}
+
 check_derper_status() {
   DERPER_BIN=0; DERPER_SERVICE_PRESENT=0; DERPER_RUNNING=0; PURE_IP_OK=0
+  DESIRED_CONFIG_OK=0; DERPER_VERIFY_CLIENTS_EFFECTIVE=0; CURRENT_DERPER_OWNS_PORTS=0
   if [[ -x "${BIN_PATH}" ]] || command -v derper >/dev/null 2>&1; then DERPER_BIN=1; fi
   local unit_path; unit_path=$(get_derper_unit_path)
   [[ -n "$unit_path" && -f "$unit_path" ]] && DERPER_SERVICE_PRESENT=1
@@ -687,7 +747,14 @@ check_derper_status() {
   if [[ $DERPER_RUNNING -eq 0 ]] && pgrep -x derper >/dev/null 2>&1; then DERPER_RUNNING=1; fi
   local content; content=$(read_derper_unit_content || true)
   check_pure_ip_from_unit "$content"
+  if echo "$content" | grep -qE -- '(^|[[:space:]])-verify-clients([[:space:]]|$)'; then
+    DERPER_VERIFY_CLIENTS_EFFECTIVE=1
+  fi
+  if unit_matches_desired_config "$content"; then
+    DESIRED_CONFIG_OK=1
+  fi
   check_ports_status
+  current_derper_owns_ports || true
 }
 
 check_cert_status() {
@@ -1573,9 +1640,19 @@ WantedBy=multi-user.target
 SERVICE
 
   systemctl daemon-reload
-  
-  # 尝试启动服务，如果失败则可能是加固选项不兼容
-  if ! systemctl enable --now derper 2>/dev/null; then
+
+  # 尝试启动或重启服务，确保修复/重写后的 unit 和证书立即生效。
+  systemctl enable derper >/dev/null 2>&1 || true
+  local service_started=0
+  if systemctl is-active --quiet derper 2>/dev/null; then
+    if systemctl restart derper 2>/dev/null; then
+      service_started=1
+    fi
+  elif systemctl start derper 2>/dev/null; then
+    service_started=1
+  fi
+
+  if [[ "${service_started}" -ne 1 ]]; then
     echo "[警告] 服务启动失败，可能是某些安全选项不兼容当前系统" >&2
     
     # 检查是否是 MemoryDenyWriteExecute 导致的问题（Go 程序常见）
@@ -1584,7 +1661,8 @@ SERVICE
       sed -i.bak '/MemoryDenyWriteExecute/d' "${SERVICE_PATH}" && rm -f "${SERVICE_PATH}.bak"
       systemctl daemon-reload
       
-      if systemctl enable --now derper 2>/dev/null; then
+      systemctl enable derper >/dev/null 2>&1 || true
+      if systemctl restart derper 2>/dev/null || systemctl start derper 2>/dev/null; then
         echo "[信息] 服务已成功启动（已禁用 MemoryDenyWriteExecute）"
       else
         cat >&2 <<'EOT'
@@ -1699,33 +1777,36 @@ runtime_checks() {
 }
 
 # 在写入 systemd 服务前，预检端口占用，避免启动后才失败
+check_port_conflicts_from_listening() {
+  local listening="$1"
+  if current_derper_owns_ports; then
+    echo "[信息] 目标端口当前由 derper 服务占用，允许修复/重启流程继续。"
+    return 0
+  fi
+
+  local conflict=0
+  if echo "$listening" | grep -E ":${DERP_PORT}([^0-9]|$)" >/dev/null 2>&1; then
+    echo "[错误] 检测到 TCP 端口 ${DERP_PORT} 已被占用。请更换 --derp-port 或释放占用进程：" >&2
+    echo "$listening" | sed -n '1,200p' | grep -E ":${DERP_PORT}([^0-9]|$)" >&2 || true
+    conflict=1
+  fi
+  if echo "$listening" | grep -E ":${STUN_PORT}([^0-9]|$)" >/dev/null 2>&1; then
+    echo "[错误] 检测到 UDP 端口 ${STUN_PORT} 已被占用。请更换 --stun-port 或释放占用进程：" >&2
+    echo "$listening" | sed -n '1,200p' | grep -E ":${STUN_PORT}([^0-9]|$)" >&2 || true
+    conflict=1
+  fi
+  [[ ${conflict} -eq 0 ]]
+}
+
 check_port_conflicts() {
   echo "[步骤] 端口占用预检…"
-  local conflict=0
+  local listening=""
   if command -v ss >/dev/null 2>&1; then
-    if ss -ltn 2>/dev/null | grep -E ":${DERP_PORT}([^0-9]|$)" >/dev/null; then
-      echo "[错误] 检测到 TCP 端口 ${DERP_PORT} 已被占用。请更换 --derp-port 或释放占用进程：" >&2
-      ss -ltnp | sed -n '1,200p' | grep -E ":${DERP_PORT}([^0-9]|$)" || true
-      conflict=1
-    fi
-    if ss -lun 2>/dev/null | grep -E ":${STUN_PORT}([^0-9]|$)" >/dev/null; then
-      echo "[错误] 检测到 UDP 端口 ${STUN_PORT} 已被占用。请更换 --stun-port 或释放占用进程：" >&2
-      ss -lunp | sed -n '1,200p' | grep -E ":${STUN_PORT}([^0-9]|$)" || true
-      conflict=1
-    fi
+    listening=$(ss -ltunp 2>/dev/null || true)
   elif command -v netstat >/dev/null 2>&1; then
-    if netstat -ltnp 2>/dev/null | grep -E ":${DERP_PORT}([^0-9]|$)" >/dev/null; then
-      echo "[错误] 检测到 TCP 端口 ${DERP_PORT} 已被占用。请更换 --derp-port 或释放占用进程：" >&2
-      netstat -ltnp | sed -n '1,200p' | grep -E ":${DERP_PORT}([^0-9]|$)" || true
-      conflict=1
-    fi
-    if netstat -lunp 2>/dev/null | grep -E ":${STUN_PORT}([^0-9]|$)" >/dev/null; then
-      echo "[错误] 检测到 UDP 端口 ${STUN_PORT} 已被占用。请更换 --stun-port 或释放占用进程：" >&2
-      netstat -lunp | sed -n '1,200p' | grep -E ":${STUN_PORT}([^0-9]|$)" || true
-      conflict=1
-    fi
+    listening=$(netstat -tulnp 2>/dev/null || true)
   fi
-  if [[ ${conflict} -eq 1 ]]; then
+  if ! check_port_conflicts_from_listening "$listening"; then
     echo "[提示] 你也可以使用如下命令进一步排查：" >&2
     echo "  ss -tulpn | grep -E ':${DERP_PORT}|:${STUN_PORT}'" >&2
     echo "  netstat -tulpn | grep -E ':${DERP_PORT}|:${STUN_PORT}'" >&2
@@ -1823,6 +1904,18 @@ EOF
 }
 
 # 健康检查摘要（适合 cron 调用）
+health_is_ok() {
+  [[ "${DERPER_RUNNING:-0}" -eq 1 ]] || return 1
+  [[ "${PORT_TLS_OK:-0}" -eq 1 ]] || return 1
+  [[ "${PORT_STUN_OK:-0}" -eq 1 ]] || return 1
+  [[ "${PURE_IP_OK:-0}" -eq 1 ]] || return 1
+  [[ "${DESIRED_CONFIG_OK:-0}" -eq 1 ]] || return 1
+  [[ "${CERT_PRESENT:-0}" -eq 1 ]] || return 1
+  [[ "${CERT_SAN_MATCH:-0}" -eq 1 ]] || return 1
+  [[ "${CERT_EXPIRY_OK:-0}" -eq 1 ]] || return 1
+  return 0
+}
+
 health_check_report() {
   # 检查关键依赖工具
   local missing_tools=()
@@ -1852,6 +1945,13 @@ health_check_report() {
   fi
   [[ $PORT_TLS_OK -eq 1 ]] && echo "✅ 端口：TLS ${DERP_PORT}/tcp 正在监听" || echo "❌ 端口：TLS ${DERP_PORT}/tcp 未监听"
   [[ $PORT_STUN_OK -eq 1 ]] && echo "✅ 端口：STUN ${STUN_PORT}/udp 正在监听" || echo "❌ 端口：STUN ${STUN_PORT}/udp 未监听"
+  [[ $PURE_IP_OK -eq 1 ]] && echo "✅ 配置：当前 unit 为纯 IP 模式" || echo "❌ 配置：当前 unit 不是纯 IP 模式"
+  [[ $DESIRED_CONFIG_OK -eq 1 ]] && echo "✅ 配置：当前 unit 与本次目标参数一致" || echo "❌ 配置：当前 unit 与本次目标参数不一致，建议执行 --repair"
+  if [[ $DERPER_VERIFY_CLIENTS_EFFECTIVE -eq 1 ]]; then
+    echo "ℹ️  客户端校验：当前 unit 已启用 -verify-clients"
+  else
+    echo "ℹ️  客户端校验：当前 unit 未启用 -verify-clients"
+  fi
 
   if [[ -n "$days_left" ]]; then
     if (( days_left >= 30 )); then
@@ -1867,6 +1967,7 @@ health_check_report() {
 
   # 进程内存占用（RSS）
   local rss_kb rss_mb pidlist
+  rss_kb=0
   pidlist=$(pgrep -x derper 2>/dev/null | xargs || true)
   if [[ -n "$pidlist" ]]; then
     rss_kb=$(ps -o rss= -p $pidlist 2>/dev/null | awk '{s+=$1} END{print s+0}')
@@ -1913,11 +2014,15 @@ write_prometheus_metrics() {
 
     echo "# HELP derper_verify_clients Whether verify-clients is enabled"
     echo "# TYPE derper_verify_clients gauge"
-    [[ "${VERIFY_CLIENTS_MODE}" == "on" ]] && echo "derper_verify_clients 1" || echo "derper_verify_clients 0"
+    [[ $DERPER_VERIFY_CLIENTS_EFFECTIVE -eq 1 ]] && echo "derper_verify_clients 1" || echo "derper_verify_clients 0"
 
     echo "# HELP derper_pure_ip_config_ok Whether pure IP mode config is detected"
     echo "# TYPE derper_pure_ip_config_ok gauge"
     [[ $PURE_IP_OK -eq 1 ]] && echo "derper_pure_ip_config_ok 1" || echo "derper_pure_ip_config_ok 0"
+
+    echo "# HELP derper_desired_config_ok Whether deployed unit matches requested script parameters"
+    echo "# TYPE derper_desired_config_ok gauge"
+    [[ $DESIRED_CONFIG_OK -eq 1 ]] && echo "derper_desired_config_ok 1" || echo "derper_desired_config_ok 0"
 
     echo "# HELP derper_process_rss_bytes Total RSS of derper process in bytes"
     echo "# TYPE derper_process_rss_bytes gauge"
@@ -1971,6 +2076,20 @@ uninstall_derper() {
       echo "[步骤] 删除 derper 二进制：${BIN_PATH} …"
       rm -f "${BIN_PATH}" || true
     fi
+    if [[ -f /etc/derper/derper.env ]]; then
+      echo "[步骤] 删除 derper 环境变量文件：/etc/derper/derper.env …"
+      rm -f /etc/derper/derper.env || true
+      rmdir /etc/derper 2>/dev/null || true
+    fi
+    if [[ -f /etc/systemd/system/tailscaled.socket.d/10-derper-localapi.conf ]]; then
+      echo "[步骤] 删除 tailscaled socket 覆盖配置：/etc/systemd/system/tailscaled.socket.d/10-derper-localapi.conf …"
+      rm -f /etc/systemd/system/tailscaled.socket.d/10-derper-localapi.conf || true
+      rmdir /etc/systemd/system/tailscaled.socket.d 2>/dev/null || true
+      if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload 2>/dev/null || true
+        systemctl restart tailscaled.socket 2>/dev/null || true
+      fi
+    fi
     # 根据已识别的服务用户给出更准确的清理提示
     if [[ -n "$svc_user" && "$svc_user" != "root" ]]; then
       echo "[提示] 检测到服务运行用户：${svc_user}。如需删除该账户，可执行："
@@ -1978,6 +2097,7 @@ uninstall_derper() {
     else
       echo "[提示] 未能识别非 root 的服务运行用户；如需删除账户请手动确认后执行 userdel。"
     fi
+    echo "[提示] 防火墙/云安全组规则可能由用户手工维护，脚本不会自动删除端口放行规则。"
   fi
   echo "完成：已卸载 derper 服务。"
 }
@@ -2169,13 +2289,19 @@ main() {
   _tmpdir=$(mktemp -d /tmp/derper-deploy.XXXXXXXXXX)
   trap 'rm -rf "$_tmpdir"' EXIT
 
-  # 特殊子命令处理
+  # 特殊子命令处理：先记录 wizard，再解析其后的通用参数。
+  local wizard_mode=0
   if [[ "${1:-}" == "wizard" ]]; then
-    deployment_wizard
-    exit 0
+    wizard_mode=1
+    shift
   fi
   
   parse_args "$@"
+
+  if [[ "${wizard_mode}" -eq 1 ]]; then
+    deployment_wizard
+    exit 0
+  fi
 
   # 非交互 + 直接以 root 运行时的安全默认：切换为专用账户
   # 条件：当前用户为 root，且未通过 sudo 传入真实用户，且未显式选择专用用户
@@ -2213,7 +2339,7 @@ main() {
     health_check_report
     # 根据关键项给出退出码：全部健康返回 0，否则 1
     local ok=1
-    if [[ $DERPER_RUNNING -eq 1 && $PORT_TLS_OK -eq 1 && $PORT_STUN_OK -eq 1 ]]; then ok=0; fi
+    if health_is_ok; then ok=0; fi
     exit $ok
   fi
 
@@ -2227,15 +2353,16 @@ main() {
     echo "- derper：二进制=${DERPER_BIN} 服务文件=${DERPER_SERVICE_PRESENT} 运行=${DERPER_RUNNING}"
     echo "- 端口监听：TLS=${PORT_TLS_OK} STUN=${PORT_STUN_OK}"
     echo "- 纯 IP 配置判定（基于 unit）：${PURE_IP_OK}"
+    echo "- 目标配置匹配（基于 unit）：${DESIRED_CONFIG_OK}"
     echo "- 证书：存在=${CERT_PRESENT} SAN匹配IP=${CERT_SAN_MATCH} 30天内不过期=${CERT_EXPIRY_OK}"
-    echo "- 客户端校验模式：${VERIFY_CLIENTS_MODE}"
+    echo "- 客户端校验模式：目标=${VERIFY_CLIENTS_MODE} 已部署=${DERPER_VERIFY_CLIENTS_EFFECTIVE}"
     # 展示将要使用的运行用户与组（若用户尚未创建则组名以用户名代替）
     local chk_group
     chk_group=$(id -g -n "$RUN_USER" 2>/dev/null || echo "$RUN_USER")
     echo "- 运行用户：${RUN_USER}（组：${chk_group}）"
 
     local suggest="--repair"
-    if [[ $DERPER_BIN -eq 1 && $DERPER_SERVICE_PRESENT -eq 1 && $DERPER_RUNNING -eq 1 && $PURE_IP_OK -eq 1 && $PORT_TLS_OK -eq 1 && $PORT_STUN_OK -eq 1 && $CERT_PRESENT -eq 1 && $CERT_SAN_MATCH -eq 1 && $CERT_EXPIRY_OK -eq 1 ]]; then
+    if health_is_ok; then
       suggest="<已就绪：可直接跳过>"
     elif [[ $DERPER_BIN -eq 0 ]]; then
       suggest="安装 derper（缺少二进制）"
@@ -2305,11 +2432,11 @@ main() {
       command -v openssl >/dev/null 2>&1 || install_deps
       generate_selfsigned_cert; changed=1
     fi
-    if [[ $DERPER_SERVICE_PRESENT -ne 1 || $PURE_IP_OK -ne 1 ]]; then
+    if [[ $DERPER_SERVICE_PRESENT -ne 1 || $DESIRED_CONFIG_OK -ne 1 ]]; then
       check_port_conflicts
       write_systemd_service; changed=1
     fi
-    if [[ $changed -eq 0 && $DERPER_RUNNING -eq 1 && $PORT_TLS_OK -eq 1 && $PORT_STUN_OK -eq 1 ]]; then
+    if [[ $changed -eq 0 ]] && health_is_ok; then
       echo "✅ 已就绪：检测到 derper 正在以纯 IP 模式运行，跳过安装。"
       exit 0
     fi
@@ -2341,4 +2468,6 @@ main() {
 INFO
 }
 
-main "$@"
+if [[ "${DERPER_TEST_MODE:-0}" != "1" ]]; then
+  main "$@"
+fi

@@ -1,5 +1,32 @@
 # Changelog
 
+## [2.0.4] - 2026-05-19
+
+### 🔧 Bug Fixes
+
+1. **Restore script executability**
+   - Restored LF line endings for the deployment script, fixing CRLF failures in `bash -n` and `--help`.
+
+2. **Idempotency and repair logic**
+   - The default skip path now verifies that the deployed unit matches the requested IP, DERP/STUN ports, run user, security level, and client verification mode.
+   - `--repair` / `--force` allow the current derper service to own the target ports, avoiding false self-conflict failures.
+   - Rewritten systemd units now restart an already running service so certificate and ExecStart changes take effect immediately.
+
+3. **Health check and metrics**
+   - `--health-check` now treats config drift and certificate problems as non-zero failures.
+   - Prometheus output adds `derper_desired_config_ok`; `derper_verify_clients` now reflects the deployed unit instead of only the current CLI default.
+
+4. **Uninstall scope**
+   - `--uninstall --purge-all` additionally removes `/etc/derper/derper.env` and the script-created tailscaled socket drop-in.
+   - Firewall rules and user/group accounts still require manual confirmation to avoid deleting user-managed state.
+
+### 🧪 Tests
+
+- Added `tests/test_deploy_script.sh` covering LF line endings, sourceable script functions, config drift detection, and current-service port conflict exemption.
+- The repository now includes a lightweight regression test script; a full integration test suite has not been added.
+
+---
+
 ## [2.0.3] - 2026-01-25
 
 ### 🔧 Bug Fixes
@@ -322,11 +349,10 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 | User Experience | Pure command line | Wizard mode + command line |
 | Automation | Manual interaction handling | Non-interactive mode |
 | Documentation | Basic instructions | Detailed docs + troubleshooting |
-| Testing | None | Integration test suite |
+| Testing | None | Lightweight regression test script |
 
 ---
 
 **Contributors**: Thanks to architects for professional advice  
 **Update Date**: 2026-01-25  
 **Version**: 2.0.3
-

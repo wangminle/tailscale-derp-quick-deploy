@@ -271,16 +271,16 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 --force                   强制全量重装（重装 derper、重签证书、重写服务）
 
 # 运行与维护
---health-check            仅输出健康检查摘要（不更改系统，可用于 cron/监控）
+--health-check            仅输出健康检查摘要（不更改系统，可用于 cron/监控；配置漂移/证书异常会返回非 0）
 --metrics-textfile <P>    将健康检查导出为 Prometheus 文本指标到路径 P（结合 node_exporter 使用）
 --uninstall               停止并卸载 derper 的 systemd 服务（保留二进制与证书）
 --purge                   搭配 --uninstall：额外删除安装目录（/opt/derper）
---purge-all               搭配 --uninstall：在 --purge 基础上同时删除二进制（/usr/local/bin/derper）
+--purge-all               搭配 --uninstall：在 --purge 基础上同时删除二进制、/etc/derper/derper.env 和脚本创建的 tailscaled socket drop-in；防火墙规则和用户/组账户需手动确认
 ```
 
 > 兼容性：脚本优先使用新版 `-a :<PORT>` 指定监听；若不支持则回退到旧参数 `-https-port <PORT>`。
 
-> 幂等说明：若检测到本机已存在“纯 IP 模式”的 derper 且工作正常（端口监听健康、证书匹配 IP 且未临期），默认跳过安装。
+> 幂等说明：若检测到本机已存在“纯 IP 模式”的 derper，且 unit 与本次目标参数一致（IP、DERP/STUN 端口、运行用户、安全级别、客户端校验）、端口监听健康、证书匹配 IP 且未临期，默认跳过安装；否则按需修复。
 
 ---
 
@@ -580,6 +580,7 @@ derper_stun_listen 1
 derper_cert_days_remaining 287
 derper_verify_clients 1
 derper_pure_ip_config_ok 1
+derper_desired_config_ok 1
 derper_process_rss_bytes 3145728
 ```
 
@@ -619,7 +620,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall
 # 卸载并清理安装目录（证书等）
 sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall --purge
 
-# 完全清理（包含二进制 /usr/local/bin/derper）
+# 完全清理（包含二进制、/etc/derper/derper.env 和脚本创建的 tailscaled socket drop-in；不自动删除防火墙规则和用户/组账户）
 sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall --purge-all
 ```
 
