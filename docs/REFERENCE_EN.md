@@ -3,7 +3,7 @@
 > This is the detailed English reference. For the simplified Chinese quickstart now used as the main README, go to `../README.md`. For the detailed Chinese reference, see `REFERENCE_CN.md` in this folder.
 
 > **Script File**: `deploy_derper_ip_selfsigned.sh`  
-> **Current Version**: 2.0.3 (2026-01-25)
+> **Current Version**: 2.0.5 (2026-06-14)
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
 ![systemd](https://img.shields.io/badge/Service-systemd-orange?logo=systemd&logoColor=white)
@@ -42,7 +42,7 @@ This solution automatically deploys Tailscale DERP relay service (`derper`) on L
 **Local Development Testing**:
 If you need to test the `derper` program itself on macOS/WSL (not for production deployment), you can manually run it in foreground:
 ```bash
-derper -hostname 127.0.0.1 -certmode manual -certdir ./certs \
+derper -c ./derper.json -hostname 127.0.0.1 -certmode manual -certdir ./certs \
   -http-port -1 -a :30399 -stun
 ```
 Note: This mode is only for local functional verification and cannot serve as a relay node for Tailscale network.
@@ -195,8 +195,8 @@ Pre-check outputs several key items, their meanings and solutions (in order of a
   - Missing items (like curl/openssl/git/go): Formal installation will fill on-demand; for offline/restricted networks, install via package manager first.
 - Service manager
   - systemd not detected: Cannot write service. Can run manually in foreground (example):
-    `derper -hostname <your-public-ip> -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun -stun-port 3478 -verify-clients`
-    Note: For older versions not supporting `-a/-stun-port`, use `-https-port 30399` and remove `-stun-port`.
+    `derper -c /opt/derper/derper.json -hostname <your-public-ip> -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun -stun-port 3478 -verify-clients -socket /run/tailscale/tailscaled.sock`
+    Note: For older versions that do not support `-a`, use `-https-port 30399`. If `-stun-port` is unsupported, only the default STUN port 3478 can be used; the script rejects custom STUN ports that cannot take effect.
 - Non-systemd environments will show manual run examples, installation process will abort.
 - Suggestions (summary of recommended actions)
   - `<Ready: can skip directly>`: No action needed.
@@ -243,7 +243,7 @@ Common paths:
 --purge-all               With --uninstall: on top of --purge, also delete binary, /etc/derper/derper.env, and the script-created tailscaled socket drop-in; firewall rules and user/group accounts require manual confirmation
 ```
 
-> Compatibility: Script prioritizes new `-a :<PORT>` for listening; falls back to old parameter `-https-port <PORT>` if unsupported.
+> Compatibility: Script prioritizes new `-a :<PORT>` for listening; falls back to old parameter `-https-port <PORT>` if unsupported. If the installed derper does not support `-stun-port`, the script only permits the default port 3478; any other STUN port causes an explicit error and abort.
 
 > Idempotency note: The script skips installation only when the existing pure-IP derper unit matches the requested parameters (IP, DERP/STUN ports, run user, security level, client verification), ports are healthy, and the certificate matches the IP and is not expiring soon; otherwise it repairs on demand.
 
@@ -513,11 +513,13 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 Exit code semantics (for shell/monitoring decision):
 
 ```text
-0  Key health items normal (service running + TLS/UDP ports both listening)
-1  At least one critical health check failed (service or port unhealthy)
+0  Key health items normal (service, listeners, desired configuration, and certificates are healthy, and the live certificate matches the on-disk certificate)
+1  At least one critical health check failed
 ```
 
 > 💡 **v2.0.2 Improvement**: `--metrics-textfile` write failure no longer causes script abort; outputs warning and continues execution.
+>
+> 💡 **v2.0.5 Improvement**: Health checks connect to the DERP TLS port and compare the live certificate fingerprint with the on-disk certificate, preventing false positives when a renewed certificate has not been loaded.
 
 Example (alert only on anomaly):
 
@@ -534,6 +536,10 @@ Example output (excerpt):
 ✅ Service: derper is running
 ✅ Port: TLS 30399/tcp is listening
 ✅ Port: STUN 3478/udp is listening
+✅ Configuration: current unit uses pure IP mode
+✅ Configuration: current unit matches requested parameters
+✅ Certificate: live service matches the on-disk certificate
+ℹ️  Client verification: current unit enables -verify-clients
 ✅ Certificate: 287 days remaining
 ℹ️  Resource: derper memory RSS ~3 MiB
 ```

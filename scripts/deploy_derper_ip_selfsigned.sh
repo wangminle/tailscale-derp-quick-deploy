@@ -42,15 +42,17 @@ REGION_NAME="My IP DERP"
 
 # 运行用户配置（可自定义）
 # 验证 SUDO_USER 是否为合法的 POSIX 用户名（防止注入，CWE-20）
+# 注意：$USER 在 sudo/CI/容器等最小环境下可能未导出，set -u 下直接引用会报错；
+#       统一使用 ${USER:-$(id -un)} 兜底（id 来自 coreutils，必定可用）。
 if [[ -n "${SUDO_USER:-}" ]]; then
   if [[ "${SUDO_USER}" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
     RUN_USER="${SUDO_USER}"
   else
-    echo "[警告] SUDO_USER 包含非法字符（${SUDO_USER}），已忽略，使用 \$USER。" >&2
-    RUN_USER="$USER"
+    echo "[警告] SUDO_USER 包含非法字符（${SUDO_USER}），已忽略，使用当前用户。" >&2
+    RUN_USER="${USER:-$(id -un)}"
   fi
 else
-  RUN_USER="$USER"
+  RUN_USER="${USER:-$(id -un)}"
 fi
 USE_CURRENT_USER=1       # 默认使用当前用户
 CREATE_DEDICATED_USER=0  # 是否强制创建专用用户
@@ -199,7 +201,7 @@ macOS 不适合作为 DERP 服务器的原因：
 
 本地开发测试：
   如需在 macOS 上测试 derper 程序本身（非生产部署），可手动运行：
-    derper -hostname 127.0.0.1 -certmode manual -certdir ./certs \
+    derper -c ./derper.json -hostname 127.0.0.1 -certmode manual -certdir ./certs \
       -http-port -1 -a :30399 -stun
   注意：此模式仅供本地功能验证，无法作为 Tailscale 网络的中继节点。
 
@@ -226,7 +228,7 @@ WSL 不适合作为 DERP 服务器的原因：
 
 本地开发测试：
   如需在 WSL 上测试 derper 程序本身（非生产部署），可手动运行：
-    derper -hostname 127.0.0.1 -certmode manual -certdir ./certs \
+    derper -c ./derper.json -hostname 127.0.0.1 -certmode manual -certdir ./certs \
       -http-port -1 -a :30399 -stun
   注意：此模式仅供本地功能验证，无法作为 Tailscale 网络的中继节点。
 
@@ -333,7 +335,7 @@ parse_args() {
       --use-current-user)
         USE_CURRENT_USER=1
         CREATE_DEDICATED_USER=0
-        RUN_USER="${SUDO_USER:-$USER}"
+        RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}"
         shift 1;;
       --dedicated-user)
         CREATE_DEDICATED_USER=1
@@ -695,15 +697,17 @@ unit_matches_desired_config() {
   local content="$1"
   [[ -n "$content" && -n "${IP_ADDR}" ]] || return 1
 
-  local ip_re certdir_re run_user_re
+  local ip_re certdir_re config_re run_user_re
   ip_re=$(regex_escape "$IP_ADDR")
   certdir_re=$(regex_escape "${INSTALL_DIR}/certs")
+  config_re=$(regex_escape "${INSTALL_DIR}/derper.json")
   run_user_re=$(regex_escape "$RUN_USER")
 
   echo "$content" | grep -qE -- "-hostname[[:space:]]+${ip_re}([[:space:]]|$)" || return 1
   echo "$content" | grep -qE -- '-certmode[[:space:]]+manual([[:space:]]|$)' || return 1
   echo "$content" | grep -qE -- "-certdir[[:space:]]+${certdir_re}([[:space:]]|$)" || return 1
   echo "$content" | grep -qE -- '-http-port[[:space:]]+-1([[:space:]]|$)' || return 1
+  echo "$content" | grep -qE -- "-c[[:space:]]+${config_re}([[:space:]]|$)" || return 1
 
   if ! echo "$content" | grep -qE -- "(-a[[:space:]]+:${DERP_PORT}|-https-port[[:space:]]+${DERP_PORT})([[:space:]]|$)"; then
     return 1
@@ -717,7 +721,12 @@ unit_matches_desired_config() {
   fi
 
   case "${VERIFY_CLIENTS_MODE}" in
-    on) echo "$content" | grep -qE -- '(^|[[:space:]])-verify-clients([[:space:]]|$)' || return 1 ;;
+    on)
+      echo "$content" | grep -qE -- '(^|[[:space:]])-verify-clients([[:space:]]|$)' || return 1
+      if derper_supports_socket_flag; then
+        echo "$content" | grep -qE -- '(^|[[:space:]])-socket[[:space:]]+[^[:space:]]+' || return 1
+      fi
+      ;;
     off) ! echo "$content" | grep -qE -- '(^|[[:space:]])-verify-clients([[:space:]]|$)' || return 1 ;;
   esac
 
@@ -762,9 +771,11 @@ check_cert_status() {
   if [[ -f "${INSTALL_DIR}/certs/fullchain.pem" && -f "${INSTALL_DIR}/certs/privkey.pem" ]]; then
     CERT_PRESENT=1
     if command -v openssl >/dev/null 2>&1; then
-      if openssl x509 -in "${INSTALL_DIR}/certs/fullchain.pem" -noout -text 2>/dev/null | grep -E "IP( Address)?:[[:space:]]*${IP_ADDR}" >/dev/null 2>&1; then
+      local ip_re
+      ip_re=$(regex_escape "$IP_ADDR")
+      if openssl x509 -in "${INSTALL_DIR}/certs/fullchain.pem" -noout -text 2>/dev/null | grep -E "IP( Address)?:[[:space:]]*${ip_re}([,[:space:]]|$)" >/dev/null 2>&1; then
         CERT_SAN_MATCH=1
-      elif openssl x509 -in "${INSTALL_DIR}/certs/fullchain.pem" -noout -ext subjectAltName 2>/dev/null | grep -E "IP(:| Address:)[[:space:]]*${IP_ADDR}" >/dev/null 2>&1; then
+      elif openssl x509 -in "${INSTALL_DIR}/certs/fullchain.pem" -noout -ext subjectAltName 2>/dev/null | grep -E "IP(:| Address:)[[:space:]]*${ip_re}([,[:space:]]|$)" >/dev/null 2>&1; then
         CERT_SAN_MATCH=1
       fi
       if openssl x509 -checkend $((30*24*3600)) -in "${INSTALL_DIR}/certs/fullchain.pem" -noout >/dev/null 2>&1; then
@@ -849,7 +860,11 @@ install_deps() {
     # 不中止，继续尝试（某些依赖非强制）
   fi
   
-  update-ca-certificates >/dev/null 2>&1 || true
+  if command -v update-ca-certificates >/dev/null 2>&1; then
+    update-ca-certificates >/dev/null 2>&1 || true
+  elif command -v update-ca-trust >/dev/null 2>&1; then
+    update-ca-trust extract >/dev/null 2>&1 || true
+  fi
 }
 
 # 轻量检测：确保系统有 go 命令。优先用发行版包，工具链版本交由 GOTOOLCHAIN=auto 处理。
@@ -921,7 +936,11 @@ ensure_go() {
     existing_go_ver=$(/usr/local/go/bin/go version 2>/dev/null | awk '{print $3}' || echo "未知")
     echo "[警告] 将替换已有 Go 安装：$existing_go_ver → Go ${GO_VERSION}" >&2
     if [[ "${NON_INTERACTIVE}" -ne 1 ]]; then
-      read -p "  确认删除 /usr/local/go 并重新安装？(y/n): " _go_confirm
+      local _go_confirm=""
+      if ! read -r -p "  确认删除 /usr/local/go 并重新安装？(y/n): " _go_confirm; then
+        echo "[中止] 输入已结束，请手动安装 Go 后重试。" >&2
+        exit 1
+      fi
       [[ "$_go_confirm" == "y" ]] || { echo "[中止] 请手动安装 Go 后重试。" >&2; exit 1; }
     fi
     rm -rf /usr/local/go
@@ -992,6 +1011,13 @@ derper_supports_listen_a() {
   fi
 }
 
+derper_supports_socket_flag() {
+  local bin help_output
+  if [[ -x "${BIN_PATH}" ]]; then bin="${BIN_PATH}"; else bin="$(command -v derper 2>/dev/null || echo ${BIN_PATH})"; fi
+  help_output=$("$bin" -h 2>&1 || true)
+  echo "$help_output" | grep -qE '(^|[[:space:]])-socket([[:space:]]|$)'
+}
+
 generate_selfsigned_cert() {
   echo "[步骤] 生成基于 IP 的自签临时证书（SAN=IP:${IP_ADDR}）…"
   mkdir -p "${INSTALL_DIR}/certs"
@@ -1050,16 +1076,7 @@ CONF
 
 generate_derper_config() {
   echo "[步骤] 生成 derper 配置文件…"
-  
-  # 注意：当使用 -verify-clients 时，derper 需要访问 tailscaled 本地 API
-  # 来获取节点密钥和验证客户端。配置文件留空让 derper 自动处理。
-  # PrivateKeyPath 指的是 derper 自身的节点私钥（非 TLS 证书私钥）。
-  cat >"${INSTALL_DIR}/derper.json" <<CONFIG
-{}
-CONFIG
-  
-  chmod 640 "${INSTALL_DIR}/derper.json"
-  echo "[信息] derper 配置文件生成于：${INSTALL_DIR}/derper.json"
+  prepare_derper_config
   
   # 创建环境变量文件模板（用于敏感配置）
   local env_file="/etc/derper/derper.env"
@@ -1080,8 +1097,7 @@ CONFIG
 # Headscale 客户端验证 URL（使用 Headscale 时）
 # DERP_VERIFY_CLIENT_URL=https://headscale.example.com/verify
 
-# 自定义本地 API Socket 路径（通常无需设置）
-# TS_LOCAL_API_SOCKET=/var/run/tailscale/tailscaled.sock
+# tailscaled 本地 API Socket 由部署脚本探测，并通过 derper 的 -socket 参数传入。
 
 # 其他自定义环境变量
 # ...
@@ -1093,6 +1109,24 @@ ENVFILE
     echo "       如需使用，请编辑该文件并重启服务"
   else
     echo "[信息] 环境变量文件已存在：$env_file"
+  fi
+}
+
+prepare_derper_config() {
+  local config_path="${INSTALL_DIR}/derper.json"
+  mkdir -p "${INSTALL_DIR}"
+  if [[ -f "$config_path" ]]; then
+    local config_trim
+    config_trim=$(tr -d ' \t\r\n' <"$config_path" 2>/dev/null || true)
+    if [[ -z "$config_trim" || "$config_trim" == "{}" ]]; then
+      rm -f "$config_path"
+      echo "[信息] 已移除旧的空 derper 配置；服务启动时将自动生成节点私钥：${config_path}"
+    else
+      chmod 600 "$config_path"
+      echo "[信息] 保留现有 derper 配置：${config_path}"
+    fi
+  else
+    echo "[信息] derper 将在首次启动时自动生成节点私钥配置：${config_path}"
   fi
 }
 
@@ -1140,6 +1174,17 @@ journal_certname_raw() {
   fp=$(journalctl -u derper -n 200 --no-pager 2>/dev/null \
        | grep -oE 'sha256-raw:[0-9a-f]+' 2>/dev/null | tail -n1 | sed 's/^sha256-raw://' || true)
   [[ -n "$fp" ]] && echo "$fp" || return 1
+}
+
+check_live_cert_status() {
+  LIVE_CERT_CHECKED=1
+  CERT_LIVE_MATCH=0
+  local file_fp="" live_fp=""
+  file_fp=$(cert_file_sha256_raw || true)
+  live_fp=$(live_cert_sha256_raw || true)
+  if [[ -n "$file_fp" && -n "$live_fp" && "$file_fp" == "$live_fp" ]]; then
+    CERT_LIVE_MATCH=1
+  fi
 }
 
 setup_service_user() {
@@ -1224,13 +1269,16 @@ setup_service_user() {
 
 write_systemd_service() {
   echo "[步骤] 写入 systemd 服务单元：${SERVICE_PATH}…"
+  prepare_derper_config
   local stun_args=()
   if derper_supports_stun_port; then
     stun_args=("-stun" "-stun-port" "${STUN_PORT}")
   else
     stun_args=("-stun")
     if [[ "${STUN_PORT}" != "3478" ]]; then
-      echo "[提示] 检测到 derper 不支持自定义 STUN 端口，将使用默认 3478。" >&2
+      echo "[错误] 当前 derper 不支持 -stun-port，无法使用自定义 STUN 端口 ${STUN_PORT}。" >&2
+      echo "  请改用 --stun-port 3478，或升级 derper 后重试。" >&2
+      return 1
     fi
   fi
 
@@ -1299,7 +1347,11 @@ write_systemd_service() {
                   echo "[跳过] 非交互模式下跳过 tailscaled 重启，将使用备选方案配置 socket 权限。" >&2
                   _do_restart=0
                 else
-                  read -p "  是否确认重启 tailscaled？(yes/no): " _ts_restart_confirm
+                  local _ts_restart_confirm=""
+                  if ! read -r -p "  是否确认重启 tailscaled？(yes/no): " _ts_restart_confirm; then
+                    echo "[跳过] 输入已结束，跳过 tailscaled 重启，将使用备选方案。" >&2
+                    _do_restart=0
+                  fi
                   if [[ "$_ts_restart_confirm" != "yes" ]]; then
                     echo "[跳过] 已取消 tailscaled 重启，将使用备选方案。" >&2
                     _do_restart=0
@@ -1443,20 +1495,13 @@ EOT
 
   # 非 systemd 环境前置拦截并给出手动运行示例
   if ! command -v systemctl >/dev/null 2>&1; then
-    # 根据配置文件是否为空，决定是否在示例命令中包含 -c 选项
-    local config_flag=""
-    if [[ -f "${INSTALL_DIR}/derper.json" ]]; then
-      local _cfg_trim
-      _cfg_trim=$(tr -d ' \t\r\n' <"${INSTALL_DIR}/derper.json" 2>/dev/null || echo "")
-      if [[ -n "${_cfg_trim}" && "${_cfg_trim}" != "{}" ]]; then
-        config_flag="-c ${INSTALL_DIR}/derper.json"
-      fi
-    fi
-    local manual_cmd="${BIN_PATH}"
-    [[ -n "${config_flag}" ]] && manual_cmd+=" ${config_flag}"
+    local manual_cmd="${BIN_PATH} -c ${INSTALL_DIR}/derper.json"
     manual_cmd+=" -hostname ${IP_ADDR} -certmode manual -certdir ${INSTALL_DIR}/certs -http-port -1"
     manual_cmd+=" ${listen_args[*]} ${stun_args[*]}"
     [[ -n "${verify_flag}" ]] && manual_cmd+=" ${verify_flag}"
+    if [[ -n "${verify_flag}" ]] && derper_supports_socket_flag; then
+      manual_cmd+=" -socket ${socket_path:-/run/tailscale/tailscaled.sock}"
+    fi
     cat >&2 <<EOT
 [阻断] 未检测到 systemd，无法写入服务单元：${SERVICE_PATH}
 
@@ -1491,19 +1536,8 @@ EOT
     supplementary_groups_line="SupplementaryGroups=${target_group_for_access}"
   fi
 
-  # 根据配置文件是否为空，决定是否在 ExecStart 中包含 -c 选项
-  local config_flag=""
-  if [[ -f "${INSTALL_DIR}/derper.json" ]]; then
-    local _cfg_trim
-    _cfg_trim=$(tr -d ' \t\r\n' <"${INSTALL_DIR}/derper.json" 2>/dev/null || echo "")
-    if [[ -n "${_cfg_trim}" && "${_cfg_trim}" != "{}" ]]; then
-      config_flag="-c ${INSTALL_DIR}/derper.json"
-    fi
-  fi
-
   # 动态构建 ExecStart 命令参数（每个参数独立为数组元素，避免空格拼接错误）
-  local exec_args=("${BIN_PATH}")
-  [[ -n "${config_flag}" ]] && exec_args+=("${config_flag}")
+  local exec_args=("${BIN_PATH}" "-c" "${INSTALL_DIR}/derper.json")
   exec_args+=("-hostname" "${IP_ADDR}")
   exec_args+=("-certmode" "manual")
   exec_args+=("-certdir" "${INSTALL_DIR}/certs")
@@ -1511,12 +1545,8 @@ EOT
   exec_args+=("${listen_args[@]}")
   exec_args+=("${stun_args[@]}")
   [[ -n "${verify_flag}" ]] && exec_args+=("${verify_flag}")
-  
-  # 将参数数组转换为单行命令字符串
-  local exec_start_line="${exec_args[*]}"
 
-  # 根据 verify-clients 与已探测的 socket 路径，设置本地 API 环境变量
-  local localapi_env_line=""
+  # 根据 verify-clients 与已探测的 socket 路径，传入 derper 实际支持的 -socket 参数。
   if [[ "${VERIFY_CLIENTS_MODE}" == "on" ]]; then
     local chosen_socket=""
     if [[ -S /run/tailscale/tailscaled.sock ]]; then
@@ -1526,10 +1556,18 @@ EOT
     elif [[ -n "$socket_path" ]]; then
       chosen_socket="$socket_path"
     fi
-    # 即便未检测到，也写入常见路径，避免 derper 误用默认
+    # 即便未检测到，也显式使用常见路径。
     [[ -z "$chosen_socket" ]] && chosen_socket="/run/tailscale/tailscaled.sock"
-    localapi_env_line="Environment=TS_LOCAL_API_SOCKET=${chosen_socket}"
+    if derper_supports_socket_flag; then
+      exec_args+=("-socket" "${chosen_socket}")
+    elif [[ "$chosen_socket" != "/run/tailscale/tailscaled.sock" ]]; then
+      echo "[错误] 当前 derper 不支持 -socket，无法使用非默认 tailscaled socket：${chosen_socket}" >&2
+      return 1
+    fi
   fi
+
+  # 将参数数组转换为单行命令字符串
+  local exec_start_line="${exec_args[*]}"
 
   # 根据安全级别生成加固选项
   local hardening_basic="NoNewPrivileges=true
@@ -1597,13 +1635,6 @@ MemoryDenyWriteExecute=true"
 ${supplementary_groups_line}"
   fi
 
-  # 构建 localapi 环境变量行（避免空行）
-  local localapi_env_section=""
-  if [[ -n "${localapi_env_line}" ]]; then
-    localapi_env_section="
-${localapi_env_line}"
-  fi
-
   cat >"${SERVICE_PATH}" <<SERVICE
 [Unit]
 Description=Tailscale DERP (derper) with self-signed IP cert
@@ -1616,7 +1647,7 @@ User=${RUN_USER}
 Group=${run_group}${supplementary_groups_section}
 
 # 环境变量（支持敏感配置）
-EnvironmentFile=-/etc/derper/derper.env${localapi_env_section}
+EnvironmentFile=-/etc/derper/derper.env
 
 ExecStart=${exec_start_line}
 Restart=on-failure
@@ -1845,24 +1876,23 @@ JSON
 }
 
 print_acl_snippet_insecure() {
-  cat <<'JSON'
+  cat <<JSON
 ==================== 备用方案（不推荐）：使用自签 + InsecureForTests 的 derpMap 片段 ====================
 // 注意：仅在无法使用 CertName 指纹时使用该片段，并设置 "InsecureForTests": true
-//       HostName 应填写你的公网 IP。
 {
   "derpMap": {
     "OmitDefaultRegions": false,
     "Regions": {
-      "901": {
-        "RegionID": 901,
-        "RegionCode": "my-derp",
-        "RegionName": "My IP DERP",
+      "${REGION_ID}": {
+        "RegionID": ${REGION_ID},
+        "RegionCode": "${REGION_CODE}",
+        "RegionName": "${REGION_NAME}",
         "Nodes": [
           {
-            "Name": "901a",
-            "RegionID": 901,
-            "HostName": "<你的公网IP>",
-            "DERPPort": 443,
+            "Name": "${REGION_ID}a",
+            "RegionID": ${REGION_ID},
+            "HostName": "${IP_ADDR}",
+            "DERPPort": ${DERP_PORT},
             "InsecureForTests": true
           }
         ]
@@ -1913,6 +1943,9 @@ health_is_ok() {
   [[ "${CERT_PRESENT:-0}" -eq 1 ]] || return 1
   [[ "${CERT_SAN_MATCH:-0}" -eq 1 ]] || return 1
   [[ "${CERT_EXPIRY_OK:-0}" -eq 1 ]] || return 1
+  if [[ "${LIVE_CERT_CHECKED:-0}" -eq 1 ]]; then
+    [[ "${CERT_LIVE_MATCH:-0}" -eq 1 ]] || return 1
+  fi
   return 0
 }
 
@@ -1930,6 +1963,7 @@ health_check_report() {
   check_tailscale_status
   check_derper_status
   check_cert_status
+  check_live_cert_status
   local days_left
   days_left=$(cert_days_remaining || true)
 
@@ -1947,6 +1981,7 @@ health_check_report() {
   [[ $PORT_STUN_OK -eq 1 ]] && echo "✅ 端口：STUN ${STUN_PORT}/udp 正在监听" || echo "❌ 端口：STUN ${STUN_PORT}/udp 未监听"
   [[ $PURE_IP_OK -eq 1 ]] && echo "✅ 配置：当前 unit 为纯 IP 模式" || echo "❌ 配置：当前 unit 不是纯 IP 模式"
   [[ $DESIRED_CONFIG_OK -eq 1 ]] && echo "✅ 配置：当前 unit 与本次目标参数一致" || echo "❌ 配置：当前 unit 与本次目标参数不一致，建议执行 --repair"
+  [[ $CERT_LIVE_MATCH -eq 1 ]] && echo "✅ 证书：在线服务与磁盘证书一致" || echo "❌ 证书：在线服务未提供当前磁盘证书（或握手失败）"
   if [[ $DERPER_VERIFY_CLIENTS_EFFECTIVE -eq 1 ]]; then
     echo "ℹ️  客户端校验：当前 unit 已启用 -verify-clients"
   else
@@ -1989,8 +2024,14 @@ health_check_report() {
 
 write_prometheus_metrics() {
   local path="$1" days_left="$2" rss_kb="$3"
-  mkdir -p "$(dirname "$path")" 2>/dev/null || true
-  local tmp="${path}.tmp"
+  local dir base tmp
+  dir=$(dirname "$path")
+  base=$(basename "$path")
+  mkdir -p "$dir" 2>/dev/null || true
+  if ! tmp=$(mktemp "${dir}/.${base}.tmp.XXXXXX" 2>/dev/null); then
+    echo "[警告] 无法在指标目录创建安全临时文件：${dir}" >&2
+    return 1
+  fi
   if ! {
     echo "# HELP derper_up Whether derper service is up (1)"
     echo "# TYPE derper_up gauge"
@@ -2033,8 +2074,10 @@ write_prometheus_metrics() {
     fi
   } >"$tmp"; then
     echo "[警告] Prometheus 指标写入临时文件失败：$tmp（权限或路径问题）" >&2
+    rm -f "$tmp" 2>/dev/null || true
     return 1
   fi
+  chmod 644 "$tmp" 2>/dev/null || true
   if ! mv -f "$tmp" "$path" 2>/dev/null; then
     echo "[警告] Prometheus 指标写入成功但无法移动到目标路径：$path" >&2
     echo "  可能原因：跨文件系统、目录权限不足。请确保路径可写。" >&2
@@ -2125,40 +2168,43 @@ EOT
 
 EOT
 
+  local scenario="" account_pref="" port_choice="" verify_choice="" region_choice=""
+  local execute="" user_ip="" final_confirm=""
+
   # 问题1：使用场景
   echo "1. 您的使用场景？"
   echo "   a) 个人测试/学习"
   echo "   b) 小团队（<10人）"
   echo "   c) 生产环境"
-  read -p "   请选择 (a/b/c): " scenario
+  read -r -p "   请选择 (a/b/c): " scenario || { echo "[中止] 输入已结束，退出向导。" >&2; return 1; }
   
   # 问题2：账户偏好
   echo ""
   echo "2. 账户管理偏好？"
   echo "   a) 简单优先（使用当前账户）"
   echo "   b) 安全优先（创建专用账户）"
-  read -p "   请选择 (a/b): " account_pref
+  read -r -p "   请选择 (a/b): " account_pref || { echo "[中止] 输入已结束，退出向导。" >&2; return 1; }
   
   # 问题3：端口选择
   echo ""
   echo "3. DERP 端口？"
   echo "   a) 443（推荐，防火墙友好）"
   echo "   b) 30399（默认，避免与其他服务冲突）"
-  read -p "   请选择 (a/b): " port_choice
+  read -r -p "   请选择 (a/b): " port_choice || { echo "[中止] 输入已结束，退出向导。" >&2; return 1; }
   
   # 问题4：客户端验证
   echo ""
   echo "4. 是否启用客户端验证？"
   echo "   a) 是（推荐，更安全）- 需要本地 tailscaled 已登录"
   echo "   b) 否（仅测试环境）"
-  read -p "   请选择 (a/b): " verify_choice
+  read -r -p "   请选择 (a/b): " verify_choice || { echo "[中止] 输入已结束，退出向导。" >&2; return 1; }
   
   # 问题5：网络环境
   echo ""
   echo "5. 服务器是否位于中国大陆？（用于 Go 代理加速）"
   echo "   a) 是（推荐，配置 goproxy.cn）"
   echo "   b) 否（全球环境）"
-  read -p "   请选择 (a/b): " region_choice
+  read -r -p "   请选择 (a/b): " region_choice || { echo "[中止] 输入已结束，退出向导。" >&2; return 1; }
   
   # 生成命令（使用模板替换，不用 eval）
   # 注意：每个参数必须是独立的数组元素，以便 exec 正确执行
@@ -2228,10 +2274,10 @@ EOT
   echo "$full_cmd" > derper_deploy_cmd.sh
   chmod +x derper_deploy_cmd.sh
   
-  read -p "> " execute
+  read -r -p "> " execute || { echo "[中止] 输入已结束，命令已保存到 derper_deploy_cmd.sh。" >&2; return 1; }
   if [[ "$execute" == "y" || "$execute" == "Y" ]]; then
     echo ""
-    read -p "请输入您的公网 IP: " user_ip
+    read -r -p "请输入您的公网 IP: " user_ip || { echo "[中止] 输入已结束。" >&2; return 1; }
     
     # 严格验证 IPv4 格式
     if [[ ! "$user_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
@@ -2270,7 +2316,7 @@ EOT
       echo "  ${exec_args[*]}"
     fi
     echo ""
-    read -p "确认执行？(yes/no): " final_confirm
+    read -r -p "确认执行？(yes/no): " final_confirm || { echo "[中止] 输入已结束。" >&2; return 1; }
     
     if [[ "$final_confirm" == "yes" ]]; then
       # 使用数组安全执行，彻底避免 shell 注入
@@ -2282,6 +2328,16 @@ EOT
     echo "[信息] 命令已保存到 derper_deploy_cmd.sh"
     echo "       手动执行前请替换 __IP_PLACEHOLDER__ 为实际 IP"
   fi
+}
+
+service_needs_reconcile() {
+  local artifacts_changed="${1:-0}"
+  [[ "${DERPER_SERVICE_PRESENT:-0}" -ne 1 ]] ||
+    [[ "${DESIRED_CONFIG_OK:-0}" -ne 1 ]] ||
+    [[ "${DERPER_RUNNING:-0}" -ne 1 ]] ||
+    [[ "${PORT_TLS_OK:-0}" -ne 1 ]] ||
+    [[ "${PORT_STUN_OK:-0}" -ne 1 ]] ||
+    [[ "$artifacts_changed" -eq 1 ]]
 }
 
 main() {
@@ -2424,15 +2480,16 @@ main() {
   else
     # 默认幂等：按需修复
     local changed=0
+    local service_reload_needed=0
     if [[ $DERPER_BIN -ne 1 ]]; then
       install_deps
-      install_derper; changed=1
+      install_derper; changed=1; service_reload_needed=1
     fi
     if [[ $CERT_PRESENT -ne 1 || $CERT_SAN_MATCH -ne 1 || $CERT_EXPIRY_OK -ne 1 ]]; then
       command -v openssl >/dev/null 2>&1 || install_deps
-      generate_selfsigned_cert; changed=1
+      generate_selfsigned_cert; changed=1; service_reload_needed=1
     fi
-    if [[ $DERPER_SERVICE_PRESENT -ne 1 || $DESIRED_CONFIG_OK -ne 1 ]]; then
+    if service_needs_reconcile "$service_reload_needed"; then
       check_port_conflicts
       write_systemd_service; changed=1
     fi
@@ -2452,7 +2509,7 @@ main() {
     print_acl_snippet_cert "${IP_ADDR}" "${DERP_PORT}" "$FP"
     echo "[信息] 已基于实际在线证书指纹生成片段：sha256-raw:${FP}"
   else
-    print_acl_snippet_insecure | sed "s/<你的公网IP>/${IP_ADDR}/g" | sed "s/\"DERPPort\": 443/\"DERPPort\": ${DERP_PORT}/g"
+    print_acl_snippet_insecure
     echo "[提示] 未能获取证书指纹（可能端口未就绪或缺少 openssl），已回退到 InsecureForTests 片段。"
   fi
   print_client_verify_steps

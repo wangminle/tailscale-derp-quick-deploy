@@ -3,7 +3,7 @@
 > 本文是中文的详细技术参考。主仓库首页 `README.md` 为精简版中文快速上手；英文详细参考见同目录的 `REFERENCE_EN.md`。
 
 > **脚本文件**：`deploy_derper_ip_selfsigned.sh`  
-> **当前版本**：2.0.3（2026-01-25）
+> **当前版本**：2.0.5（2026-06-14）
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
 ![systemd](https://img.shields.io/badge/Service-systemd-orange?logo=systemd&logoColor=white)
@@ -50,7 +50,7 @@
 **本地开发测试**：
 如需在 macOS/WSL 上测试 `derper` 程序本身（非生产部署），可手动前台运行：
 ```bash
-derper -hostname 127.0.0.1 -certmode manual -certdir ./certs \
+derper -c ./derper.json -hostname 127.0.0.1 -certmode manual -certdir ./certs \
   -http-port -1 -a :30399 -stun
 ```
 注意：此模式仅供本地功能验证，无法作为 Tailscale 网络的中继节点。
@@ -230,8 +230,8 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
   - 缺少项（如 curl/openssl/git/go）：正式安装会按需补齐；离线/受限网络下请先用包管理器安装。
 - 服务管理器
   - 未检测到 systemd：无法写入服务。可手动前台运行（示例）：
-    `derper -hostname <你的公网IP> -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun -stun-port 3478 -verify-clients`
-    说明：老版本不支持 `-a/-stun-port` 时，改用 `-https-port 30399` 并去掉 `-stun-port`。
+    `derper -c /opt/derper/derper.json -hostname <你的公网IP> -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun -stun-port 3478 -verify-clients -socket /run/tailscale/tailscaled.sock`
+    说明：老版本不支持 `-a` 时可改用 `-https-port 30399`。若不支持 `-stun-port`，只能使用默认 STUN 端口 3478；脚本会拒绝无法生效的自定义 STUN 端口。
 - 非 systemd 环境将给出手动运行示例，安装流程会中止。
 - 建议（建议动作汇总）
   - `<已就绪：可直接跳过>`：无需操作。
@@ -278,7 +278,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 --purge-all               搭配 --uninstall：在 --purge 基础上同时删除二进制、/etc/derper/derper.env 和脚本创建的 tailscaled socket drop-in；防火墙规则和用户/组账户需手动确认
 ```
 
-> 兼容性：脚本优先使用新版 `-a :<PORT>` 指定监听；若不支持则回退到旧参数 `-https-port <PORT>`。
+> 兼容性：脚本优先使用新版 `-a :<PORT>` 指定监听；若不支持则回退到旧参数 `-https-port <PORT>`。若当前 derper 不支持 `-stun-port`，脚本仅允许默认端口 3478；传入其他 STUN 端口会明确报错并中止。
 
 > 幂等说明：若检测到本机已存在“纯 IP 模式”的 derper，且 unit 与本次目标参数一致（IP、DERP/STUN 端口、运行用户、安全级别、客户端校验）、端口监听健康、证书匹配 IP 且未临期，默认跳过安装；否则按需修复。
 
@@ -546,11 +546,13 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 退出码语义（可用于 shell/监控判定）：
 
 ```text
-0  表示关键健康项正常（服务运行 + TLS/UDP 端口均在监听）
-1  表示至少一项关键健康检查失败（服务或端口不健康）
+0  表示关键健康项正常（服务、端口、目标配置和证书均正常，在线证书与磁盘证书一致）
+1  表示至少一项关键健康检查失败
 ```
 
 > 💡 **v2.0.2 改进**：`--metrics-textfile` 写入失败时不再导致脚本中止，会输出警告并继续执行。
+>
+> 💡 **v2.0.5 改进**：健康检查会实际连接 DERP TLS 端口，对比在线证书与磁盘证书指纹，避免续签后服务仍提供旧证书时误报健康。
 
 示例（仅在异常时报警）：
 
@@ -567,6 +569,10 @@ fi
 ✅ 服务：derper 处于运行中
 ✅ 端口：TLS 30399/tcp 正在监听
 ✅ 端口：STUN 3478/udp 正在监听
+✅ 配置：当前 unit 为纯 IP 模式
+✅ 配置：当前 unit 与本次目标参数一致
+✅ 证书：在线服务与磁盘证书一致
+ℹ️  客户端校验：当前 unit 已启用 -verify-clients
 ✅ 证书：有效期剩余 287 天
 ℹ️  资源：derper 内存 RSS 约 3 MiB
 ```

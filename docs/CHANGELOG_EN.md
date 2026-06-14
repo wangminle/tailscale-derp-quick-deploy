@@ -1,5 +1,37 @@
 # Changelog
 
+## [2.0.5] - 2026-06-14
+
+### 🔧 Bug Fixes
+
+1. **Minimal-environment and interactive robustness**
+   - Fixed the script failing during load under `set -u` when `USER` is not exported; it now falls back to `id -un`.
+   - All interactive `read` calls now handle EOF safely, preventing unbound-variable failures in the wizard, Go installation confirmation, and tailscaled restart confirmation.
+
+2. **derper configuration and client verification correctness**
+   - systemd `ExecStart` and manual-run examples now always specify the node-key config with `-c /opt/derper/derper.json`.
+   - Legacy empty `{}` configs are removed so derper can generate a valid node private key on first start, while existing valid configs are preserved.
+   - `-verify-clients` now uses derper's supported `-socket` flag instead of the ineffective `TS_LOCAL_API_SOCKET` environment variable.
+   - Custom STUN ports are rejected when the installed derper lacks `-stun-port`, avoiding mismatches between the actual listener, configuration, and firewall guidance.
+
+3. **Idempotent repair and certificate health checks**
+   - Certificate renewal, binary replacement, a stopped service, or missing target listeners now trigger service reconciliation and restart so updated files take effect immediately.
+   - Fixed certificate SAN checks treating IPv4 dots as regular-expression wildcards.
+   - Health checks now compare the live TLS certificate fingerprint with the on-disk certificate, preventing false positives while derper still serves an old certificate.
+
+4. **Platform compatibility and safe writes**
+   - RHEL-family systems now refresh CA state with `update-ca-trust extract`.
+   - Prometheus textfile output now uses a secure randomized temporary file in the target directory, avoiding fixed `.tmp` path concurrency and symlink risks.
+   - The fallback `InsecureForTests` ACL snippet now uses the requested Region, IP, and DERP port.
+   - Added `.gitattributes` to enforce LF line endings for `.sh` files.
+
+### 🧪 Tests
+
+- Expanded the regression suite to 16 tests, covering unset `USER`, runtime reconciliation, `-c`/`-socket` arguments, empty-config migration, unsupported custom STUN ports, ACL parameters, wizard EOF, exact SAN matching, live-certificate consistency, and safe metrics writes.
+- `bash -n`, `git diff --check`, and LF line-ending checks pass.
+
+---
+
 ## [2.0.4] - 2026-05-19
 
 ### 🔧 Bug Fixes
@@ -353,6 +385,8 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 ---
 
-**Contributors**: Thanks to architects for professional advice  
-**Update Date**: 2026-01-25  
-**Version**: 2.0.3
+**Contributors**: Thanks to architects for professional advice
+
+**Update Date**: 2026-06-14
+
+**Version**: 2.0.5
