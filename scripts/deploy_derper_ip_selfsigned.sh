@@ -476,6 +476,24 @@ EOT
   fi
 }
 
+# -verify-clients 要求 derper 与 tailscaled 由同一 Git revision 构建（上游约定），
+# 否则本地 API 协议可能不兼容、客户端校验异常。
+# 参考上游说明：https://github.com/tailscale/tailscale/blob/main/cmd/derper/README.md
+# 当用户未显式指定 derper 版本（仍为 latest）且启用了 -verify-clients 时，
+# 自动对齐到当前已安装的 tailscale 版本，保证二者同源构建。
+align_derper_version_with_tailscale() {
+  [[ "${VERIFY_CLIENTS_MODE}" == "on" ]] || return 0
+  [[ "${DERPER_VERSION}" == "latest" ]] || return 0
+  if [[ -z "${TS_VERSION:-}" ]]; then
+    echo "[提示] --verify-clients 已启用，但未检测到 tailscale 版本；将安装 derper@latest。" >&2
+    echo "       -verify-clients 要求 derper 与 tailscaled 同源构建；建议用 --derper-version 显式指定与 tailscaled 一致的版本。" >&2
+    return 0
+  fi
+  DERPER_VERSION="v${TS_VERSION}"
+  echo "[信息] --verify-clients 已启用：derper 版本自动对齐到 tailscale ${TS_VERSION}（将安装 derper@v${TS_VERSION}），确保二者同源构建。"
+  echo "       如需改用其他版本，请用 --derper-version 显式指定。"
+}
+
 validate_settings() {
   # 端口合法性
   if ! [[ "${DERP_PORT}" =~ ^[0-9]+$ ]] || (( DERP_PORT < 1 || DERP_PORT > 65535 )); then
@@ -724,7 +742,12 @@ unit_matches_desired_config() {
     on)
       echo "$content" | grep -qE -- '(^|[[:space:]])-verify-clients([[:space:]]|$)' || return 1
       if derper_supports_socket_flag; then
-        echo "$content" | grep -qE -- '(^|[[:space:]])-socket[[:space:]]+[^[:space:]]+' || return 1
+        # 不仅要求存在 -socket，还必须与本机实际探测到的 socket 路径一致，
+        # 否则错误的 socket 路径会被误判为"配置一致"，verify-clients 静默失效。
+        local expected_sock sock_re
+        expected_sock=$(expected_tailscaled_socket)
+        sock_re=$(regex_escape "$expected_sock")
+        echo "$content" | grep -qE -- "(^|[[:space:]])-socket[[:space:]]+${sock_re}([[:space:]]|$)" || return 1
       fi
       ;;
     off) ! echo "$content" | grep -qE -- '(^|[[:space:]])-verify-clients([[:space:]]|$)' || return 1 ;;
@@ -1184,6 +1207,19 @@ check_live_cert_status() {
   live_fp=$(live_cert_sha256_raw || true)
   if [[ -n "$file_fp" && -n "$live_fp" && "$file_fp" == "$live_fp" ]]; then
     CERT_LIVE_MATCH=1
+  fi
+}
+
+# 返回本机应使用的 tailscaled 本地 API socket 路径。
+# 与 write_systemd_service 内 chosen_socket 的探测口径保持一致：
+# 优先标准路径，缺失时回退到默认 /run/tailscale/tailscaled.sock。
+expected_tailscaled_socket() {
+  if [[ -S /run/tailscale/tailscaled.sock ]]; then
+    echo "/run/tailscale/tailscaled.sock"
+  elif [[ -S /var/run/tailscale/tailscaled.sock ]]; then
+    echo "/var/run/tailscale/tailscaled.sock"
+  else
+    echo "/run/tailscale/tailscaled.sock"
   fi
 }
 
@@ -2337,7 +2373,9 @@ service_needs_reconcile() {
     [[ "${DERPER_RUNNING:-0}" -ne 1 ]] ||
     [[ "${PORT_TLS_OK:-0}" -ne 1 ]] ||
     [[ "${PORT_STUN_OK:-0}" -ne 1 ]] ||
-    [[ "$artifacts_changed" -eq 1 ]]
+    [[ "$artifacts_changed" -eq 1 ]] ||
+    # 在线证书与磁盘证书不一致（如外部替换了磁盘证书但 derper 未重启）→ 需重启加载
+    { [[ "${LIVE_CERT_CHECKED:-0}" -eq 1 ]] && [[ "${CERT_LIVE_MATCH:-0}" -ne 1 ]]; }
 }
 
 main() {
@@ -2389,6 +2427,7 @@ main() {
   check_tailscale_status
   check_derper_status
   check_cert_status
+  check_live_cert_status
 
   # 健康检查模式（仅输出状态/指标，不变更系统）
   if [[ "${HEALTH_CHECK}" -eq 1 ]]; then
@@ -2459,6 +2498,8 @@ main() {
 
   # 默认启用 verify-clients 并在未登录时阻断
   precheck_verify_clients
+  # verify-clients 启用时，将 derper 版本对齐到本机 tailscale 版本（同源构建）
+  align_derper_version_with_tailscale
 
   if [[ "${FORCE}" -eq 1 ]]; then
     install_deps

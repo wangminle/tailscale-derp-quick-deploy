@@ -3,7 +3,7 @@
 > 本文是中文的详细技术参考。主仓库首页 `README.md` 为精简版中文快速上手；英文详细参考见同目录的 `REFERENCE_EN.md`。
 
 > **脚本文件**：`deploy_derper_ip_selfsigned.sh`  
-> **当前版本**：2.0.5（2026-06-14）
+> **当前版本**：0.2.6（2026-06-15）
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
 ![systemd](https://img.shields.io/badge/Service-systemd-orange?logo=systemd&logoColor=white)
@@ -70,6 +70,7 @@ derper -c ./derper.json -hostname 127.0.0.1 -certmode manual -certdir ./certs \
 - **默认启用 `-verify-clients`**：脚本会在安装前检查本机 `tailscaled` 是否运行且已登录
   - ✅ 若未就绪，脚本会中止并提示登录方法
   - ⚠️ 若确需跳过校验，可使用 `--no-verify-clients`（**仅限测试环境**）
+  - 🔒 **版本对齐（v0.2.6）**：`-verify-clients` 要求 derper 与 tailscaled 由同一 Git revision 构建。未显式指定 `--derper-version` 时，脚本会自动把 derper 对齐到本机 tailscale 版本（`derper@v<TS版本>`）；可用 `--derper-version` 覆盖。
   - 📝 检测逻辑：
     - 若检测到 `tailscale` CLI，通过 `tailscale ip` 判断是否已分配 Tailnet IP
     - 若未检测到 CLI，则仅依据 `tailscaled` 运行状态判断
@@ -113,7 +114,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh --ip <你的公网IP> --check
 
 说明：预检不会写入系统或打开端口，只输出当前环境与参数检查结果、建议的下一步动作。若提示 tailscaled 未登录、端口冲突或缺少依赖，请先按提示处理。
 
-> 💡 **v2.0.2 改进**：即使公网 IP 探测失败，`--check` 模式也能继续输出完整诊断信息，方便排查环境问题。
+> 💡 **v0.2.2 改进**：即使公网 IP 探测失败，`--check` 模式也能继续输出完整诊断信息，方便排查环境问题。
 
 3) 运行部署脚本（正式安装/修复；国内网络示例，默认开启 `-verify-clients`）
 
@@ -550,9 +551,9 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 1  表示至少一项关键健康检查失败
 ```
 
-> 💡 **v2.0.2 改进**：`--metrics-textfile` 写入失败时不再导致脚本中止，会输出警告并继续执行。
+> 💡 **v0.2.2 改进**：`--metrics-textfile` 写入失败时不再导致脚本中止，会输出警告并继续执行。
 >
-> 💡 **v2.0.5 改进**：健康检查会实际连接 DERP TLS 端口，对比在线证书与磁盘证书指纹，避免续签后服务仍提供旧证书时误报健康。
+> 💡 **v0.2.5 改进**：健康检查会实际连接 DERP TLS 端口，对比在线证书与磁盘证书指纹，避免续签后服务仍提供旧证书时误报健康。
 
 示例（仅在异常时报警）：
 

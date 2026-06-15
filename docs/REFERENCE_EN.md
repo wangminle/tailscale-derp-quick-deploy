@@ -3,7 +3,7 @@
 > This is the detailed English reference. For the simplified Chinese quickstart now used as the main README, go to `../README.md`. For the detailed Chinese reference, see `REFERENCE_CN.md` in this folder.
 
 > **Script File**: `deploy_derper_ip_selfsigned.sh`  
-> **Current Version**: 2.0.5 (2026-06-14)
+> **Current Version**: 0.2.6 (2026-06-15)
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
 ![systemd](https://img.shields.io/badge/Service-systemd-orange?logo=systemd&logoColor=white)
@@ -62,6 +62,7 @@ Note: This mode is only for local functional verification and cannot serve as a 
 - **`-verify-clients` enabled by default**: Script checks if local `tailscaled` is running and logged in before installation
   - ✅ If not ready, script will abort and show login instructions
   - ⚠️ To skip verification, use `--no-verify-clients` (**testing only**)
+  - 🔒 **Version alignment (v0.2.6)**: `-verify-clients` requires derper and tailscaled to be built from the same git revision. When `--derper-version` is not specified, the script auto-aligns derper to the local tailscale version (`derper@v<TS-version>`); override with `--derper-version`.
   - 📝 Detection logic:
     - If `tailscale` CLI detected, checks via `tailscale ip` whether Tailnet IP is assigned
     - If CLI not detected, only checks `tailscaled` running status
@@ -91,7 +92,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh --ip <your-public-ip> --check
 
 Note: Pre-check won't modify system or open ports, only outputs current environment and parameter check results, plus suggested next actions. If it shows tailscaled not logged in, port conflicts, or missing dependencies, handle them first as instructed.
 
-> 💡 **v2.0.2 Improvement**: Even if public IP detection fails, `--check` mode will continue to output complete diagnostic information for easier troubleshooting.
+> 💡 **v0.2.2 Improvement**: Even if public IP detection fails, `--check` mode will continue to output complete diagnostic information for easier troubleshooting.
 
 3) Run deployment script (formal installation/repair; example for China mainland, with `-verify-clients` enabled by default)
 
@@ -517,9 +518,9 @@ Exit code semantics (for shell/monitoring decision):
 1  At least one critical health check failed
 ```
 
-> 💡 **v2.0.2 Improvement**: `--metrics-textfile` write failure no longer causes script abort; outputs warning and continues execution.
+> 💡 **v0.2.2 Improvement**: `--metrics-textfile` write failure no longer causes script abort; outputs warning and continues execution.
 >
-> 💡 **v2.0.5 Improvement**: Health checks connect to the DERP TLS port and compare the live certificate fingerprint with the on-disk certificate, preventing false positives when a renewed certificate has not been loaded.
+> 💡 **v0.2.5 Improvement**: Health checks connect to the DERP TLS port and compare the live certificate fingerprint with the on-disk certificate, preventing false positives when a renewed certificate has not been loaded.
 
 Example (alert only on anomaly):
 

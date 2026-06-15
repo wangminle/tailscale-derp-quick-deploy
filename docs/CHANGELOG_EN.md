@@ -1,6 +1,31 @@
 # Changelog
 
-## [2.0.5] - 2026-06-14
+## [0.2.6] - 2026-06-15
+
+### 🔧 Bug Fixes
+
+1. **Align derper version with tailscaled (verify-clients)**
+   - When `-verify-clients` is enabled and `--derper-version` is not specified, the script now auto-aligns derper to the locally installed tailscale version (installs `derper@v<TS-version>`), ensuring both are built from the same source revision and avoiding local-API protocol incompatibilities that break client verification.
+   - Upstream requires derper and tailscaled to be built from the same git revision; override with `--derper-version`; falls back to `latest` with a notice when the tailscale version cannot be detected.
+
+2. **Idempotent deploys missed stale live certificate**
+   - The main status-collection step now compares the live (served) certificate fingerprint with the on-disk one and feeds the result into `service_needs_reconcile`: if the disk cert was replaced externally while derper kept serving the old one, a re-run triggers a restart to load the new cert.
+   - `--health-check` exit code and summary now reflect live-certificate status.
+
+3. **Config match validates the actual `-socket` path**
+   - `unit_matches_desired_config` now verifies that `-socket` not only exists but matches the locally detected tailscaled socket path; a wrong socket path is no longer misreported as "config matches", which previously let verify-clients fail silently.
+
+4. **README doc sync**
+   - Fixed the example `RUN_USER="${SUDO_USER:-$USER}"` to `${SUDO_USER:-${USER:-$(id -un)}}`, matching the script (avoids unbound `$USER` under `set -u`).
+   - Corrected the `--repair` description: it restarts the derper service (only rewrites config/certs, does not reinstall derper/Go); the previous "without interrupting service" wording was inaccurate.
+
+### 🧪 Tests
+
+- Regression tests expanded to 19, adding coverage for: `-socket` path drift detection, stale live certificate triggering reconcile, and derper version auto-alignment.
+
+---
+
+## [0.2.5] - 2026-06-14
 
 ### 🔧 Bug Fixes
 
@@ -32,7 +57,7 @@
 
 ---
 
-## [2.0.4] - 2026-05-19
+## [0.2.4] - 2026-05-19
 
 ### 🔧 Bug Fixes
 
@@ -59,7 +84,7 @@
 
 ---
 
-## [2.0.3] - 2026-01-25
+## [0.2.3] - 2026-01-25
 
 ### 🔧 Bug Fixes
 
@@ -86,7 +111,7 @@
 
 ---
 
-## [2.0.2] - 2025-12-26
+## [0.2.2] - 2025-12-26
 
 ### 🔧 Bug Fixes
 
@@ -123,7 +148,7 @@
 
 ---
 
-## [2.0.0] - 2025-11-10
+## [0.2.0] - 2025-11-10
 
 ### 🎯 Major Improvements
 
@@ -319,7 +344,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 ---
 
-## [2.0.1] - 2025-11-10
+## [0.2.1] - 2025-11-10
 
 This is a "documentation and wording alignment" minor version, focusing on simplifying the homepage, demoting technical references, and synchronizing script usage wording with default policies.
 
@@ -340,7 +365,7 @@ This is a "documentation and wording alignment" minor version, focusing on simpl
 - Non-interactive root: Defaults to equivalent of `--dedicated-user` when no `SUDO_USER`, consistent with documentation.
 - Wizard execution: Removed eval, changed to safe parameter array execution (declared in documentation).
 
-> Note: Above code-level fine-tuning are all backward-compatible updates, do not change 2.0.0 functional boundaries, only correct wording and default policy statements, and strengthen parameter validation.
+> Note: Above code-level fine-tuning are all backward-compatible updates, do not change 0.2.0 functional boundaries, only correct wording and default policy statements, and strengthen parameter validation.
 
 **Personal Environment**:
 ```bash
@@ -387,6 +412,6 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 **Contributors**: Thanks to architects for professional advice
 
-**Update Date**: 2026-06-14
+**Update Date**: 2026-06-15
 
-**Version**: 2.0.5
+**Version**: 0.2.6

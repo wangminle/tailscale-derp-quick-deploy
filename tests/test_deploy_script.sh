@@ -287,17 +287,72 @@ test_source_survives_unset_user() {
   [[ -n "$saved_user" ]] && export USER="$saved_user" || true
 }
 
+test_unit_matching_rejects_wrong_socket_path() {
+  DERPER_TEST_MODE=1 source "$SCRIPT"
+  IP_ADDR="203.0.113.10" DERP_PORT="30399" STUN_PORT="3478" INSTALL_DIR="/opt/derper"
+  RUN_USER="derper" VERIFY_CLIENTS_MODE="on" SECURITY_LEVEL="standard"
+  derper_supports_socket_flag() { return 0; }
+  local base good bad
+  base=$'[Service]\nUser=derper\n# 安全加固（级别：standard）\nExecStart=/usr/local/bin/derper -c /opt/derper/derper.json -hostname 203.0.113.10 -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun -stun-port 3478 -verify-clients'
+  # 正确 socket 路径应被接受
+  good="${base} -socket /run/tailscale/tailscaled.sock"
+  unit_matches_desired_config "$good" || fail "correct -socket path should be accepted"
+  # 错误 socket 路径应被判为配置漂移
+  bad="${base} -socket /var/run/tailscale/tailscaled.sock"
+  unit_matches_desired_config "$bad" && fail "wrong -socket path should be rejected as drift"
+  ok "unit matching rejects wrong -socket path"
+}
+
+test_reconcile_detects_stale_live_cert() {
+  DERPER_TEST_MODE=1 source "$SCRIPT"
+  DERPER_SERVICE_PRESENT=1 DESIRED_CONFIG_OK=1 DERPER_RUNNING=1
+  PORT_TLS_OK=1 PORT_STUN_OK=1
+  # 在线证书与磁盘证书不一致（如外部替换磁盘证书但 derper 未重启）→ 应触发协调
+  LIVE_CERT_CHECKED=1 CERT_LIVE_MATCH=0
+  service_needs_reconcile 0 || fail "stale live certificate should trigger reconcile"
+  # 在线证书一致时不应触发
+  CERT_LIVE_MATCH=1
+  service_needs_reconcile 0 && fail "matching live certificate should not trigger reconcile"
+  # 未执行在线检查时也不应凭空触发
+  LIVE_CERT_CHECKED=0 CERT_LIVE_MATCH=0
+  service_needs_reconcile 0 && fail "absent live check must not trigger reconcile"
+  ok "stale live certificate triggers service reconcile"
+}
+
+test_verify_clients_aligns_derper_version() {
+  DERPER_TEST_MODE=1 source "$SCRIPT"
+  VERIFY_CLIENTS_MODE="on"; DERPER_VERSION="latest"; TS_VERSION="1.80.0"
+  align_derper_version_with_tailscale >/dev/null 2>&1
+  [[ "$DERPER_VERSION" == "v1.80.0" ]] || fail "verify-clients on should align derper to tailscale version"
+  # 显式指定版本时不覆盖
+  DERPER_VERSION="v1.74.1"
+  align_derper_version_with_tailscale >/dev/null 2>&1
+  [[ "$DERPER_VERSION" == "v1.74.1" ]] || fail "explicit --derper-version must be respected"
+  # 关闭 verify-clients 时不覆盖
+  VERIFY_CLIENTS_MODE="off"; DERPER_VERSION="latest"
+  align_derper_version_with_tailscale >/dev/null 2>&1
+  [[ "$DERPER_VERSION" == "latest" ]] || fail "verify-clients off should keep latest"
+  # 检测不到 tailscale 版本时保留 latest
+  VERIFY_CLIENTS_MODE="on"; DERPER_VERSION="latest"; TS_VERSION=""
+  align_derper_version_with_tailscale >/dev/null 2>&1
+  [[ "$DERPER_VERSION" == "latest" ]] || fail "unknown tailscale version should keep latest"
+  ok "verify-clients aligns derper version with tailscale"
+}
+
 test_no_crlf_and_syntax
 test_source_does_not_run_main
 test_source_survives_unset_user
 test_unit_matching_detects_config_drift
+test_unit_matching_rejects_wrong_socket_path
 test_validate_settings_rejects_invalid_user
 test_port_conflict_ignores_current_derper_service
 test_service_reconcile_detects_runtime_failures_and_cert_regen
+test_reconcile_detects_stale_live_cert
 test_nonempty_config_uses_separate_c_argument
 test_unsupported_custom_stun_port_is_rejected
 test_empty_derper_config_is_migrated_for_auto_key_generation
 test_verify_clients_passes_socket_flag
+test_verify_clients_aligns_derper_version
 test_insecure_acl_uses_requested_region_and_endpoint
 test_wizard_handles_eof_cleanly
 test_cert_san_matches_literal_ip_only

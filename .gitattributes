@@ -1,1 +1,19 @@
-*.sh text eol=lf
+# Auto detect text files and perform LF normalization
+*          text=auto eol=lf
+
+# Shell scripts must use LF
+*.sh       text eol=lf
+
+# Windows scripts
+*.bat      text eol=crlf
+*.cmd      text eol=crlf
+
+# Binary files - no normalization
+*.png      binary
+*.jpg      binary
+*.jpeg     binary
+*.gif      binary
+*.ico      binary
+*.pdf      binary
+*.zip      binary
+*.tar.gz   binary

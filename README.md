@@ -34,7 +34,7 @@ This project provides a **fully automated Tailscale DERP relay service deploymen
 
 - ✅ **Idempotent Design**: Safe to run multiple times, automatically detects existing configurations
 - ✅ **Parameter Auto-Adaptation**: Auto-detects new/old derper parameter differences (`-a` vs `-https-port`)
-- ✅ **Smart Repair**: `--repair` mode fixes configurations without interrupting service
+- ✅ **Smart Repair**: `--repair` mode rewrites config/certs and restarts the service (no derper/Go reinstall)
 
 #### 2. Security Hardening
 
@@ -143,7 +143,7 @@ INSTALL_DIR="/opt/derper"      # Installation directory
 BIN_PATH="/usr/local/bin/derper"
 VERIFY_CLIENTS_MODE="on"       # Enable client verification (secure default)
 SECURITY_LEVEL="standard"      # Standard security level
-RUN_USER="${SUDO_USER:-$USER}" # Use current login user
+RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # Use current login user
 ```
 
 #### Core Parameters
@@ -510,7 +510,7 @@ Whether you're an **individual user quickly setting up a testing environment** o
 
 - ✅ **幂等设计**：多次运行安全，自动识别已有配置
 - ✅ **参数自适应**：自动检测新旧版本 derper 参数差异（`-a` vs `-https-port`）
-- ✅ **智能修复**：`--repair` 模式仅修复配置，不中断服务
+- ✅ **智能修复**：`--repair` 仅重写配置/证书并重启服务，不重装 derper/Go
 
 #### 2. 安全加固
 
@@ -619,7 +619,7 @@ INSTALL_DIR="/opt/derper"      # 安装目录
 BIN_PATH="/usr/local/bin/derper"
 VERIFY_CLIENTS_MODE="on"       # 启用客户端校验（安全默认）
 SECURITY_LEVEL="standard"      # 标准安全级别
-RUN_USER="${SUDO_USER:-$USER}" # 使用当前登录用户
+RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # 使用当前登录用户
 ```
 
 #### 核心参数
