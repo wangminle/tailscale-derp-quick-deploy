@@ -3,7 +3,8 @@
 > 本文是中文的详细技术参考。主仓库首页 `README.md` 为精简版中文快速上手；英文详细参考见同目录的 `REFERENCE_EN.md`。
 
 > **脚本文件**：`deploy_derper_ip_selfsigned.sh`  
-> **当前版本**：0.2.6（2026-06-15）
+> **当前版本**：0.2.7（2026-07-11）  
+> **查看版本**：`bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
 ![systemd](https://img.shields.io/badge/Service-systemd-orange?logo=systemd&logoColor=white)
@@ -70,7 +71,7 @@ derper -c ./derper.json -hostname 127.0.0.1 -certmode manual -certdir ./certs \
 - **默认启用 `-verify-clients`**：脚本会在安装前检查本机 `tailscaled` 是否运行且已登录
   - ✅ 若未就绪，脚本会中止并提示登录方法
   - ⚠️ 若确需跳过校验，可使用 `--no-verify-clients`（**仅限测试环境**）
-  - 🔒 **版本对齐（v0.2.6）**：`-verify-clients` 要求 derper 与 tailscaled 由同一 Git revision 构建。未显式指定 `--derper-version` 时，脚本会自动把 derper 对齐到本机 tailscale 版本（`derper@v<TS版本>`）；可用 `--derper-version` 覆盖。
+  - 🔒 **版本对齐（v0.2.7）**：`-verify-clients` 要求 derper 与 tailscaled 由同一 Git revision 构建。未显式指定 `--derper-version` 时，脚本会自动把目标版本对齐到本机 tailscale 版本；**若已安装 derper 与目标版本不一致，会实际重新安装二进制**（无需额外 `--force`）。可用 `--derper-version` 覆盖。
   - 📝 检测逻辑：
     - 若检测到 `tailscale` CLI，通过 `tailscale ip` 判断是否已分配 Tailnet IP
     - 若未检测到 CLI，则仅依据 `tailscaled` 运行状态判断
@@ -161,7 +162,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 执行完成后脚本会（已做成幂等，已就绪则直接跳过；依赖“按需安装”，若都已具备则不会访问包仓库）：
 - 安装依赖（`git/curl/openssl/golang/netcat` 等）
 - 安装/构建 `derper`（使用 `GOTOOLCHAIN=auto` 自动获取匹配版本）
-- 生成“基于 IP 的自签证书”到 `/opt/derper/certs/`
+- 生成“基于 IP 的自签证书”到 `/opt/derper/certs/<公网IP>.crt` 与 `.key`（上游 derper manual 模式固定读取此命名；同时提供 `fullchain.pem`/`privkey.pem` 兼容链接）
 - 写入并启动 `systemd` 服务 `/etc/systemd/system/derper.service`
 - 打印端口放行提示与运行自检
 - 输出带 `CertName`（证书指纹）的 `derpMap` 片段（直接粘贴到 Tailscale ACL 即可）
@@ -267,6 +268,8 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 --user <username>         指定运行 derper 的用户（默认：当前登录用户）
                           可指定现有用户（如 nobody、www-data 等）
 --use-current-user        使用当前登录用户运行 derper（等价于 --user $USER）
+-V, --version             打印脚本版本并退出
+-h, --help                显示帮助并退出
 --check / --dry-run       仅进行状态与参数检查，不执行安装/写服务/放行等
 --repair                  仅修复/重写配置（systemd/证书等），不重装 derper
 --force                   强制全量重装（重装 derper、重签证书、重写服务）
@@ -281,7 +284,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 > 兼容性：脚本优先使用新版 `-a :<PORT>` 指定监听；若不支持则回退到旧参数 `-https-port <PORT>`。若当前 derper 不支持 `-stun-port`，脚本仅允许默认端口 3478；传入其他 STUN 端口会明确报错并中止。
 
-> 幂等说明：若检测到本机已存在“纯 IP 模式”的 derper，且 unit 与本次目标参数一致（IP、DERP/STUN 端口、运行用户、安全级别、客户端校验）、端口监听健康、证书匹配 IP 且未临期，默认跳过安装；否则按需修复。
+> 幂等说明：若检测到本机已存在“纯 IP 模式”的 derper，且 unit 与本次目标参数一致（IP、DERP/STUN 端口、运行用户、安全级别、客户端校验）、端口监听健康、证书为上游命名且匹配 IP、未临期、在线指纹一致，并且已安装 derper 版本与目标版本一致（非 `latest` 时），默认跳过安装；否则按需修复（含必要时重装 derper）。
 
 ---
 
@@ -340,10 +343,14 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 # 从日志获取（服务启动时会打印）
 journalctl -u derper --no-pager | grep sha256-raw | tail -1
 
-# 或直接计算文件指纹
+# 推荐：计算 derper 实际读取的证书指纹
+openssl x509 -in /opt/derper/certs/<你的公网IP>.crt -outform DER | sha256sum | awk '{print $1}'
+
+# 兼容链接（指向上述 .crt）
 openssl x509 -in /opt/derper/certs/fullchain.pem -outform DER | sha256sum | awk '{print $1}'
 ```
 
+> 自动重签会改变 `CertName`。请先更新 ACL 再重启服务，或接受短暂中断后粘贴新指纹。幂等修复在仅命名迁移时会尽量保留原证书，避免无谓指纹变化。
 ---
 
 ## 安全最佳实践
@@ -522,6 +529,8 @@ openssl s_client -connect <你的公网IP>:<DERP_PORT> -servername <你的公网
 补充：若已在本机上生成证书文件，也可以直接对文件求指纹（与“如何再次获取证书指纹”一致）：
 
 ```bash
+openssl x509 -in /opt/derper/certs/<你的公网IP>.crt -outform DER | sha256sum | awk '{print $1}'
+# 或兼容链接
 openssl x509 -in /opt/derper/certs/fullchain.pem -outform DER | sha256sum | awk '{print $1}'
 ```
 

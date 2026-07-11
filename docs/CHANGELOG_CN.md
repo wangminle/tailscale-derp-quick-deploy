@@ -1,5 +1,41 @@
 # 更新日志
 
+## [0.2.7] - 2026-07-11
+
+### 🔧 Bug 修复
+
+1. **证书命名与上游 derper manual 模式对齐**
+   - 自签证书改为生成 `<公网IP>.crt` / `<公网IP>.key`（与上游 `cmd/derper/cert.go` 一致），避免 derper 忽略脚本证书并另签一套。
+   - 保留 `fullchain.pem`/`privkey.pem`/`cert.pem`/`key.pem` 兼容符号链接；旧命名在幂等修复时就地迁移，尽量不改变 CertName。
+   - 健康检查与指纹计算优先使用上游命名；命名不兼容时视为不健康。
+
+2. **版本对齐真正重装二进制**
+   - 对齐目标版本后，通过 `go version -m`（或回退探测）读取已安装 derper 模块版本；不一致时重新 `go install`，无需额外 `--force`。
+   - `--derper-version` 显式指定时同样会在版本漂移时重装。
+
+3. **socket 权限处理去侵入化**
+   - 先创建运行用户，再判断是否已具备读写权限（含 world-writable）；已可访问则跳过改组/重启 tailscaled/drop-in。
+
+4. **systemd / 配置漂移 / 健康检查可靠性**
+   - `StartLimitBurst`/`StartLimitIntervalSec` 移至 `[Unit]`。
+   - paranoid 降级禁用 `MemoryDenyWriteExecute` 时更新注释标记；漂移检测区分完整/降级状态。
+   - 写入 unit 前备份，启动失败时尝试回滚。
+   - 端口归属核对 MainPID；TLS/健康探测优先本机回环，降低 NAT hairpin 误报。
+   - `--check`/`--health-check` 在参数校验失败时返回非 0。
+   - 运行时检查补充协议级诊断提示（`tailscale debug derp`/`netcheck`），并标明 `nc -zvu` 的局限。
+
+### 📚 文档
+
+- 收敛“生产级/企业级/全覆盖”表述，与测试/家用/小规模定位一致。
+- 证书路径、版本对齐、CertName 轮换与健康检查边界说明已同步。
+- 为脚本引入正式版本概念：`SCRIPT_VERSION`、仓库根目录 `VERSION`、`-V/--version`；REFERENCE/CHANGELOG 版本号统一为 0.2.7。
+
+### 🧪 测试
+
+- 回归测试扩展至 26 项，新增覆盖：上游证书命名、版本漂移重装、paranoid 降级匹配、StartLimit 分区、socket 已可访问跳过、健康检查命名要求、`--version` 与 VERSION 文件一致性。
+
+---
+
 ## [0.2.6] - 2026-06-15
 
 ### 🔧 Bug 修复
@@ -412,6 +448,6 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 **贡献者**：感谢架构师的专业建议
 
-**更新日期**：2026-06-15
+**更新日期**：2026-07-11
 
-**版本**：0.2.6
+**版本**：0.2.7

@@ -1,5 +1,41 @@
 # Changelog
 
+## [0.2.7] - 2026-07-11
+
+### 🔧 Bug Fixes
+
+1. **Certificate names match upstream derper manual mode**
+   - Self-signed certs are now written as `<public-ip>.crt` / `<public-ip>.key` (matching upstream `cmd/derper/cert.go`), so derper no longer ignores script certs and auto-mints another pair.
+   - Keeps `fullchain.pem`/`privkey.pem`/`cert.pem`/`key.pem` compatibility symlinks; legacy names are migrated in place during idempotent repair when possible to preserve CertName.
+   - Health checks and fingerprinting prefer upstream names; incompatible naming is treated as unhealthy.
+
+2. **Version alignment actually reinstalls the binary**
+   - After aligning the target version, the script reads the installed derper module version via `go version -m` (with fallbacks) and re-runs `go install` on mismatch—no extra `--force` required.
+   - Explicit `--derper-version` similarly triggers reinstall on drift.
+
+3. **Less invasive socket permission handling**
+   - Creates the run user first, then checks whether that user can already read/write the socket (including world-writable); skips group changes / tailscaled restarts / drop-ins when access already works.
+
+4. **systemd / config-drift / health-check reliability**
+   - Moves `StartLimitBurst`/`StartLimitIntervalSec` into `[Unit]`.
+   - When paranoid mode drops `MemoryDenyWriteExecute`, the unit comment is marked degraded; drift detection distinguishes full vs degraded.
+   - Backs up the unit before overwrite and attempts rollback on failed start.
+   - Port ownership checks MainPID; TLS/health probes prefer loopback to reduce NAT hairpin false failures.
+   - `--check`/`--health-check` return non-zero when parameter validation fails.
+   - Runtime checks add protocol-level diagnostics hints and document `nc -zvu` limitations.
+
+### 📚 Docs
+
+- Softened “production-grade / enterprise / full coverage” wording to match the test/home/small-scale positioning.
+- Certificate paths, version alignment, CertName rotation, and health-check boundaries updated.
+- Formalized script versioning: `SCRIPT_VERSION`, root `VERSION` file, and `-V/--version`; REFERENCE/CHANGELOG now consistently report 0.2.7.
+
+### 🧪 Tests
+
+- Regression suite expanded to 26 cases covering upstream cert names, version-drift reinstall, paranoid degraded matching, StartLimit section placement, world-writable socket skip, naming-aware health checks, and `--version`/`VERSION` consistency.
+
+---
+
 ## [0.2.6] - 2026-06-15
 
 ### 🔧 Bug Fixes
@@ -412,6 +448,6 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 **Contributors**: Thanks to architects for professional advice
 
-**Update Date**: 2026-06-15
+**Update Date**: 2026-07-11
 
-**Version**: 0.2.6
+**Version**: 0.2.7

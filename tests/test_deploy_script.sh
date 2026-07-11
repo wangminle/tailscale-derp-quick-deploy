@@ -246,7 +246,7 @@ test_cert_san_matches_literal_ip_only() {
 test_live_certificate_mismatch_fails_health_check() {
   DERPER_TEST_MODE=1 source "$SCRIPT"
   DERPER_RUNNING=1 PORT_TLS_OK=1 PORT_STUN_OK=1 PURE_IP_OK=1 DESIRED_CONFIG_OK=1
-  CERT_PRESENT=1 CERT_SAN_MATCH=1 CERT_EXPIRY_OK=1
+  CERT_PRESENT=1 CERT_NAMING_OK=1 CERT_SAN_MATCH=1 CERT_EXPIRY_OK=1
   cert_file_sha256_raw() { echo "disk"; }
   live_cert_sha256_raw() { echo "live"; }
   check_live_cert_status
@@ -339,6 +339,156 @@ test_verify_clients_aligns_derper_version() {
   ok "verify-clients aligns derper version with tailscale"
 }
 
+test_manual_cert_uses_upstream_filenames() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    command -v openssl >/dev/null 2>&1 || { echo "ok - certificate naming skipped (no openssl)"; return 0; }
+    local_tmp=$(mktemp -d)
+    trap 'rm -rf "$local_tmp"' EXIT
+    INSTALL_DIR="$local_tmp"
+    IP_ADDR="203.0.113.10"
+    CERT_DAYS="30"
+    generate_derper_config() { :; }
+    generate_selfsigned_cert >/dev/null
+    [[ -f "${INSTALL_DIR}/certs/203.0.113.10.crt" ]] || fail "missing upstream <ip>.crt"
+    [[ -f "${INSTALL_DIR}/certs/203.0.113.10.key" ]] || fail "missing upstream <ip>.key"
+    [[ -L "${INSTALL_DIR}/certs/fullchain.pem" ]] || fail "fullchain.pem should be a compatibility symlink"
+    check_cert_status
+    [[ $CERT_PRESENT -eq 1 && $CERT_NAMING_OK -eq 1 && $CERT_SAN_MATCH -eq 1 ]] ||
+      fail "generated upstream-named certificate should pass cert status checks"
+  )
+  ok "self-signed cert uses derper manual filenames"
+}
+
+test_derper_binary_needs_reinstall_on_version_mismatch() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local_tmp=$(mktemp -d)
+    trap 'rm -rf "$local_tmp"' EXIT
+    BIN_PATH="${local_tmp}/derper"
+    printf '#!/bin/sh\necho fake\n' >"$BIN_PATH"
+    chmod +x "$BIN_PATH"
+
+    DERPER_VERSION="latest"
+    if derper_binary_needs_install; then
+      fail "existing binary with latest target should not force reinstall"
+    fi
+
+    DERPER_VERSION="v1.80.0"
+    get_installed_derper_version() { echo "1.74.1"; }
+    if ! derper_binary_needs_install; then
+      fail "mismatched pinned version should require reinstall"
+    fi
+
+    get_installed_derper_version() { echo "1.80.0"; }
+    if derper_binary_needs_install; then
+      fail "matching pinned version should skip reinstall"
+    fi
+  )
+  ok "derper binary reinstall is driven by real version mismatch"
+}
+
+test_paranoid_degraded_unit_is_accepted() {
+  DERPER_TEST_MODE=1 source "$SCRIPT"
+  IP_ADDR="203.0.113.10" DERP_PORT="30399" STUN_PORT="3478" INSTALL_DIR="/opt/derper"
+  RUN_USER="derper" VERIFY_CLIENTS_MODE="off" SECURITY_LEVEL="paranoid"
+  derper_supports_socket_flag() { return 1; }
+  local full degraded
+  full=$'[Service]\nUser=derper\n# 安全加固（级别：paranoid）\nMemoryDenyWriteExecute=true\nExecStart=/usr/local/bin/derper -c /opt/derper/derper.json -hostname 203.0.113.10 -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun -stun-port 3478\n'
+  unit_matches_desired_config "$full" || fail "full paranoid unit should match"
+
+  degraded=$'[Service]\nUser=derper\n# 安全加固（级别：paranoid；已禁用 MemoryDenyWriteExecute）\nExecStart=/usr/local/bin/derper -c /opt/derper/derper.json -hostname 203.0.113.10 -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun -stun-port 3478\n'
+  unit_matches_desired_config "$degraded" || fail "explicitly degraded paranoid unit should match"
+
+  local fake_full
+  fake_full=$'[Service]\nUser=derper\n# 安全加固（级别：paranoid）\nExecStart=/usr/local/bin/derper -c /opt/derper/derper.json -hostname 203.0.113.10 -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun -stun-port 3478\n'
+  unit_matches_desired_config "$fake_full" && fail "paranoid comment without MemoryDenyWriteExecute should be drift"
+  ok "paranoid degraded marker is honored by config matching"
+}
+
+test_start_limit_lives_in_unit_section() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local_tmp=$(mktemp -d)
+    trap 'rm -rf "$local_tmp"' EXIT
+    INSTALL_DIR="${local_tmp}/install"
+    SERVICE_PATH="${local_tmp}/derper.service"
+    BIN_PATH="/usr/local/bin/derper"
+    RUN_USER="$(id -un)"
+    VERIFY_CLIENTS_MODE="off"
+    SECURITY_LEVEL="basic"
+    mkdir -p "$INSTALL_DIR"
+    derper_supports_stun_port() { return 0; }
+    derper_supports_listen_a() { return 0; }
+    setup_service_user() { return 0; }
+    systemctl() { return 0; }
+    write_systemd_service >/dev/null
+    awk '
+      /^\[Unit\]/ { in_unit=1; in_service=0; next }
+      /^\[Service\]/ { in_unit=0; in_service=1; next }
+      /^\[/ { in_unit=0; in_service=0; next }
+      /^StartLimitBurst=/ { if (!in_unit) exit 2; found=1 }
+      /^StartLimitIntervalSec=/ { if (!in_unit) exit 3; found2=1 }
+      END { if (!found || !found2) exit 4 }
+    ' "$SERVICE_PATH" || fail "StartLimit* must live under [Unit]"
+  )
+  ok "systemd StartLimit settings are under [Unit]"
+}
+
+test_socket_access_skips_when_world_writable() {
+  DERPER_TEST_MODE=1 source "$SCRIPT"
+  local_tmp=$(mktemp -d)
+  # shellcheck disable=SC2064
+  trap "rm -rf '$local_tmp'" RETURN
+  local sock="${local_tmp}/tailscaled.sock"
+  local py=""
+  if command -v python3 >/dev/null 2>&1; then
+    py=python3
+  elif command -v python >/dev/null 2>&1; then
+    py=python
+  else
+    ok "socket access skip test skipped (no python)"
+    return 0
+  fi
+  if ! "$py" -c "import socket,os;p=r'''${sock}''';
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);
+os.path.exists(p) and os.unlink(p);s.bind(p);os.chmod(p,0o666);s.close()" 2>/dev/null; then
+    ok "socket access skip test skipped (unix socket unavailable)"
+    return 0
+  fi
+  [[ -S "$sock" ]] || { ok "socket access skip test skipped (socket missing)"; return 0; }
+  user_can_access_socket "$(id -un)" "$sock" || fail "world-writable socket should be considered accessible"
+  ok "world-writable socket is treated as already accessible"
+}
+
+test_health_requires_upstream_cert_naming() {
+  DERPER_TEST_MODE=1 source "$SCRIPT"
+  DERPER_RUNNING=1 PORT_TLS_OK=1 PORT_STUN_OK=1 PURE_IP_OK=1 DESIRED_CONFIG_OK=1
+  CERT_PRESENT=1 CERT_NAMING_OK=0 CERT_SAN_MATCH=1 CERT_EXPIRY_OK=1
+  LIVE_CERT_CHECKED=0
+  health_is_ok && fail "health should fail when certificate naming is incompatible"
+  CERT_NAMING_OK=1
+  health_is_ok || fail "health should pass once naming is compatible"
+  ok "health check requires derper-compatible certificate names"
+}
+
+test_script_version_is_declared_and_consistent() {
+  DERPER_TEST_MODE=1 source "$SCRIPT"
+  [[ -n "${SCRIPT_VERSION:-}" ]] || fail "SCRIPT_VERSION must be declared"
+  [[ "${SCRIPT_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "SCRIPT_VERSION must be semver: ${SCRIPT_VERSION}"
+
+  local file_ver output
+  file_ver=$(tr -d ' \t\r\n' <"${ROOT_DIR}/VERSION")
+  [[ "$file_ver" == "$SCRIPT_VERSION" ]] ||
+    fail "VERSION file (${file_ver}) must match SCRIPT_VERSION (${SCRIPT_VERSION})"
+
+  output=$(bash "$SCRIPT" --version)
+  [[ "$output" == *" ${SCRIPT_VERSION} "* ]] || fail "--version should print SCRIPT_VERSION"
+  output=$(bash "$SCRIPT" -V)
+  [[ "$output" == *" ${SCRIPT_VERSION} "* ]] || fail "-V should print SCRIPT_VERSION"
+  ok "script version is declared and consistent with VERSION/--version"
+}
+
 test_no_crlf_and_syntax
 test_source_does_not_run_main
 test_source_survives_unset_user
@@ -353,6 +503,13 @@ test_unsupported_custom_stun_port_is_rejected
 test_empty_derper_config_is_migrated_for_auto_key_generation
 test_verify_clients_passes_socket_flag
 test_verify_clients_aligns_derper_version
+test_manual_cert_uses_upstream_filenames
+test_derper_binary_needs_reinstall_on_version_mismatch
+test_paranoid_degraded_unit_is_accepted
+test_start_limit_lives_in_unit_section
+test_socket_access_skips_when_world_writable
+test_health_requires_upstream_cert_naming
+test_script_version_is_declared_and_consistent
 test_insecure_acl_uses_requested_region_and_endpoint
 test_wizard_handles_eof_cleanly
 test_cert_san_matches_literal_ip_only

@@ -1,6 +1,7 @@
 # Tailscale DERP Quick Deploy Script
 
-> **Language / 语言**: [English](#english) | [中文](#中文)
+> **Language / 语言**: [English](#english) | [中文](#中文)  
+> **Version / 版本**: `0.2.7` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ---
 
@@ -17,7 +18,7 @@ This project provides a **fully automated Tailscale DERP relay service deploymen
 1. **Zero-Domain Deployment**: Build DERP relay with just a public IP, no domain purchase needed
 2. **Security-First**: Auto-generate IP-based self-signed certificates with certificate fingerprint (`CertName`) verification, eliminating the need for insecure `InsecureForTests` flag
 3. **Out-of-the-Box**: Complete deployment from dependency installation to service startup with a single command
-4. **Production-Grade**: Built-in security hardening, health checks, and Prometheus metrics export
+4. **Hardened Operations**: Built-in security hardening, health checks, and Prometheus metrics export (best for test/home/small-scale; validate thoroughly before critical Tailnets)
 
 #### Use Cases
 
@@ -43,12 +44,14 @@ This project provides a **fully automated Tailscale DERP relay service deploymen
 - 🔒 **Client Verification**: Enables `-verify-clients` by default, rejecting unauthorized access
 - 🔒 **Privilege Minimization**: Grants `CAP_NET_BIND_SERVICE` capability, no root execution required
 
-#### 3. Enterprise Operations
+#### 3. Operations Tooling
 
 - 📊 **Health Checks**: Built-in `--health-check` outputs service status summary
 - 📊 **Prometheus Integration**: Exports textfile format metrics for seamless monitoring integration
 - 🔧 **Multi-Mode Operation**: check/repair/force modes for different scenarios
 - 🗑️ **Scoped Uninstall**: `--uninstall` supports three-level cleanup for service, install directory, binary, and script-created config
+
+> Note: Health checks cover systemd status, listeners, TLS handshake and certificate fingerprint consistency. They are **not** a full DERP/STUN/Tailnet connectivity proof; use `tailscale debug derp` / `netcheck` / `derpprobe` for that.
 
 #### 4. Cross-Environment Compatibility
 
@@ -435,7 +438,7 @@ fi
 | **Personal Learning** | `--use-current-user --security-level basic` | 5-min deployment, < 5MB resource usage |
 | **Home Network** | `--derp-port 443 --auto-ufw` | High traversal rate, auto-acceleration for family devices |
 | **Small Teams** | `--dedicated-user --health-check` | Stable operation with monitoring alerts |
-| **Production** | `--security-level paranoid --metrics-textfile` | Enterprise-grade security, full observability |
+| **Production pilot** | `--security-level paranoid --metrics-textfile` | Stricter systemd hardening + observability (validate compatibility first) |
 
 ---
 
@@ -463,12 +466,12 @@ fi
 
 This project compresses the originally manual **20+ steps DERP deployment process** into **a single command** through an intelligent **2100+ line script**, while ensuring:
 
-- ✅ **Security**: Enterprise-grade systemd hardening + least-privilege execution
+- ✅ **Security**: Tiered systemd hardening + least-privilege execution
 - ✅ **Stability**: Idempotent design + automatic fault recovery
 - ✅ **Observability**: Health checks + Prometheus metrics
-- ✅ **Maintainability**: Full coverage of repair/force/uninstall modes
+- ✅ **Maintainability**: repair/force/uninstall modes covered
 
-Whether you're an **individual user quickly setting up a testing environment** or an **enterprise team building a production relay network**, you can complete deployment and put it into use within 5 minutes.
+Whether you're an **individual user quickly setting up a testing environment** or a **small team building a private relay**, you can deploy quickly. For critical Tailnets, validate certificates, version alignment, and real client connectivity first.
 
 ---
 
@@ -493,7 +496,7 @@ Whether you're an **individual user quickly setting up a testing environment** o
 1. **零域名部署**：无需购买域名，仅凭公网 IP 即可搭建 DERP 中继
 2. **安全优先**：自动生成基于 IP 的自签证书，使用证书指纹（`CertName`）验证，无需不安全的 `InsecureForTests` 标记
 3. **开箱即用**：一条命令完成从依赖安装到服务启动的全流程
-4. **生产级质量**：内置安全加固、健康检查、监控指标导出等企业级特性
+4. **运维加固**：内置安全加固、健康检查、监控指标导出（适合测试/家用/小规模；关键 Tailnet 请先完成集成验证）
 
 #### 适用场景
 
@@ -519,12 +522,14 @@ Whether you're an **individual user quickly setting up a testing environment** o
 - 🔒 **客户端校验**：默认启用 `-verify-clients`，拒绝未授权访问
 - 🔒 **权限最小化**：通过 `CAP_NET_BIND_SERVICE` 能力授予，无需 root 运行
 
-#### 3. 企业级运维
+#### 3. 运维工具
 
 - 📊 **健康检查**：内置 `--health-check` 输出服务状态摘要
 - 📊 **Prometheus 集成**：导出 textfile 格式指标，无缝对接监控体系
 - 🔧 **多模式运行**：check/repair/force 三种模式满足不同场景
 - 🗑️ **分级卸载**：`--uninstall` 支持服务、安装目录、二进制和脚本生成配置的三级清理
+
+> 说明：健康检查覆盖服务状态、端口监听、TLS 握手与证书指纹一致性，**不等于**完整 DERP/STUN/Tailnet 连通性证明；请使用 `tailscale debug derp` / `netcheck` / `derpprobe` 做协议级验证。
 
 #### 4. 跨环境兼容
 
@@ -911,7 +916,7 @@ fi
 | **个人学习** | `--use-current-user --security-level basic` | 5分钟部署，资源占用 < 5MB |
 | **家庭网络** | `--derp-port 443 --auto-ufw` | 穿透率高，家人设备自动加速 |
 | **小团队** | `--dedicated-user --health-check` | 稳定运行，配合监控告警 |
-| **生产环境** | `--security-level paranoid --metrics-textfile` | 企业级安全，全链路可观测 |
+| **加固试点** | `--security-level paranoid --metrics-textfile` | 更严 systemd 加固 + 可观测（需先验证兼容性） |
 
 ---
 
@@ -939,12 +944,12 @@ fi
 
 这个项目通过一个 **2100+ 行的智能脚本**，将原本需要手动执行 20+ 步骤的 DERP 部署流程，压缩为**一条命令**，同时保证：
 
-- ✅ **安全性**：企业级 systemd 加固 + 最小权限运行
+- ✅ **安全性**：分级 systemd 加固 + 最小权限运行
 - ✅ **稳定性**：幂等设计 + 自动故障恢复
 - ✅ **可观测**：健康检查 + Prometheus 指标
-- ✅ **易维护**：repair/force/uninstall 模式全覆盖
+- ✅ **易维护**：repair/force/uninstall 模式齐全
 
-无论你是**个人用户快速搭建测试环境**，还是**企业团队构建生产级中继网络**，都能在 5 分钟内完成部署并投入使用。
+无论你是**个人用户快速搭建测试环境**，还是**小团队构建自建中继**，都能较快完成部署。关键 Tailnet 请先完成证书、版本对齐与真实客户端连通性验证。
 
 ---
 

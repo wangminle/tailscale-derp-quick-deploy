@@ -3,7 +3,8 @@
 > This is the detailed English reference. For the simplified Chinese quickstart now used as the main README, go to `../README.md`. For the detailed Chinese reference, see `REFERENCE_CN.md` in this folder.
 
 > **Script File**: `deploy_derper_ip_selfsigned.sh`  
-> **Current Version**: 0.2.6 (2026-06-15)
+> **Current Version**: 0.2.7 (2026-07-11)  
+> **Show version**: `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
 ![systemd](https://img.shields.io/badge/Service-systemd-orange?logo=systemd&logoColor=white)
@@ -62,7 +63,7 @@ Note: This mode is only for local functional verification and cannot serve as a 
 - **`-verify-clients` enabled by default**: Script checks if local `tailscaled` is running and logged in before installation
   - ✅ If not ready, script will abort and show login instructions
   - ⚠️ To skip verification, use `--no-verify-clients` (**testing only**)
-  - 🔒 **Version alignment (v0.2.6)**: `-verify-clients` requires derper and tailscaled to be built from the same git revision. When `--derper-version` is not specified, the script auto-aligns derper to the local tailscale version (`derper@v<TS-version>`); override with `--derper-version`.
+  - 🔒 **Version alignment (v0.2.7)**: `-verify-clients` requires derper and tailscaled to be built from the same git revision. When `--derper-version` is not specified, the script auto-aligns the *target* version to the local tailscale version; **if an installed derper binary does not match that target, it is reinstalled** (no extra `--force` required). Override with `--derper-version`.
   - 📝 Detection logic:
     - If `tailscale` CLI detected, checks via `tailscale ip` whether Tailnet IP is assigned
     - If CLI not detected, only checks `tailscaled` running status
@@ -126,7 +127,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 After completion, the script will (made idempotent, will skip if already ready; dependencies installed "on-demand", won't access package repositories if all present):
 - Install dependencies (`git/curl/openssl/golang/netcat` etc.)
 - Install/build `derper` (using `GOTOOLCHAIN=auto` to auto-fetch matching version)
-- Generate "IP-based self-signed certificate" to `/opt/derper/certs/`
+- Generate "IP-based self-signed certificate" as `/opt/derper/certs/<public-ip>.crt` and `.key` (upstream derper manual mode reads these names; `fullchain.pem`/`privkey.pem` compatibility symlinks are also created)
 - Write and start `systemd` service `/etc/systemd/system/derper.service`
 - Print port opening instructions and run self-check
 - Output `derpMap` snippet with `CertName` (certificate fingerprint) - directly paste to Tailscale ACL
@@ -232,6 +233,8 @@ Common paths:
 --user <username>         Specify which user runs derper (default: current login user)
                           Can specify existing users (e.g., nobody, www-data)
 --use-current-user        Use current login user to run derper (equivalent to --user $USER; default)
+-V, --version             Print script version and exit
+-h, --help                Show help and exit
 --check / --dry-run       Only perform status and parameter checks, no install/write service/open ports
 --repair                  Only fix/rewrite config (systemd/certificates etc.), don't reinstall derper
 --force                   Force full reinstall (reinstall derper, re-sign certs, rewrite service)
@@ -246,7 +249,7 @@ Common paths:
 
 > Compatibility: Script prioritizes new `-a :<PORT>` for listening; falls back to old parameter `-https-port <PORT>` if unsupported. If the installed derper does not support `-stun-port`, the script only permits the default port 3478; any other STUN port causes an explicit error and abort.
 
-> Idempotency note: The script skips installation only when the existing pure-IP derper unit matches the requested parameters (IP, DERP/STUN ports, run user, security level, client verification), ports are healthy, and the certificate matches the IP and is not expiring soon; otherwise it repairs on demand.
+> Idempotency note: The script skips installation only when the existing pure-IP derper unit matches the requested parameters (IP, DERP/STUN ports, run user, security level, client verification), ports are healthy, the certificate uses upstream `<ip>.crt/.key` naming, matches the IP, is not expiring soon, live fingerprint matches disk, and (when the target is not `latest`) the installed derper version matches the target; otherwise it repairs on demand (including reinstalling derper when needed).
 
 ---
 
@@ -305,9 +308,14 @@ Paste this snippet to Tailscale admin console → Access Controls (ACL) and save
 # Get from logs (printed when service starts)
 journalctl -u derper --no-pager | grep sha256-raw | tail -1
 
-# Or directly calculate from file fingerprint
+# Preferred: fingerprint of the cert derper actually loads
+openssl x509 -in /opt/derper/certs/<your-public-ip>.crt -outform DER | sha256sum | awk '{print $1}'
+
+# Compatibility symlink (points at the .crt above)
 openssl x509 -in /opt/derper/certs/fullchain.pem -outform DER | sha256sum | awk '{print $1}'
 ```
+
+> Auto re-signing changes `CertName`. Update the ACL before restarting, or accept a brief outage and paste the new fingerprint. Idempotent repair migrates legacy filenames in place when possible to avoid unnecessary fingerprint churn.
 
 ---
 
@@ -489,6 +497,8 @@ openssl s_client -connect <your-public-ip>:<DERP_PORT> -servername <your-public-
 Additional: If certificate file generated locally, can also directly calculate from file (same as "How to Retrieve Certificate Fingerprint Again"):
 
 ```bash
+openssl x509 -in /opt/derper/certs/<your-public-ip>.crt -outform DER | sha256sum | awk '{print $1}'
+# or compatibility symlink
 openssl x509 -in /opt/derper/certs/fullchain.pem -outform DER | sha256sum | awk '{print $1}'
 ```
 
