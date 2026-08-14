@@ -1,5 +1,93 @@
 # 更新日志
 
+## [0.2.9] - 2026-08-14
+
+### 🔧 Bug 修复
+
+1. **`ensure_go` 接受过旧的发行版 Go**
+   - Ubuntu 22.04 / Debian 12 的 apt `golang-go` 常为 1.18，不支持 `GOTOOLCHAIN=auto`，构建会失败。现在要求工具链 `>= 1.21`，过旧则安装官方 Go 1.22.6。
+
+2. **`get_installed_derper_version` 误抓 Go 工具链版本**
+   - 第三级裸 semver 回退会先匹配二进制里的 `go1.22.6`，把工具链版本当成 derper 版本，导致该重装时误判已对齐。已删除该回退。
+
+3. **旧部署缺 STUN 时 `--force`/`--repair` 被自家端口卡死**
+   - 端口预检改为按端口判断是否由 derper 占用；仅有 TLS、没有 STUN 的旧实例不再把自身 DERP 端口当成冲突。他人占用的 STUN 仍会拒绝。
+
+4. **`--repair` 证书重签未复用迁移逻辑**
+   - 仅命名不兼容（`fullchain.pem` → `<IP>.crt`）时，`--repair` 与默认路径一样先迁移、保留指纹，而不是无谓重签。
+
+5. **drop-in 重启 `tailscaled.socket` 缺少 SSH 保护**
+   - 与重启 `tailscaled` 一致：检测到当前 SSH 走 Tailscale（`100.x` / `fd7a:115c:a1e0:`）时，非交互模式跳过 socket 重启并提示稍后在非 Tailscale 会话执行。
+
+6. **向导 `exec` 泄漏临时目录**
+   - `exec` 替换进程时 EXIT trap 不会运行；执行前先 `release_tmpdir`。
+
+7. **健康检查每次外网探测 IP**
+   - `--health-check`（cron）不再打外网 IP API，优先从已部署 unit 的 `-hostname` 读取；已指定 `--ip` 时也不会再探测。
+
+8. **向导产物 `derper_deploy_cmd.sh` 未忽略**
+   - 已加入 `.gitignore`。
+
+- 回归测试扩展至 46 项。
+
+## [0.2.8] - 2026-08-14
+
+### 🔒 安全修复
+
+1. **证书生成符号链接覆盖风险（P1）**
+   - 证书目录与 `<IP>.crt`/`<IP>.key` 保持 root 所有，服务用户仅通过组权限只读；节点私钥状态（`derper.json`）仍位于服务用户可写的安装目录。
+   - 重签/迁移前先收紧证书目录，写入前拒绝符号链接路径，全部通过同目录随机临时文件 + `mv` 原子替换（`mv` 不沿符号链接写入）；`openssl-derper.cnf` 临时配置不再落入安装目录。
+   - `setup_service_user` 每次 `chown -R` 后重新收回证书目录所有权，避免服务账户重获写权限。
+
+2. **不再回退到 `InsecureForTests`（P1）**
+   - 指纹获取失败时不再输出 `InsecureForTests: true` 的 derpMap，而是部署失败并要求排查 TLS；上游明确该字段仅用于单元测试。
+
+3. **公网 IP 校验补全**
+   - 新增完整 IPv4 分类（私有/CGNAT 100.64/10、回环、链路本地、文档 TEST-NET、组播、保留段等）；部署模式默认拒绝非全局可路由地址，内网测试需显式 `--allow-non-global-ip`。
+
+4. **RegionID 范围收紧**
+   - 上限收紧到 JavaScript 安全整数（2^53-1）；900-999 之外给出警告（上游约定保留给用户自建区域）。
+
+### 🔧 Bug 修复
+
+5. **derpMap 缺少 STUNPort（P1）**
+   - CertName ACL 片段补充输出 `STUNPort`，自定义 `--stun-port` 现在真正生效。
+
+6. **服务启动验证与完整回滚（P1）**
+   - 启动/重启后强制验证：active 状态、TLS/STUN 端口监听、TLS 握手成功、进程存活；失败时回滚旧 unit 并重新启动旧服务再验证，而不是只恢复文件。
+
+7. **--repair 描述与行为一致**
+   - 帮助与文档明确：`--repair` 默认不重装 derper，但已部署二进制与对齐目标版本不一致时会重装。
+
+8. **verify-clients 同源对齐升级为 Git revision**
+   - 优先读取 `tailscale version` 的 `tailscale commit`，将 derper 对齐到同一 commit；取不到时退化为版本标签并给出警告。按 commit 对齐时，已安装伪版本包含该 commit 即视为同源。
+
+9. **参数组合互斥校验**
+   - `--purge/--purge-all` 需配合 `--uninstall`、`--metrics-textfile` 需配合 `--health-check`、`--force`/`--repair`/`--uninstall`/`--check` 互斥组合直接报错，不再静默取分支。
+
+10. **Prometheus 指标补全**
+    - 新增 `derper_healthy`（总体健康）与 `derper_cert_live_match`（在线证书一致性），证书不一致时不再出现“derper_up 1 但实际不健康”的盲区。
+
+11. **极简环境依赖补全**
+    - 依赖检查新增 `tar`（Go 兜底安装需要）。
+
+### 📚 文档
+
+- README 补充上游自建 DERP 限制：不支持部分跨 Tailnet/节点分享场景、不应放在普通 HTTP 反向代理或全局负载均衡后、生产建议静态 IPv4+IPv6、应使用 `derpprobe` 做协议级监控。
+
+### 🛡️ 主机与 Tailnet 暴露面审计（公网中继风险主要在主机本身）
+
+- 部署/检查/健康检查时新增**暴露面检查**：列出除 DERP 端口外面向非回环地址的 TCP 监听（含 0.0.0.0:22 的 SSH 提示），建议单机单用途。
+- 新增**自动安全更新检测**（unattended-upgrades / dnf-automatic），未启用时给出告警与开启指引。
+- 防火墙提示新增主机加固建议：云安全组入方向只放行 DERP TLS + STUN 两个端口、SSH 优先走 Tailscale 或限源、出方向不要收紧（tailscaled 需连控制面/官方中继探测）、关注 `-verify-clients` 拒绝日志。
+- 部署完成输出新增**服务器节点 ACL 约束建议**：给节点打 `tag:derper-server` 并在 ACL 中最小授权，做到“中继被攻破 ≠ 内网失守”。
+
+### 🧪 测试
+
+- 回归测试扩展至 36 项，新增覆盖：STUNPort ACL 输出、指纹缺失安全失败、非公网 IP 拒绝、RegionID 安全整数范围、参数组合校验、证书符号链接拒绝、commit 对齐与伪版本匹配、新 Prometheus 指标、暴露面检测、自动更新检测、服务器节点 ACL 建议。
+
+---
+
 ## [0.2.7] - 2026-07-11
 
 ### 🔧 Bug 修复
@@ -448,6 +536,6 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 **贡献者**：感谢架构师的专业建议
 
-**更新日期**：2026-07-11
+**更新日期**：2026-08-14
 
-**版本**：0.2.7
+**版本**：0.2.9

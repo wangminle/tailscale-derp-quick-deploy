@@ -1,5 +1,93 @@
 # Changelog
 
+## [0.2.9] - 2026-08-14
+
+### 🔧 Bug Fixes
+
+1. **`ensure_go` accepted distro Go that is too old**
+   - Ubuntu 22.04 / Debian 12 apt `golang-go` is often 1.18, which cannot use `GOTOOLCHAIN=auto`. The script now requires Go `>= 1.21` and installs the official toolchain otherwise.
+
+2. **`get_installed_derper_version` could pick up the Go toolchain version**
+   - The third-level bare semver fallback matched `go1.22.6` inside the binary and treated it as the derper module version. That fallback is removed.
+
+3. **`--force`/`--repair` deadlocked on the service's own port when STUN was missing**
+   - Port preflight now decides ownership per port. An old derper that only listens on TLS is no longer treated as a foreign occupant of its own DERP port. A STUN port held by another process is still a conflict.
+
+4. **`--repair` re-signed certs instead of reusing name migration**
+   - When only the filename is legacy (`fullchain.pem` → `<IP>.crt`), `--repair` now migrates and keeps the fingerprint, same as the default idempotent path.
+
+5. **Drop-in restart of `tailscaled.socket` lacked SSH protection**
+   - Same guard as restarting `tailscaled`: if the current SSH session is over Tailscale (`100.x` / `fd7a:115c:a1e0:`), non-interactive mode skips the socket restart and tells the operator to run it from a non-Tailscale session.
+
+6. **Wizard `exec` leaked the temp directory**
+   - `exec` replaces the process so the EXIT trap never runs; the wizard now calls `release_tmpdir` first.
+
+7. **Health checks probed public IP on the internet every time**
+   - `--health-check` (cron) no longer hits external IP APIs; it prefers `-hostname` from the deployed unit, and skips probing when `--ip` is already set.
+
+8. **Wizard artifact `derper_deploy_cmd.sh` was untracked**
+   - Added to `.gitignore`.
+
+- Regression suite expanded to 46 cases.
+
+## [0.2.8] - 2026-08-14
+
+### 🔒 Security Fixes
+
+1. **Symlink overwrite risk in certificate generation (P1)**
+   - The certs directory and `<IP>.crt`/`<IP>.key` stay root-owned; the service user gets group read-only access. Node key state (`derper.json`) remains in the service-writable install directory.
+   - The certs dir is tightened before re-sign/migration; symlinked paths are refused; all writes go through random temp files in the same directory plus atomic `mv` (which replaces a symlink itself rather than following it). The `openssl-derper.cnf` fallback no longer lands in the install directory.
+   - `setup_service_user` re-asserts root ownership of the certs dir after every `chown -R`.
+
+2. **No more `InsecureForTests` fallback (P1)**
+   - When the fingerprint cannot be obtained, the script no longer prints an `InsecureForTests: true` derpMap; it fails the deployment and asks to debug TLS. Upstream says that field is for unit tests only.
+
+3. **Complete public-IP classification**
+   - New IPv4 classifier covers private, CGNAT 100.64.0.0/10, loopback, link-local, TEST-NET documentation ranges, multicast, and reserved ranges. Deployment mode rejects non-globally-routable addresses; intranet testing requires explicit `--allow-non-global-ip`.
+
+4. **RegionID bounded to JS safe integers**
+   - Upper bound is now 2^53-1; values outside 900-999 (the upstream user-reserved range) get a warning.
+
+### 🔧 Bug Fixes
+
+5. **derpMap now includes STUNPort (P1)**
+   - The CertName ACL snippet prints `STUNPort`, making custom `--stun-port` actually usable.
+
+6. **Startup verification and complete rollback (P1)**
+   - After start/restart the script verifies active state, TLS/STUN listeners, a successful TLS handshake, and process liveness. On failure it restores the backed-up unit, restarts the old service, and re-verifies it — not just restores the file.
+
+7. **`--repair` docs match behavior**
+   - Help/docs now state that `--repair` normally skips derper reinstall, except when the installed binary drifts from the aligned target version.
+
+8. **verify-clients alignment now uses the actual Git revision**
+   - Prefers the `tailscale commit` from `tailscale version` and aligns derper to that commit; falls back to a semver tag with a warning otherwise. Installed pseudo-versions containing the target commit count as aligned.
+
+9. **Argument combination validation**
+   - `--purge/--purge-all` require `--uninstall`, `--metrics-textfile` requires `--health-check`, and `--force`/`--repair`/`--uninstall`/`--check` conflicts are hard errors instead of silently picking a branch.
+
+10. **Prometheus metrics completed**
+    - Added `derper_healthy` (overall health) and `derper_cert_live_match` (live/disk certificate consistency), so cert mismatches are no longer invisible while `derper_up` still reads 1.
+
+11. **Minimal-environment dependency**
+    - Dependency check now ensures `tar` (needed by the Go tarball fallback).
+
+### 📚 Docs
+
+- README adds upstream self-hosted DERP limitations: no support for some cross-Tailnet/shared-node scenarios, don't place behind generic HTTP reverse proxies or global load balancers, prefer static IPv4+IPv6 in production, and use `derpprobe` for protocol-level monitoring.
+
+### 🛡️ Host & Tailnet Attack-Surface Auditing (public-relay risk lives mostly on the host itself)
+
+- Deploy/check/health-check now run an **attack-surface check**: lists non-loopback TCP listeners other than the DERP port (with a specific hint for 0.0.0.0:22 SSH), recommending single-purpose hosts.
+- New **automatic security updates detection** (unattended-upgrades / dnf-automatic) with warning and enablement guidance.
+- Firewall tips add host-hardening advice: security group inbound only for DERP TLS + STUN, SSH preferably via Tailscale or source-restricted, don't restrict egress (tailscaled needs the control plane and official relay probes), and watch `-verify-clients` rejection logs.
+- Deployment output now includes **server-node ACL restriction advice**: tag the node `tag:derper-server` and grant minimal access so "relay compromise ≠ tailnet compromise".
+
+### 🧪 Tests
+
+- Regression suite expanded to 36 cases (now exercising real `tailscale version` output parsing for commit alignment): STUNPort ACL output, safe failure on missing fingerprint, non-global IP rejection, RegionID safe-integer range, argument-combination validation, cert symlink refusal, commit alignment / pseudo-version matching, the new Prometheus metrics, attack-surface detection, auto-updates detection, and server-node ACL advice.
+
+---
+
 ## [0.2.7] - 2026-07-11
 
 ### 🔧 Bug Fixes
@@ -448,6 +536,6 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 **Contributors**: Thanks to architects for professional advice
 
-**Update Date**: 2026-07-11
+**Update Date**: 2026-08-14
 
-**Version**: 0.2.7
+**Version**: 0.2.9

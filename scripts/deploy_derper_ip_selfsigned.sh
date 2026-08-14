@@ -9,8 +9,8 @@
 set -euo pipefail
 
 # 脚本自身版本（与 docs/CHANGELOG_*.md、仓库根目录 VERSION 保持同步）
-SCRIPT_VERSION="0.2.7"
-SCRIPT_VERSION_DATE="2026-07-11"
+SCRIPT_VERSION="0.2.9"
+SCRIPT_VERSION_DATE="2026-08-14"
 
 # 默认端口
 DERP_PORT="30399"        # DERP TLS 端口
@@ -29,6 +29,8 @@ GOSUMDB_ARG=""                 # 例：sum.golang.google.cn
 GOTOOLCHAIN_ARG="auto"         # auto|local（默认 auto 以满足 >=1.25）
 
 # Go 版本配置（用于 ensure_go 自动安装）
+# GOTOOLCHAIN=auto 需要 Go >= 1.21；发行版 apt 包（如 Ubuntu 22.04 的 1.18）不够。
+MIN_GO_VERSION="1.21"
 GO_VERSION="1.22.6"
 GO_SHA256_AMD64="999805bed7d9039ec3da1a53bfbcafc13e367da52aa823cb60b68ba22d44c616"
 GO_SHA256_ARM64="c15fa895341b8eaf7f219fada25c36a610eb042985dc1a912410c1c90098eaf2"
@@ -71,6 +73,7 @@ DRY_RUN=0                # 只做检查，不执行安装/写入
 FORCE=0                  # 强制全量重装
 REPAIR=0                 # 仅修复配置（不重装 derper）
 CHECK_ONLY=0             # --check 别名（等价于 --dry-run）
+ALLOW_NON_GLOBAL_IP=0    # 是否放行私有/保留/文档等非全局可路由 IP（仅内网测试）
 DESIRED_CONFIG_OK=0      # 当前 systemd unit 是否与本次目标参数一致
 DERPER_VERIFY_CLIENTS_EFFECTIVE=0 # 当前已部署 unit 是否启用了 -verify-clients
 CURRENT_DERPER_OWNS_PORTS=0       # 当前监听端口是否来自已运行的 derper 服务
@@ -96,6 +99,7 @@ usage() {
                [--no-verify-clients | --force-verify-clients]
                [--region-id 900] [--region-code my-derp] [--region-name "My IP DERP"]
                [--user <username> | --use-current-user]
+               [--allow-non-global-ip]
                [--check | --dry-run] [--repair] [--force]
                [--health-check [--metrics-textfile 路径]]
                [--uninstall [--purge | --purge-all]]
@@ -105,8 +109,10 @@ usage() {
   -V, --version           打印脚本版本并退出。
   -h, --help              显示本帮助并退出。
   --ip                    服务器公网 IPv4（推荐显式指定），缺省自动探测。
+                          正式部署必须为全局可路由的公网地址；
+                          内网/保留/文档地址默认拒绝，测试需加 --allow-non-global-ip。
   --derp-port             DERP TLS 端口，默认 30399/TCP。
-  --stun-port             STUN 端口，默认 3478/UDP。
+  --stun-port             STUN 端口，默认 3478/UDP（同时写入 derpMap 的 STUNPort）。
   --cert-days             自签临时证书有效期（天），默认 365。
   --auto-ufw              若检测到 UFW，自动放行端口规则。
   --goproxy URL           设置 GOPROXY，例如 https://goproxy.cn,direct（默认继承环境）。
@@ -121,20 +127,25 @@ usage() {
                           可指定现有用户（如 nobody、www-data 等）。
   --use-current-user      使用当前登录用户运行 derper（等价于 --user \$USER，默认行为）。
   --dedicated-user        强制创建专用 derper 系统账户（生产环境推荐）。
+  --allow-non-global-ip   允许使用私有/保留/文档/组播等非全局可路由 IP（仅内网测试）。
   --security-level LEVEL  安全加固级别：basic|standard|paranoid（默认 standard）。
   --relax-socket-perms    允许临时放宽 tailscaled socket 权限到 0666（不推荐，仅紧急情况）。
   --yes, --non-interactive 非交互模式，自动确认所有选择（适合 CI/自动化脚本）。
   --check, --dry-run      仅进行状态与参数检查，不执行安装/写服务/放行端口等操作。
-  --repair                仅修复/重写配置（systemd/证书等），不中断可用的依赖；不重装 derper。
+  --repair                仅修复/重写配置（systemd/证书等），不中断可用的依赖；
+                          默认不重装 derper，但若已部署二进制与目标版本不一致，
+                          会重新安装以对齐（如 -verify-clients 的版本对齐）。
   --force                 强制全量重装（重新安装 derper、重签证书、重写服务）。
-  --derper-version VER    指定 derper 版本（默认 latest），例如 v1.74.1 以确保可复现构建。
+  --derper-version VER    指定 derper 版本（默认 latest），例如 v1.74.1 以确保可复现构建；
+                          也接受 Git commit（与 tailscaled 同源对齐时使用）。
 
   --health-check          输出健康检查摘要（适合 cron 周期探测；不更改系统）。
   --metrics-textfile P    将健康检查结果以 Prometheus 文本格式写入到文件 P。
+                          必须与 --health-check 一起使用；
                           建议结合 node_exporter 的 textfile collector 使用。
   --uninstall             停止并卸载 derper systemd 服务（保留二进制与证书）。
-  --purge                 与 --uninstall 配合：额外删除 ${INSTALL_DIR}（证书等）。
-  --purge-all             与 --uninstall 配合：在 --purge 基础上，同时删除 ${BIN_PATH}、
+  --purge                 必须与 --uninstall 一起使用：额外删除 ${INSTALL_DIR}（证书等）。
+  --purge-all             必须与 --uninstall 一起使用：在 --purge 基础上，同时删除 ${BIN_PATH}、
                           /etc/derper/derper.env 和脚本创建的 tailscaled socket drop-in。
                           防火墙规则和用户/组账户需手动确认，不会自动删除。
 
@@ -350,6 +361,9 @@ parse_args() {
         CREATE_DEDICATED_USER=0
         RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}"
         shift 1;;
+      --allow-non-global-ip)
+        ALLOW_NON_GLOBAL_IP=1
+        shift 1;;
       --dedicated-user)
         CREATE_DEDICATED_USER=1
         USE_CURRENT_USER=0
@@ -405,6 +419,38 @@ parse_args() {
         echo "未知参数：$1" >&2; usage; exit 1;;
     esac
   done
+}
+
+# 参数组合互斥/依赖校验：避免“静默取一个分支”或“选项被忽略”的误用。
+validate_arg_combos() {
+  local err=0
+  if [[ "${PURGE}" -eq 1 || "${PURGE_ALL}" -eq 1 ]]; then
+    if [[ "${UNINSTALL}" -ne 1 ]]; then
+      echo "[错误] --purge/--purge-all 必须与 --uninstall 一起使用，单独使用不会执行清理。" >&2
+      err=1
+    fi
+  fi
+  if [[ -n "${METRICS_TEXTFILE}" && "${HEALTH_CHECK}" -ne 1 ]]; then
+    echo "[错误] --metrics-textfile 必须与 --health-check 一起使用（指标由健康检查生成）。" >&2
+    err=1
+  fi
+  if [[ "${FORCE}" -eq 1 && "${REPAIR}" -eq 1 ]]; then
+    echo "[错误] --force 与 --repair 互斥，请只选择其中一个。" >&2
+    err=1
+  fi
+  if [[ "${UNINSTALL}" -eq 1 ]]; then
+    if [[ "${FORCE}" -eq 1 || "${REPAIR}" -eq 1 || "${DRY_RUN}" -eq 1 ]]; then
+      echo "[错误] --uninstall 不能与 --force/--repair/--check/--dry-run 一起使用。" >&2
+      err=1
+    fi
+  fi
+  if [[ "${DRY_RUN}" -eq 1 ]]; then
+    if [[ "${FORCE}" -eq 1 || "${REPAIR}" -eq 1 ]]; then
+      echo "[错误] --check/--dry-run 不能与 --force/--repair 一起使用。" >&2
+      err=1
+    fi
+  fi
+  [[ "$err" -eq 0 ]]
 }
 
 # 在任何安装/构建之前进行的前置检查：
@@ -559,11 +605,7 @@ get_installed_derper_version() {
       | grep -oE 'tailscale\.com(/cmd/derper)?[[:space:]]+v?[0-9]+\.[0-9]+\.[0-9]+' \
       | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
   fi
-  if [[ -z "$ver" ]]; then
-    ver=$(strings "${BIN_PATH}" 2>/dev/null \
-      | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9a-zA-Z.]+)?' \
-      | head -n1 || true)
-  fi
+  # 不再用裸 semver 回退：Go 工具链版本（go1.22.6）会先被匹配，导致误判已对齐。
   normalize_version_tag "$ver"
 }
 
@@ -583,6 +625,11 @@ derper_binary_needs_install() {
     return 0
   fi
   if [[ "$have" != "$want" ]]; then
+    # 按 Git commit 对齐时，已安装模块版本会记录为伪版本
+    # （vX.Y.Z-0.<时间戳>-<commit>）：包含该 commit 即视为同源。
+    if [[ "$want" =~ ^[0-9a-f]{7,40}$ ]] && [[ "$have" == *"$want"* ]]; then
+      return 1
+    fi
     echo "[信息] 已安装 derper=${have}，目标=${want}，将重新安装以对齐版本。"
     return 0
   fi
@@ -593,7 +640,8 @@ derper_binary_needs_install() {
 # 否则本地 API 协议可能不兼容、客户端校验异常。
 # 参考上游说明：https://github.com/tailscale/tailscale/blob/main/cmd/derper/README.md
 # 当用户未显式指定 derper 版本（仍为 latest）且启用了 -verify-clients 时，
-# 自动对齐到当前已安装的 tailscale 版本，保证二者同源构建。
+# 优先对齐到本机 tailscaled 的 Git commit（真正的同源），
+# 取不到 commit 时才退化为语义版本标签并给出警告。
 align_derper_version_with_tailscale() {
   [[ "${VERIFY_CLIENTS_MODE}" == "on" ]] || return 0
   [[ "${DERPER_VERSION}" == "latest" ]] || return 0
@@ -602,22 +650,75 @@ align_derper_version_with_tailscale() {
     echo "       -verify-clients 要求 derper 与 tailscaled 同源构建；建议用 --derper-version 显式指定与 tailscaled 一致的版本。" >&2
     return 0
   fi
-  DERPER_VERSION="v${TS_VERSION}"
-  echo "[信息] --verify-clients 已启用：derper 版本自动对齐到 tailscale ${TS_VERSION}（将安装 derper@v${TS_VERSION}），确保二者同源构建。"
-  echo "       如需改用其他版本，请用 --derper-version 显式指定。"
+  local commit=""
+  commit=$(ts_commit || true)
+  if [[ -n "$commit" ]]; then
+    DERPER_VERSION="$commit"
+    echo "[信息] --verify-clients 已启用：derper 版本自动对齐到 tailscaled 的同一 Git revision（${commit}），确保二者同源构建。"
+    echo "       如需改用其他版本，请用 --derper-version 显式指定。"
+  else
+    DERPER_VERSION="v${TS_VERSION}"
+    echo "[警告] --verify-clients 已启用，但无法读取 tailscaled 的 Git commit（tailscale version 未提供）。" >&2
+    echo "       将退化为按版本标签对齐（v${TS_VERSION}）；该标签可能与本地 tailscaled 并非同一 revision。" >&2
+    echo "       建议升级 tailscale，或用 --derper-version 显式指定与 tailscaled 完全一致的 revision。" >&2
+  fi
+}
+
+# IPv4 地址分类：global（全局可路由）/ private / 各类保留、文档、组播等。
+# 依据 IANA 特殊用途地址注册表，正式部署仅接受 global。
+ipv4_address_class() {
+  local ip="$1" o1 o2 o3 o4 n
+  if [[ ! "$ip" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+    echo "invalid"; return 0
+  fi
+  o1=$((10#${BASH_REMATCH[1]})); o2=$((10#${BASH_REMATCH[2]}))
+  o3=$((10#${BASH_REMATCH[3]})); o4=$((10#${BASH_REMATCH[4]}))
+  if (( o1 > 255 || o2 > 255 || o3 > 255 || o4 > 255 )); then
+    echo "invalid"; return 0
+  fi
+  n=$(( (o1<<24) + (o2<<16) + (o3<<8) + o4 ))
+
+  in_cidr() { # n, a, b, c, d, prefix
+    local base=$(( ($2<<24) + ($3<<16) + ($4<<8) + $5 ))
+    local mask=$(( 0xFFFFFFFF & (0xFFFFFFFF << (32 - $6)) ))
+    (( ( $1 & mask ) == ( base & mask ) ))
+  }
+
+  if (( o1 == 0 )); then echo "保留（0.0.0.0/8）"
+  elif in_cidr "$n" 10 0 0 0 8; then echo "私有（10.0.0.0/8）"
+  elif in_cidr "$n" 100 64 0 0 10; then echo "CGNAT 保留（100.64.0.0/10）"
+  elif in_cidr "$n" 127 0 0 0 8; then echo "回环（127.0.0.0/8）"
+  elif in_cidr "$n" 169 254 0 0 16; then echo "链路本地（169.254.0.0/16）"
+  elif in_cidr "$n" 172 16 0 0 12; then echo "私有（172.16.0.0/12）"
+  elif in_cidr "$n" 192 0 0 0 24; then echo "保留（192.0.0.0/24，IETF）"
+  elif in_cidr "$n" 192 0 2 0 24; then echo "文档测试（192.0.2.0/24，TEST-NET-1）"
+  elif in_cidr "$n" 192 88 99 0 24; then echo "保留（192.88.99.0/24，6to4 中继）"
+  elif in_cidr "$n" 192 168 0 0 16; then echo "私有（192.168.0.0/16）"
+  elif in_cidr "$n" 198 18 0 0 15; then echo "保留（198.18.0.0/15，基准测试）"
+  elif in_cidr "$n" 198 51 100 0 24; then echo "文档测试（198.51.100.0/24，TEST-NET-2）"
+  elif in_cidr "$n" 203 0 113 0 24; then echo "文档测试（203.0.113.0/24，TEST-NET-3）"
+  elif in_cidr "$n" 224 0 0 0 4; then echo "组播（224.0.0.0/4）"
+  elif in_cidr "$n" 240 0 0 0 4; then echo "保留（240.0.0.0/4）"
+  elif (( o1 == 255 && o2 == 255 && o3 == 255 && o4 == 255 )); then echo "广播（255.255.255.255）"
+  else echo "global"; fi
 }
 
 validate_settings() {
-  # 端口合法性
-  if ! [[ "${DERP_PORT}" =~ ^[0-9]+$ ]] || (( DERP_PORT < 1 || DERP_PORT > 65535 )); then
+  # 端口合法性（10# 强制十进制，避免前导零被当作八进制解析）
+  local derp_port_dec stun_port_dec cert_days_dec
+  derp_port_dec=0; stun_port_dec=0; cert_days_dec=0
+  if [[ "${DERP_PORT}" =~ ^[0-9]+$ ]]; then derp_port_dec=$((10#$DERP_PORT)); fi
+  if [[ "${STUN_PORT}" =~ ^[0-9]+$ ]]; then stun_port_dec=$((10#$STUN_PORT)); fi
+  if [[ "${CERT_DAYS}" =~ ^[0-9]+$ ]]; then cert_days_dec=$((10#$CERT_DAYS)); fi
+  if (( derp_port_dec < 1 || derp_port_dec > 65535 )); then
     echo "[错误] --derp-port 必须为 1-65535 的整数，当前：${DERP_PORT}" >&2
     return 1
   fi
-  if ! [[ "${STUN_PORT}" =~ ^[0-9]+$ ]] || (( STUN_PORT < 1 || STUN_PORT > 65535 )); then
+  if (( stun_port_dec < 1 || stun_port_dec > 65535 )); then
     echo "[错误] --stun-port 必须为 1-65535 的整数，当前：${STUN_PORT}" >&2
     return 1
   fi
-  if ! [[ "${CERT_DAYS}" =~ ^[0-9]+$ ]] || (( CERT_DAYS < 1 )); then
+  if (( cert_days_dec < 1 )); then
     echo "[错误] --cert-days 必须为正整数，当前：${CERT_DAYS}" >&2
     return 1
   fi
@@ -640,15 +741,19 @@ validate_settings() {
     fi
   done
 
-  # 检测私有/保留地址（仅警告，不阻断，兼容内网测试场景）
-  local o1_dec=$((10#$o1)) o2_dec=$((10#$o2))
-  if (( o1_dec == 10 )) || \
-     (( o1_dec == 172 && o2_dec >= 16 && o2_dec <= 31 )) || \
-     (( o1_dec == 192 && o2_dec == 168 )) || \
-     (( o1_dec == 127 )) || \
-     (( o1_dec == 169 && o2_dec == 254 )); then
-    echo "[警告] IP ${IP_ADDR} 似乎是私有/保留地址，DERP 服务需要公网 IP 才能被远程客户端访问。" >&2
-    echo "  如果你确定这是你的场景（例如内网测试），可忽略此警告。" >&2
+  # 全局可路由校验：正式部署模式拒绝私有/保留/文档/组播等非公网地址；
+  # 内网测试必须通过 --allow-non-global-ip 显式放行。
+  local ip_class
+  ip_class=$(ipv4_address_class "${IP_ADDR}")
+  if [[ "$ip_class" != "global" ]]; then
+    if [[ "${ALLOW_NON_GLOBAL_IP}" -eq 1 ]]; then
+      echo "[警告] IP ${IP_ADDR} 被识别为${ip_class}地址（非全局可路由），已通过 --allow-non-global-ip 显式放行。" >&2
+      echo "  DERP 服务需要公网 IP 才能被远程客户端访问；内网测试可忽略此警告。" >&2
+    else
+      echo "[错误] IP ${IP_ADDR} 被识别为${ip_class}地址，不是全局可路由的公网 IPv4。" >&2
+      echo "  DERP 中继必须部署在公网 IP 上；若确需在内网/保留地址上测试，请显式添加 --allow-non-global-ip。" >&2
+      return 1
+    fi
   fi
 
   # Region 字段白名单校验（防止 JSON 注入）
@@ -664,9 +769,24 @@ validate_settings() {
     echo "[错误] --region-name 仅允许字母、数字、空格、连字符、下划线：${REGION_NAME}" >&2
     return 1
   fi
-  if ! [[ "${REGION_ID}" =~ ^[0-9]+$ ]] || (( REGION_ID < 1 )); then
+  if ! [[ "${REGION_ID}" =~ ^[0-9]+$ ]]; then
     echo "[错误] --region-id 必须为正整数：${REGION_ID}" >&2
     return 1
+  fi
+  # 10# 强制十进制，避免前导零被当作八进制解析
+  local region_id_dec=$((10#$REGION_ID))
+  if (( region_id_dec < 1 )); then
+    echo "[错误] --region-id 必须为正整数：${REGION_ID}" >&2
+    return 1
+  fi
+  # 上游要求 RegionID 能安全放入 JavaScript number（Number.MAX_SAFE_INTEGER = 2^53-1）
+  if (( region_id_dec > 9007199254740991 )); then
+    echo "[错误] --region-id 超出 JavaScript 安全整数范围（最大 9007199254740991）：${REGION_ID}" >&2
+    return 1
+  fi
+  # 上游约定 900-999 保留给用户自建区域
+  if (( region_id_dec < 900 || region_id_dec > 999 )); then
+    echo "[警告] --region-id ${REGION_ID} 不在 900-999 范围；上游约定该范围保留给用户自建区域，建议使用 900-999。" >&2
   fi
 
   # 安全级别前置校验（避免执行完所有安装步骤后才报错）
@@ -696,6 +816,20 @@ detect_public_ip() {
   echo "[信息] 使用公网 IP：${IP_ADDR}"
 }
 
+# 健康检查/cron 优先从已部署 unit 读 hostname，避免每次打外网探测 IP。
+infer_ip_from_existing_deployment() {
+  [[ -z "${IP_ADDR:-}" ]] || return 0
+  local content host
+  content=$(read_derper_unit_content || true)
+  host=$(printf '%s\n' "$content" | grep -oE -- '-hostname[[:space:]]+[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | awk '{print $2}' | head -n1 || true)
+  if [[ -n "$host" ]]; then
+    IP_ADDR="$host"
+    echo "[信息] 从已部署 unit 读取 hostname/IP：${IP_ADDR}（跳过外网探测）"
+    return 0
+  fi
+  return 1
+}
+
 # 兼容 timeout：优先使用系统 timeout，缺失时用后台进程模拟
 _timeout_run() {
   local secs="$1"; shift
@@ -711,6 +845,18 @@ _timeout_run() {
     kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null || true
     return $rc
   fi
+}
+
+# 从 `go version` 输出解析工具链版本号（如 1.18.1）。
+parse_go_version() {
+  printf '%s' "${1:-}" | grep -oE 'go[0-9]+\.[0-9]+(\.[0-9]+)?' | head -n1 | sed 's/^go//'
+}
+
+# 当前 PATH 中的 go 是否满足 MIN_GO_VERSION（GOTOOLCHAIN=auto 的下限）。
+go_toolchain_meets_min() {
+  local have
+  have=$(parse_go_version "$(go version 2>/dev/null || true)")
+  [[ -n "$have" ]] && ver_ge "$have" "${MIN_GO_VERSION}"
 }
 
 # 版本比较：ver_ge A B => A >= B ?
@@ -735,6 +881,47 @@ ver_ge() {
 
 ts_version() {
   (tailscale version 2>/dev/null | head -n1 | sed -E 's/[^0-9\.].*$//' || true)
+}
+
+# 读取本机 tailscaled 的 Git commit（tailscale version 输出 "tailscale commit: <hash>"；
+# 标准构建中 CLI 与 tailscaled 同源，该字段即 tailscaled 的 revision）。
+# 上游 -verify-clients 要求 derper 与 tailscaled 来自同一 Git revision，而非仅版本号相同。
+ts_commit() {
+  tailscale version 2>/dev/null \
+    | awk '/tailscale commit:/ {print $3; exit}' \
+    | grep -E '^[0-9a-f]{7,40}$' || true
+}
+
+# 当前 SSH 是否走 Tailscale（CGNAT 100.64/10 或 fd7a:115c:a1e0::/48）。
+ssh_session_via_tailscale() {
+  [[ -n "${SSH_CONNECTION:-}" ]] || return 1
+  local src
+  src=$(awk '{print $1}' <<<"${SSH_CONNECTION}")
+  [[ "$src" == 100.* || "$src" == fd7a:115c:a1e0:* ]]
+}
+
+# 重启 tailscaled.socket 以使 drop-in 生效。经由 Tailscale 的 SSH 会话会因此断开，默认跳过。
+restart_tailscaled_socket_unit() {
+  if ssh_session_via_tailscale; then
+    echo "[警告] 检测到当前 SSH 连接可能经由 Tailscale（${SSH_CONNECTION%% *}）。" >&2
+    echo "  重启 tailscaled.socket 将断开此连接，可能导致脚本中断和服务器不可达。" >&2
+    if [[ "${NON_INTERACTIVE:-0}" -eq 1 ]]; then
+      echo "[跳过] 非交互模式下跳过 tailscaled.socket 重启；drop-in 已写入，请在非 Tailscale 会话执行：systemctl restart tailscaled.socket" >&2
+      return 1
+    fi
+    local confirm=""
+    if ! read -r -p "  是否确认重启 tailscaled.socket？(yes/no): " confirm; then
+      echo "[跳过] 输入已结束，跳过 tailscaled.socket 重启。" >&2
+      return 1
+    fi
+    if [[ "$confirm" != "yes" ]]; then
+      echo "[跳过] 已取消 tailscaled.socket 重启。" >&2
+      return 1
+    fi
+  fi
+  command -v systemctl >/dev/null 2>&1 || return 1
+  systemctl daemon-reload 2>/dev/null || true
+  systemctl restart tailscaled.socket 2>/dev/null
 }
 
 check_tailscale_status() {
@@ -994,6 +1181,8 @@ install_deps() {
   command -v curl >/dev/null 2>&1     || need_pkgs+=(curl)
   command -v openssl >/dev/null 2>&1  || need_pkgs+=(openssl)
   command -v git >/dev/null 2>&1      || need_pkgs+=(git)
+  # tar 是 ensure_go 兜底安装 Go 官方 tarball 的必要工具
+  command -v tar >/dev/null 2>&1      || need_pkgs+=(tar)
   # 可选但常用：nc/ss，用于自检；缺失不强制
   if ! command -v nc >/dev/null 2>&1; then
     if command -v apt >/dev/null 2>&1; then need_pkgs+=(netcat-openbsd);
@@ -1050,23 +1239,30 @@ install_deps() {
   fi
 }
 
-# 轻量检测：确保系统有 go 命令。优先用发行版包，工具链版本交由 GOTOOLCHAIN=auto 处理。
+# 确保系统有足够新的 Go（>= MIN_GO_VERSION）。发行版包经常偏旧，GOTOOLCHAIN=auto 在 1.21 之前不可用。
 ensure_go() {
-  if command -v go >/dev/null 2>&1; then
+  if go_toolchain_meets_min; then
     echo "[信息] 已检测到 Go：$(go version 2>/dev/null)"
     return 0
   fi
-  echo "[步骤] 未检测到 go，尝试通过系统包管理器安装 golang-go…"
-  if command -v apt >/dev/null 2>&1; then
-    DEBIAN_FRONTEND=noninteractive apt install -y golang-go || true
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y golang || true
-  elif command -v yum >/dev/null 2>&1; then
-    yum install -y golang || true
-  fi
   if command -v go >/dev/null 2>&1; then
-    echo "[信息] Go 安装完成：$(go version 2>/dev/null)"
-    return 0
+    echo "[警告] 已安装 Go 版本过低（$(go version 2>/dev/null)），需要 >= ${MIN_GO_VERSION}（GOTOOLCHAIN=auto 在此之前不可用）。将安装官方工具链 ${GO_VERSION}。" >&2
+  else
+    echo "[步骤] 未检测到 go，尝试通过系统包管理器安装 golang-go…"
+    if command -v apt >/dev/null 2>&1; then
+      DEBIAN_FRONTEND=noninteractive apt install -y golang-go || true
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y golang || true
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y golang || true
+    fi
+    if go_toolchain_meets_min; then
+      echo "[信息] Go 安装完成：$(go version 2>/dev/null)"
+      return 0
+    fi
+    if command -v go >/dev/null 2>&1; then
+      echo "[警告] 发行版 Go 仍低于 ${MIN_GO_VERSION}（$(go version 2>/dev/null)），改为安装官方工具链 ${GO_VERSION}。" >&2
+    fi
   fi
   # 兜底：按架构安装官方二进制（最新稳定工具链可再由 GOTOOLCHAIN 自动拉取）。
   local arch os url tarball sha256_expected
@@ -1201,25 +1397,95 @@ derper_supports_socket_flag() {
   echo "$help_output" | grep -qE '(^|[[:space:]])-socket([[:space:]]|$)'
 }
 
-generate_selfsigned_cert() {
-  echo "[步骤] 生成基于 IP 的自签临时证书（SAN=IP:${IP_ADDR}）…"
-  mkdir -p "${INSTALL_DIR}/certs"
+# 拒绝写入符号链接路径（防止低权限服务账户诱导 root 沿链接覆盖任意文件）。
+refuse_symlink() {
+  if [[ -L "$1" ]]; then
+    echo "[错误] 拒绝写入：$1 是符号链接（可能存在恶意替换风险），请手动检查后删除。" >&2
+    return 1
+  fi
+}
+
+# 加固证书目录：certs 目录与证书/私钥保持 root 所有，服务用户仅通过组权限只读，
+# 防止 derper 账户篡改证书或预埋符号链接等待 root 重签时触发覆盖。
+harden_cert_dir() {
+  local certs_dir="${INSTALL_DIR}/certs"
+  [[ -d "$certs_dir" ]] || return 0
+  if [[ -L "$certs_dir" ]]; then
+    echo "[错误] ${certs_dir} 是符号链接，拒绝加固（可能存在安全风险）。" >&2
+    return 1
+  fi
+  local group="root"
+  if [[ -n "${RUN_USER:-}" ]] && id -g -n "$RUN_USER" >/dev/null 2>&1; then
+    group=$(id -g -n "$RUN_USER")
+  fi
+  chown root:"$group" "$certs_dir" 2>/dev/null || chown root:root "$certs_dir" 2>/dev/null || true
+  chmod 750 "$certs_dir" 2>/dev/null || true
 
   local cert_file key_file
   cert_file=$(derper_manual_cert_file)
   key_file=$(derper_manual_key_file)
+  if [[ -f "$key_file" && ! -L "$key_file" ]]; then
+    chown root:"$group" "$key_file" 2>/dev/null || chown root:root "$key_file" 2>/dev/null || true
+    chmod 640 "$key_file" 2>/dev/null || true
+  fi
+  if [[ -f "$cert_file" && ! -L "$cert_file" ]]; then
+    chown root:"$group" "$cert_file" 2>/dev/null || chown root:root "$cert_file" 2>/dev/null || true
+    chmod 644 "$cert_file" 2>/dev/null || true
+  fi
+  return 0
+}
 
+generate_selfsigned_cert() {
+  echo "[步骤] 生成基于 IP 的自签临时证书（SAN=IP:${IP_ADDR}）…"
+  mkdir -p "${INSTALL_DIR}"
+
+  local certs_dir="${INSTALL_DIR}/certs"
+  if [[ -L "$certs_dir" ]]; then
+    echo "[错误] ${certs_dir} 是符号链接，拒绝继续（可能存在安全风险）。请删除后重试。" >&2
+    return 1
+  fi
+  mkdir -p "$certs_dir"
+  # 生成前先把证书目录收紧为 root 所有，杜绝服务账户在生成过程中插入符号链接
+  harden_cert_dir || return 1
+
+  local cert_file key_file
+  cert_file=$(derper_manual_cert_file)
+  key_file=$(derper_manual_key_file)
+  refuse_symlink "$cert_file" || return 1
+  refuse_symlink "$key_file" || return 1
+
+  # 在证书目录内创建随机临时文件，成功后原子替换（mv 会替换符号链接本身，不会沿链接写入）
+  local key_tmp cert_tmp cnf_tmp
+  if ! key_tmp=$(mktemp "${certs_dir}/.derper-key.XXXXXX" 2>/dev/null); then
+    echo "[错误] 无法在 ${certs_dir} 创建密钥临时文件。" >&2
+    return 1
+  fi
+  if ! cert_tmp=$(mktemp "${certs_dir}/.derper-cert.XXXXXX" 2>/dev/null); then
+    rm -f "$key_tmp"
+    echo "[错误] 无法在 ${certs_dir} 创建证书临时文件。" >&2
+    return 1
+  fi
+
+  local ok=0
   # 优先使用 -addext；若系统 openssl 太旧则降级到配置文件方式
   # 上游 derper manual 模式固定读取 <hostname>.crt / <hostname>.key
   if openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
-      -keyout "${key_file}" \
-      -out "${cert_file}" \
+      -keyout "${key_tmp}" \
+      -out "${cert_tmp}" \
       -days "${CERT_DAYS}" \
       -subj "/CN=${IP_ADDR}" \
       -addext "subjectAltName = IP:${IP_ADDR}" >/dev/null 2>&1; then
-    :
+    ok=1
   else
-    cat >"${INSTALL_DIR}/openssl-derper.cnf" <<CONF
+    rm -f "$key_tmp" "$cert_tmp"
+    if ! key_tmp=$(mktemp "${certs_dir}/.derper-key.XXXXXX" 2>/dev/null) ||
+       ! cert_tmp=$(mktemp "${certs_dir}/.derper-cert.XXXXXX" 2>/dev/null) ||
+       ! cnf_tmp=$(mktemp "${certs_dir}/.derper-cnf.XXXXXX" 2>/dev/null); then
+      rm -f "$key_tmp" "$cert_tmp" "$cnf_tmp" 2>/dev/null || true
+      echo "[错误] 无法在 ${certs_dir} 创建临时文件。" >&2
+      return 1
+    fi
+    cat >"${cnf_tmp}" <<CONF
 [ req ]
 default_bits       = 2048
 distinguished_name = req_distinguished_name
@@ -1239,12 +1505,29 @@ subjectAltName = @alt_names
 [ alt_names ]
 IP.1 = ${IP_ADDR}
 CONF
-    openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
-      -keyout "${key_file}" \
-      -out "${cert_file}" \
+    if openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
+      -keyout "${key_tmp}" \
+      -out "${cert_tmp}" \
       -days "${CERT_DAYS}" \
-      -config "${INSTALL_DIR}/openssl-derper.cnf" >/dev/null 2>&1
+      -config "${cnf_tmp}" >/dev/null 2>&1; then
+      ok=1
+    fi
   fi
+
+  if [[ "$ok" -ne 1 ]]; then
+    rm -f "$key_tmp" "$cert_tmp" "$cnf_tmp" 2>/dev/null || true
+    echo "[错误] 自签证书生成失败，请检查 openssl 版本与磁盘状态。" >&2
+    return 1
+  fi
+
+  # 原子替换到最终路径（mv 不沿符号链接写入，并替换残留符号链接本身）
+  chmod 600 "$key_tmp" "$cert_tmp" 2>/dev/null || true
+  if ! mv -f "$key_tmp" "$key_file" || ! mv -f "$cert_tmp" "$cert_file"; then
+    rm -f "$key_tmp" "$cert_tmp" "$cnf_tmp" 2>/dev/null || true
+    echo "[错误] 证书文件写入失败：${key_file} / ${cert_file}" >&2
+    return 1
+  fi
+  rm -f "$cnf_tmp" 2>/dev/null || true
 
   # 兼容旧路径与常见别名（符号链接指向 derper 实际读取的文件）
   ln -sfn "$(basename "$cert_file")" "${INSTALL_DIR}/certs/fullchain.pem"
@@ -1252,18 +1535,62 @@ CONF
   ln -sfn "$(basename "$cert_file")" "${INSTALL_DIR}/certs/cert.pem"
   ln -sfn "$(basename "$key_file")"  "${INSTALL_DIR}/certs/key.pem"
 
-  # 加固证书目录与私钥权限
-  chmod 750 "${INSTALL_DIR}/certs"
+  # 加固证书目录与私钥权限：root 所有，服务用户仅组内只读
   chmod 600 "${key_file}"
   chmod 644 "${cert_file}"
-  
-  # 注意：证书目录权限由 setup_service_user() 统一设置，避免重复
+  harden_cert_dir
 
   echo "[信息] 证书文件生成于：${cert_file} / ${key_file}"
   echo "[信息] 兼容链接：${INSTALL_DIR}/certs/{fullchain.pem,privkey.pem,cert.pem,key.pem}"
   
   # 生成 derper 配置文件（新版 derper 要求必须指定 -c 参数）
   generate_derper_config
+}
+
+# 证书就绪：已兼容则跳过；仅命名过旧则迁移（保留指纹）；否则重签。
+# --repair 与默认幂等路径共用，避免 repair 把可迁移证书直接重签导致 ACL 指纹变化。
+ensure_compatible_certs() {
+  CERTS_CHANGED=0
+  if [[ ${CERT_PRESENT:-0} -eq 1 && ${CERT_SAN_MATCH:-0} -eq 1 && ${CERT_EXPIRY_OK:-0} -eq 1 && ${CERT_NAMING_OK:-0} -eq 1 ]]; then
+    return 0
+  fi
+  command -v openssl >/dev/null 2>&1 || install_deps
+  if [[ ${CERT_NAMING_OK:-0} -ne 1 && ${CERT_PRESENT:-0} -eq 1 ]]; then
+    echo "[信息] 检测到旧证书命名（非 <IP>.crt/.key），将迁移为上游 derper manual 模式兼容命名。"
+  fi
+  if [[ ${CERT_PRESENT:-0} -eq 1 && ${CERT_SAN_MATCH:-0} -eq 1 && ${CERT_EXPIRY_OK:-0} -eq 1 && ${CERT_NAMING_OK:-0} -ne 1 ]]; then
+    local old_cert old_key new_cert new_key
+    old_cert=$(resolve_disk_cert_pem || true)
+    old_key=$(resolve_disk_key_pem || true)
+    new_cert=$(derper_manual_cert_file)
+    new_key=$(derper_manual_key_file)
+    if [[ -n "$old_cert" && -n "$old_key" && -f "$old_cert" && -f "$old_key" ]]; then
+      mkdir -p "${INSTALL_DIR}/certs"
+      harden_cert_dir || { echo "[错误] 证书目录加固失败，迁移中止。" >&2; return 1; }
+      refuse_symlink "$new_cert" || return 1
+      refuse_symlink "$new_key" || return 1
+      local _mig_cert_tmp _mig_key_tmp
+      _mig_cert_tmp=$(mktemp "${INSTALL_DIR}/certs/.derper-cert.XXXXXX") || return 1
+      _mig_key_tmp=$(mktemp "${INSTALL_DIR}/certs/.derper-key.XXXXXX") || { rm -f "$_mig_cert_tmp"; return 1; }
+      cp -a "$old_cert" "$_mig_cert_tmp" && mv -f "$_mig_cert_tmp" "$new_cert" || { rm -f "$_mig_cert_tmp" "$_mig_key_tmp"; echo "[错误] 证书迁移失败。" >&2; return 1; }
+      cp -a "$old_key" "$_mig_key_tmp" && mv -f "$_mig_key_tmp" "$new_key" || { rm -f "$_mig_cert_tmp" "$_mig_key_tmp"; echo "[错误] 密钥迁移失败。" >&2; return 1; }
+      ln -sfn "$(basename "$new_cert")" "${INSTALL_DIR}/certs/fullchain.pem"
+      ln -sfn "$(basename "$new_key")"  "${INSTALL_DIR}/certs/privkey.pem"
+      ln -sfn "$(basename "$new_cert")" "${INSTALL_DIR}/certs/cert.pem"
+      ln -sfn "$(basename "$new_key")"  "${INSTALL_DIR}/certs/key.pem"
+      chmod 600 "$new_key"
+      chmod 644 "$new_cert"
+      harden_cert_dir || true
+      echo "[信息] 已迁移证书到上游命名：${new_cert} / ${new_key}"
+      CERT_NAMING_OK=1
+      CERTS_CHANGED=1
+      return 0
+    fi
+  fi
+  echo "[警告] 即将重签证书：CertName 指纹会变化，请同步更新 ACL。" >&2
+  generate_selfsigned_cert || return 1
+  CERTS_CHANGED=1
+  return 0
 }
 
 generate_derper_config() {
@@ -1468,6 +1795,8 @@ setup_service_user() {
         echo "    chown -R $RUN_USER:$user_group ${INSTALL_DIR}" >&2
       }
     fi
+    # 证书目录必须收回 root 所有，服务账户只读（防止符号链接覆盖攻击）
+    harden_cert_dir || true
     return 0
   fi
   
@@ -1523,6 +1852,88 @@ setup_service_user() {
       echo "[警告] 无法设置安装目录所有权，服务启动时可能失败" >&2
     }
   fi
+  # 证书目录必须收回 root 所有，服务账户只读（防止符号链接覆盖攻击）
+  harden_cert_dir || true
+}
+
+# 启动后强制健康验证：active 状态、TLS/STUN 端口监听、TLS 握手、进程存活。
+# systemctl start/restart 即时返回成功并不代表服务真正可用（可能启动后立即崩溃）。
+service_verified_running() {
+  command -v systemctl >/dev/null 2>&1 || return 1
+  local tries=0
+  while (( tries < 15 )); do
+    if systemctl is-active --quiet derper 2>/dev/null; then
+      break
+    fi
+    sleep 1
+    ((tries++))
+  done
+  systemctl is-active --quiet derper 2>/dev/null || return 1
+  # 防止启动后立即崩溃：短暂等待后复核 active 状态
+  sleep 2
+  systemctl is-active --quiet derper 2>/dev/null || return 1
+
+  # TLS/STUN 端口确实监听
+  check_ports_status
+  [[ "${PORT_TLS_OK:-0}" -eq 1 && "${PORT_STUN_OK:-0}" -eq 1 ]] || return 1
+
+  # TLS 握手成功（优先本机回环，避免 NAT hairpin 误报）
+  command -v openssl >/dev/null 2>&1 || return 1
+  local host pem tls_ok=0
+  while IFS= read -r host; do
+    [[ -n "$host" ]] || continue
+    pem=$(_timeout_run 6 openssl s_client -connect "${host}:${DERP_PORT}" -servername "${IP_ADDR}" -showcerts </dev/null 2>/dev/null \
+          | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p') || true
+    if [[ -n "$pem" ]]; then
+      tls_ok=1
+      break
+    fi
+  done < <(tls_probe_endpoints)
+  [[ "$tls_ok" -eq 1 ]] || return 1
+
+  # derper 主进程仍在运行（未崩溃退出）
+  local main_pid
+  main_pid=$(systemctl show -p MainPID --value derper 2>/dev/null || echo "0")
+  [[ -n "$main_pid" && "$main_pid" != "0" ]] || return 1
+  kill -0 "$main_pid" 2>/dev/null || return 1
+  return 0
+}
+
+# 失败回滚：恢复备份的旧 unit，并尝试重新启动旧服务（若此前在运行）后验证，
+# 保证“自动故障恢复”不只是还原文件、而是真正恢复可用状态。
+rollback_previous_unit() {
+  local backup="$1" was_running="${2:-0}"
+  if [[ -z "$backup" || ! -f "$backup" ]]; then
+    if [[ "$was_running" -ne 1 ]]; then
+      # 全新安装失败且无备份：停止残留的半启动状态
+      systemctl stop derper 2>/dev/null || true
+      echo "[信息] 新安装启动失败，服务已停止；请排查后重新运行本脚本。" >&2
+    else
+      echo "[警告] 无可用备份单元，旧服务可能已停止；请立即检查 systemctl status derper。" >&2
+    fi
+    return 1
+  fi
+  echo "[步骤] 正在恢复备份的 systemd 单元：${backup}" >&2
+  if ! cp -a "$backup" "${SERVICE_PATH}" 2>/dev/null; then
+    echo "[错误] 恢复备份单元失败，旧服务可能处于停止状态。" >&2
+    return 1
+  fi
+  systemctl daemon-reload 2>/dev/null || true
+  if [[ "$was_running" -eq 1 ]]; then
+    echo "[步骤] 原服务此前在运行，尝试按旧配置重新启动并验证…" >&2
+    if systemctl restart derper 2>/dev/null || systemctl start derper 2>/dev/null; then
+      if service_verified_running; then
+        echo "[信息] 已恢复旧服务并通过健康验证。" >&2
+        return 0
+      fi
+    fi
+    echo "[错误] 旧配置未能重新启动并通过验证；服务当前可能处于停止状态。" >&2
+    echo "  请立即执行 systemctl status derper 与 journalctl -u derper -n 100 排查。" >&2
+    return 1
+  fi
+  systemctl stop derper 2>/dev/null || true
+  echo "[信息] 已恢复旧单元；新配置启动失败，服务保持停止状态。" >&2
+  return 1
 }
 
 write_systemd_service() {
@@ -1596,19 +2007,9 @@ write_systemd_service() {
           if getent group tailscale >/dev/null 2>&1; then
             echo "[步骤] 重启 tailscaled 尝试应用 tailscale 组到本地 API socket"
             if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet tailscaled 2>/dev/null; then
-              # 检测当前 SSH 连接是否经由 Tailscale（重启会断开连接）
-              local _via_tailscale=0
-              if [[ -n "${SSH_CONNECTION:-}" ]]; then
-                local _ssh_src_ip
-                _ssh_src_ip=$(echo "$SSH_CONNECTION" | awk '{print $1}')
-                if [[ "$_ssh_src_ip" == 100.* ]] || [[ "$_ssh_src_ip" == fd7a:115c:a1e0:* ]]; then
-                  _via_tailscale=1
-                fi
-              fi
-
               local _do_restart=1
-              if [[ "$_via_tailscale" -eq 1 ]]; then
-                echo "[警告] 检测到当前 SSH 连接可能经由 Tailscale（源 IP: ${_ssh_src_ip}）。" >&2
+              if ssh_session_via_tailscale; then
+                echo "[警告] 检测到当前 SSH 连接可能经由 Tailscale（${SSH_CONNECTION%% *}）。" >&2
                 echo "  重启 tailscaled 将断开此连接，可能导致脚本中断和服务器不可达。" >&2
                 if [[ "${NON_INTERACTIVE}" -eq 1 ]]; then
                   echo "[跳过] 非交互模式下跳过 tailscaled 重启，将使用备选方案配置 socket 权限。" >&2
@@ -1672,7 +2073,7 @@ write_systemd_service() {
 SocketGroup=${tailscaled_socket_override_group}
 SocketMode=0660
 EOF
-            if systemctl daemon-reload 2>/dev/null && systemctl restart tailscaled.socket 2>/dev/null; then
+            if restart_tailscaled_socket_unit; then
               tailscaled_socket_unit_has_override=1
               echo "[信息] 已为 tailscaled.socket 应用覆盖：SocketGroup=${tailscaled_socket_override_group} SocketMode=0660"
               # 同步将 derper 用户加入该组（若为 tailscale 组）
@@ -1680,7 +2081,7 @@ EOF
                 usermod -a -G tailscale "$RUN_USER" 2>/dev/null || true
               fi
             else
-              echo "[警告] tailscaled.socket 覆盖应用失败，将回退到临时权限调整或 ACL。" >&2
+              echo "[警告] tailscaled.socket 覆盖未能立即生效（重启被跳过或失败），将回退到临时权限调整或 ACL。" >&2
             fi
           fi
 
@@ -1955,13 +2356,26 @@ SERVICE
 
   # 尝试启动或重启服务，确保修复/重写后的 unit 和证书立即生效。
   systemctl enable derper >/dev/null 2>&1 || true
-  local service_started=0
+  local was_running=0
   if systemctl is-active --quiet derper 2>/dev/null; then
+    was_running=1
+  fi
+  local service_started=0
+  if [[ "$was_running" -eq 1 ]]; then
     if systemctl restart derper 2>/dev/null; then
       service_started=1
     fi
   elif systemctl start derper 2>/dev/null; then
     service_started=1
+  fi
+
+  # start/restart 即时返回成功 ≠ 服务健康：必须验证 active/端口监听/TLS 握手/进程存活，
+  # 否则“启动后立即崩溃”会被误判为部署成功。
+  if [[ "${service_started}" -eq 1 ]]; then
+    if ! service_verified_running; then
+      echo "[警告] 服务启动命令成功，但未通过健康验证（active/端口/TLS/进程）。" >&2
+      service_started=0
+    fi
   fi
 
   if [[ "${service_started}" -ne 1 ]]; then
@@ -1978,14 +2392,16 @@ SERVICE
       systemctl daemon-reload
       
       systemctl enable derper >/dev/null 2>&1 || true
+      local degraded_ok=0
       if systemctl restart derper 2>/dev/null || systemctl start derper 2>/dev/null; then
-        echo "[信息] 服务已成功启动（已禁用 MemoryDenyWriteExecute；unit 已标记为 paranoid 降级）"
-      else
-        if [[ -n "$unit_backup" && -f "$unit_backup" ]]; then
-          echo "[步骤] 启动仍失败，正在恢复备份的 systemd 单元：$unit_backup" >&2
-          cp -a "$unit_backup" "${SERVICE_PATH}" 2>/dev/null || true
-          systemctl daemon-reload 2>/dev/null || true
+        if service_verified_running; then
+          degraded_ok=1
+          echo "[信息] 服务已成功启动（已禁用 MemoryDenyWriteExecute；unit 已标记为 paranoid 降级）"
         fi
+      fi
+      if [[ "$degraded_ok" -ne 1 ]]; then
+        echo "[警告] 降级后服务仍未通过健康验证，开始回滚。" >&2
+        rollback_previous_unit "$unit_backup" "$was_running" || true
         cat >&2 <<'EOT'
 
 [错误] 服务仍然无法启动
@@ -2009,11 +2425,8 @@ EOT
         exit 1
       fi
     else
-      if [[ -n "$unit_backup" && -f "$unit_backup" ]]; then
-        echo "[步骤] 启动失败，正在恢复备份的 systemd 单元：$unit_backup" >&2
-        cp -a "$unit_backup" "${SERVICE_PATH}" 2>/dev/null || true
-        systemctl daemon-reload 2>/dev/null || true
-      fi
+      echo "[步骤] 启动失败，正在回滚到备份的旧服务配置。" >&2
+      rollback_previous_unit "$unit_backup" "$was_running" || true
       cat >&2 <<'EOT'
 
 [错误] 服务启动失败
@@ -2079,6 +2492,18 @@ print_firewall_tips() {
     echo "  # 或（RHEL/CentOS）："
     echo "  service iptables save"
   fi
+
+  # 主机与云层面加固建议（公网中继的关键风险不在 DERP 协议，而在主机本身）
+  echo ""
+  echo "[建议] 主机加固（公网中继关键项）："
+  echo "  - 云安全组入方向只放行 ${DERP_PORT}/tcp 与 ${STUN_PORT}/udp；其余端口（尤其 22/tcp）不要对 0.0.0.0/0 开放。"
+  echo "  - SSH 优先走 Tailscale（sshd 只监听 tailscale IP），并保留云厂商 VNC/控制台兜底；"
+  echo "    或至少限源 IP + 禁用密码登录（PasswordAuthentication no）。"
+  echo "  - 出方向不要收紧：tailscaled 需要访问控制面与官方 DERP/STUN 做探测（netcheck/升级）。"
+  echo "  - 单机单用途：本机只跑 derper + tailscaled，减少暴露面。"
+  echo "  - 定期查看 journalctl -u derper：-verify-clients 的拒绝记录是异常访问/滥用信号。"
+  check_extra_attack_surface || true
+  check_automatic_updates || true
 }
 
 runtime_checks() {
@@ -2128,7 +2553,22 @@ runtime_checks() {
   fi
 }
 
-# 在写入 systemd 服务前，预检端口占用，避免启动后才失败
+# 判断 ss/netstat 输出中某端口是否由 derper 占用（旧部署可能只听 TLS、没有 STUN）。
+port_listening_owned_by_derper() {
+  local listening="$1" port="$2" main_pid="${3:-}"
+  local lines
+  lines=$(printf '%s\n' "$listening" | grep -E ":${port}([^0-9]|$)" || true)
+  [[ -n "$lines" ]] || return 1
+  printf '%s\n' "$lines" | grep -Fq '"derper"' && return 0
+  if [[ -n "$main_pid" && "$main_pid" != "0" ]] &&
+     printf '%s\n' "$lines" | grep -Eq "(pid[=,]|^|,)${main_pid}([^0-9]|$)"; then
+    return 0
+  fi
+  return 1
+}
+
+# 在写入 systemd 服务前，预检端口占用，避免启动后才失败。
+# 自家 derper 占用的端口（含「有 TLS、无 STUN」的旧部署）不视为冲突，否则 --force/--repair 会被卡死。
 check_port_conflicts_from_listening() {
   local listening="$1"
   if current_derper_owns_ports; then
@@ -2136,16 +2576,33 @@ check_port_conflicts_from_listening() {
     return 0
   fi
 
-  local conflict=0
-  if echo "$listening" | grep -E ":${DERP_PORT}([^0-9]|$)" >/dev/null 2>&1; then
-    echo "[错误] 检测到 TCP 端口 ${DERP_PORT} 已被占用。请更换 --derp-port 或释放占用进程：" >&2
-    echo "$listening" | sed -n '1,200p' | grep -E ":${DERP_PORT}([^0-9]|$)" >&2 || true
-    conflict=1
+  local main_pid=""
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet derper 2>/dev/null; then
+    main_pid=$(systemctl show -p MainPID --value derper 2>/dev/null || echo "")
   fi
-  if echo "$listening" | grep -E ":${STUN_PORT}([^0-9]|$)" >/dev/null 2>&1; then
-    echo "[错误] 检测到 UDP 端口 ${STUN_PORT} 已被占用。请更换 --stun-port 或释放占用进程：" >&2
-    echo "$listening" | sed -n '1,200p' | grep -E ":${STUN_PORT}([^0-9]|$)" >&2 || true
-    conflict=1
+
+  local conflict=0
+  local derp_lines stun_lines
+  derp_lines=$(printf '%s\n' "$listening" | grep -E ":${DERP_PORT}([^0-9]|$)" || true)
+  stun_lines=$(printf '%s\n' "$listening" | grep -E ":${STUN_PORT}([^0-9]|$)" || true)
+
+  if [[ -n "$derp_lines" ]]; then
+    if port_listening_owned_by_derper "$listening" "${DERP_PORT}" "$main_pid"; then
+      echo "[信息] TCP 端口 ${DERP_PORT} 当前由 derper 占用，允许修复/重启流程继续。"
+    else
+      echo "[错误] 检测到 TCP 端口 ${DERP_PORT} 已被占用。请更换 --derp-port 或释放占用进程：" >&2
+      printf '%s\n' "$derp_lines" | sed -n '1,200p' >&2 || true
+      conflict=1
+    fi
+  fi
+  if [[ -n "$stun_lines" ]]; then
+    if port_listening_owned_by_derper "$listening" "${STUN_PORT}" "$main_pid"; then
+      echo "[信息] UDP 端口 ${STUN_PORT} 当前由 derper 占用，允许修复/重启流程继续。"
+    else
+      echo "[错误] 检测到 UDP 端口 ${STUN_PORT} 已被占用。请更换 --stun-port 或释放占用进程：" >&2
+      printf '%s\n' "$stun_lines" | sed -n '1,200p' >&2 || true
+      conflict=1
+    fi
   fi
   [[ ${conflict} -eq 0 ]]
 }
@@ -2167,6 +2624,59 @@ check_port_conflicts() {
   echo "[信息] 端口未发现占用。"
 }
 
+# 暴露面检查：列出除本脚本 DERP 端口外、面向非回环地址的 TCP 监听端口。
+# 只警告不阻断——单机单用途是公网 DERP 服务器的重要基线，
+# 每个额外的公网监听端口（尤其是 0.0.0.0:22 的 SSH）都会扩大被攻击面。
+check_extra_attack_surface() {
+  EXTRA_LISTENERS=""
+  local listening=""
+  if command -v ss >/dev/null 2>&1; then
+    listening=$(ss -ltn 2>/dev/null | awk 'NR>1 {print $4}' \
+      | grep -E ':[0-9]+$' \
+      | grep -vE '^127\.0\.0\.1:|^\[::1\]:|^::1:' \
+      | grep -vE ":${DERP_PORT}$" || true)
+  elif command -v netstat >/dev/null 2>&1; then
+    listening=$(netstat -ltn 2>/dev/null | awk 'NR>2 && $1 ~ /^tcp6?/ {print $4}' \
+      | grep -E ':[0-9]+$' \
+      | grep -vE '^127\.0\.0\.1:|^\[::1\]:|^::1:' \
+      | grep -vE ":${DERP_PORT}$" || true)
+  fi
+  EXTRA_LISTENERS=$(printf '%s\n' "$listening" | sort -u | grep -v '^$' || true)
+  if [[ -n "$EXTRA_LISTENERS" ]]; then
+    echo "[警告] 检测到除 DERP 端口外，仍有面向非回环地址的 TCP 监听端口：" >&2
+    printf '%s\n' "$EXTRA_LISTENERS" | sed 's/^/  - /' >&2
+    echo "  公网 DERP 服务器建议单机单用途；每个额外端口都会扩大暴露面。" >&2
+    if printf '%s\n' "$EXTRA_LISTENERS" | grep -qE '(^|:)22$|^\[::\]:22$'; then
+      echo "  尤其注意 22/tcp（SSH）：建议云安全组不要对 0.0.0.0/0 放行，SSH 优先走 Tailscale 或限源 IP。" >&2
+    fi
+  fi
+  return 0
+}
+
+# 检测是否启用了操作系统自动安全更新（unattended-upgrades / dnf-automatic）。
+# 公网机器长期最大风险是"忘记打补丁的已知漏洞"，只提示不阻断。
+check_automatic_updates() {
+  AUTO_UPDATES_OK=0
+  if command -v apt >/dev/null 2>&1; then
+    if grep -rqsE 'APT::Periodic::Unattended-Upgrade[[:space:]]+"1"' /etc/apt/apt.conf.d/ 2>/dev/null; then
+      AUTO_UPDATES_OK=1
+    fi
+  fi
+  if [[ "$AUTO_UPDATES_OK" -ne 1 ]] && command -v dnf >/dev/null 2>&1; then
+    if systemctl is-enabled dnf-automatic.timer >/dev/null 2>&1 || \
+       systemctl is-enabled dnf-automatic-install.timer >/dev/null 2>&1; then
+      AUTO_UPDATES_OK=1
+    fi
+  fi
+  if [[ "$AUTO_UPDATES_OK" -ne 1 ]]; then
+    echo "[警告] 未检测到自动安全更新（unattended-upgrades / dnf-automatic）。" >&2
+    echo "  公网机器建议开启自动安全补丁：Debian/Ubuntu 安装并启用 unattended-upgrades；RHEL/Fedora 启用 dnf-automatic。" >&2
+  else
+    echo "[信息] 已启用操作系统自动安全更新。"
+  fi
+  return 0
+}
+
 print_acl_snippet_cert() {
   local ip="$1" port="$2" fp="$3"
   cat <<JSON
@@ -2185,6 +2695,7 @@ print_acl_snippet_cert() {
             "RegionID": ${REGION_ID},
             "HostName": "${ip}",
             "DERPPort": ${port},
+            "STUNPort": ${STUN_PORT},
             "CertName": "sha256-raw:${fp}"
           }
         ]
@@ -2196,40 +2707,11 @@ print_acl_snippet_cert() {
 JSON
 }
 
-print_acl_snippet_insecure() {
-  cat <<JSON
-==================== 备用方案（不推荐）：使用自签 + InsecureForTests 的 derpMap 片段 ====================
-// 注意：仅在无法使用 CertName 指纹时使用该片段，并设置 "InsecureForTests": true
-{
-  "derpMap": {
-    "OmitDefaultRegions": false,
-    "Regions": {
-      "${REGION_ID}": {
-        "RegionID": ${REGION_ID},
-        "RegionCode": "${REGION_CODE}",
-        "RegionName": "${REGION_NAME}",
-        "Nodes": [
-          {
-            "Name": "${REGION_ID}a",
-            "RegionID": ${REGION_ID},
-            "HostName": "${IP_ADDR}",
-            "DERPPort": ${DERP_PORT},
-            "InsecureForTests": true
-          }
-        ]
-      }
-    }
-  }
-}
-====================================================================================================================
-JSON
-}
-
 print_client_verify_steps() {
   cat <<EOF
 ============================== 客户端验证步骤（在同一 Tailnet 的任意设备上执行） ==============================
 1) 更新 ACL：把上面的 derpMap 片段粘贴到管理后台 Access Controls 并保存；
-   - 若你修改了端口，请同步更新 "DERPPort"。
+   - 若你修改了端口，请同步更新 "DERPPort" 与 "STUNPort"。
    - 保存后等待 10~60 秒，客户端会自动拉取最新 derpMap。
 
 2) 在客户端验证：
@@ -2252,10 +2734,33 @@ print_client_verify_steps() {
 4) 常见排查：
    - derper 启动失败：journalctl -u derper -f 查看报错（证书路径/端口占用/参数）。
    - 证书文件名：derper manual 模式读取 /opt/derper/certs/<公网IP>.crt 与 .key。
-   - 客户端未走你的 DERP：确认 derpMap 已保存、HostName 为公网 IP、（若未使用 CertName）InsecureForTests 已设置。
+   - 客户端未走你的 DERP：确认 derpMap 已保存、HostName 为公网 IP、CertName 指纹与在线证书一致。
    - 自动重签会改变 CertName：请先更新 ACL 再重启服务，或接受短暂中断后粘贴新指纹。
    - 端口被拦截：确认云安全组/本机防火墙已放行 ${DERP_PORT}/tcp 与 ${STUN_PORT}/udp。
 =========================================================================================================
+EOF
+}
+
+# 建议：约束本服务器节点在 Tailnet 内的身份。Tailscale 默认 ACL 全通，
+# 若这台公网 DERP 机器被攻破，攻击者将获得一个可访问整个 Tailnet 的节点身份；
+# 打 tag 并最小授权后，"中继被攻破 ≠ 内网失守"。
+print_server_node_acl_advice() {
+  cat <<'EOF'
+==================== 建议：约束本服务器节点在 Tailnet 内的身份（重要） ====================
+Tailscale 默认 ACL 是全通的：如果这台公网机器被攻破，攻击者会获得一个
+可访问整个 Tailnet 的节点身份。建议给服务器打 tag 并最小授权：
+
+1) 在本机执行（或在管理后台 Machines 页给该节点打 tag）：
+     sudo tailscale set --tags=tag:derper-server
+
+2) 在管理后台 Access Controls 中声明 tag 所有者：
+     "tagOwners": {
+       "tag:derper-server": ["autogroup:admin"]
+     }
+
+3) 不要在任何放行规则里把 "tag:derper-server" 写成 "src"；
+   确需从服务器访问内网资源时，再加最小规则（如仅允许访问特定设备/端口）。
+====================================================================================
 EOF
 }
 
@@ -2284,8 +2789,8 @@ health_check_report() {
   if [[ ${#missing_tools[@]} -gt 0 ]]; then
     echo "[提示] 健康检查建议安装以下工具以获得完整功能：${missing_tools[*]}" >&2
   fi
-  
-  detect_public_ip || true
+
+  infer_ip_from_existing_deployment || true
   validate_settings || true
   check_tailscale_status
   check_derper_status
@@ -2340,6 +2845,13 @@ health_check_report() {
     echo "ℹ️  资源：未发现 derper 进程，略过内存统计"
   fi
 
+  # 主机层面暴露面与自动补丁状态（只提示，不影响退出码）
+  check_extra_attack_surface || true
+  if [[ -n "${EXTRA_LISTENERS:-}" ]]; then
+    echo "⚠️  暴露面：除 DERP 外仍有面向非回环地址的 TCP 监听（${EXTRA_LISTENERS}），建议单机单用途"
+  fi
+  check_automatic_updates || true
+
   # 导出 Prometheus 文本（可被 node_exporter textfile collector 收集）
   if [[ -n "${METRICS_TEXTFILE}" ]]; then
     if write_prometheus_metrics "${METRICS_TEXTFILE}" "$days_left" "$rss_kb"; then
@@ -2360,10 +2872,17 @@ write_prometheus_metrics() {
     echo "[警告] 无法在指标目录创建安全临时文件：${dir}" >&2
     return 1
   fi
+  local overall=0 cert_live=0
+  if health_is_ok; then overall=1; fi
+  if [[ "${LIVE_CERT_CHECKED:-0}" -eq 1 && "${CERT_LIVE_MATCH:-0}" -eq 1 ]]; then cert_live=1; fi
   if ! {
     echo "# HELP derper_up Whether derper service is up (1)"
     echo "# TYPE derper_up gauge"
     [[ $DERPER_RUNNING -eq 1 ]] && echo "derper_up 1" || echo "derper_up 0"
+
+    echo "# HELP derper_healthy Whether all derper health checks pass (1)"
+    echo "# TYPE derper_healthy gauge"
+    echo "derper_healthy $overall"
 
     echo "# HELP derper_tls_listen TLS port listen state"
     echo "# TYPE derper_tls_listen gauge"
@@ -2392,6 +2911,10 @@ write_prometheus_metrics() {
     echo "# HELP derper_desired_config_ok Whether deployed unit matches requested script parameters"
     echo "# TYPE derper_desired_config_ok gauge"
     [[ $DESIRED_CONFIG_OK -eq 1 ]] && echo "derper_desired_config_ok 1" || echo "derper_desired_config_ok 0"
+
+    echo "# HELP derper_cert_live_match Whether live TLS certificate matches disk certificate (0 = mismatch or not checked)"
+    echo "# TYPE derper_cert_live_match gauge"
+    echo "derper_cert_live_match $cert_live"
 
     echo "# HELP derper_process_rss_bytes Total RSS of derper process in bytes"
     echo "# TYPE derper_process_rss_bytes gauge"
@@ -2457,8 +2980,7 @@ uninstall_derper() {
       rm -f /etc/systemd/system/tailscaled.socket.d/10-derper-localapi.conf || true
       rmdir /etc/systemd/system/tailscaled.socket.d 2>/dev/null || true
       if command -v systemctl >/dev/null 2>&1; then
-        systemctl daemon-reload 2>/dev/null || true
-        systemctl restart tailscaled.socket 2>/dev/null || true
+        restart_tailscaled_socket_unit || true
       fi
     fi
     # 根据已识别的服务用户给出更准确的清理提示
@@ -2647,7 +3169,8 @@ EOT
     read -r -p "确认执行？(yes/no): " final_confirm || { echo "[中止] 输入已结束。" >&2; return 1; }
     
     if [[ "$final_confirm" == "yes" ]]; then
-      # 使用数组安全执行，彻底避免 shell 注入
+      # exec 会替换当前进程，EXIT trap 不会运行；先丢掉临时目录避免泄漏
+      release_tmpdir
       exec "${exec_args[@]}"
     else
       echo "[信息] 已取消执行，命令已保存到 derper_deploy_cmd.sh"
@@ -2670,6 +3193,15 @@ service_needs_reconcile() {
     { [[ "${LIVE_CERT_CHECKED:-0}" -eq 1 ]] && [[ "${CERT_LIVE_MATCH:-0}" -ne 1 ]]; }
 }
 
+# 丢掉部署临时目录。exec 替换进程时 EXIT trap 不会运行，向导在 exec 前必须调用。
+release_tmpdir() {
+  if [[ -n "${_tmpdir:-}" && -d "${_tmpdir}" ]]; then
+    rm -rf "${_tmpdir}"
+  fi
+  trap - EXIT
+  _tmpdir=""
+}
+
 main() {
   # 创建安全临时目录（防止 /tmp 可预测路径符号链接攻击，CWE-377）
   _tmpdir=$(mktemp -d /tmp/derper-deploy.XXXXXXXXXX)
@@ -2683,6 +3215,13 @@ main() {
   fi
   
   parse_args "$@"
+
+  # 参数组合校验：--purge 需配合 --uninstall、--metrics-textfile 需配合 --health-check、
+  # --force/--repair/--uninstall/--check 等互斥组合直接报错，避免静默取分支或选项被忽略。
+  if ! validate_arg_combos; then
+    echo "[错误] 参数组合不合法，请检查选项组合。" >&2
+    exit 1
+  fi
 
   if [[ "${wizard_mode}" -eq 1 ]]; then
     deployment_wizard
@@ -2711,9 +3250,14 @@ main() {
   check_os_environment
 
   # 探测 IP 与校验参数（即使非 root 也可做检查）
-  # --check/--health-check：IP 探测可容错；但参数校验失败时最终必须非 0 退出
+  # --health-check（cron）：不打外网，优先从已部署 unit 推断 IP
+  # --check/--dry-run：IP 探测可容错；但参数校验失败时最终必须非 0 退出
   local check_validate_failed=0
-  detect_public_ip || true
+  if [[ "${HEALTH_CHECK}" -eq 1 ]]; then
+    infer_ip_from_existing_deployment || true
+  else
+    detect_public_ip || true
+  fi
   if ! validate_settings; then
     check_validate_failed=1
     if [[ "${DRY_RUN}" -ne 1 && "${CHECK_ONLY}" -ne 1 && "${HEALTH_CHECK}" -ne 1 ]]; then
@@ -2781,6 +3325,15 @@ main() {
       echo "- 服务管理器：未检测到 systemd（将无法写入 systemd 服务，请改用手动或其他服务管理器）"
     fi
 
+    echo "- 主机加固状态："
+    check_extra_attack_surface || true
+    if [[ -n "${EXTRA_LISTENERS:-}" ]]; then
+      echo "  * 暴露面：除 DERP 外仍有非回环 TCP 监听：${EXTRA_LISTENERS}（建议单机单用途）"
+    else
+      echo "  * 暴露面：未发现除 DERP 端口外的非回环 TCP 监听"
+    fi
+    check_automatic_updates || true
+
     echo "[检查结束] 使用 --repair 修复配置，或 --force 全量重装；若一切就绪可直接跳过。"
     if [[ "$check_validate_failed" -eq 1 ]]; then
       return 1
@@ -2826,10 +3379,7 @@ main() {
     if [[ "$need_derper_install" -eq 1 ]]; then
       install_derper
     fi
-    if [[ $CERT_PRESENT -ne 1 || $CERT_SAN_MATCH -ne 1 || $CERT_EXPIRY_OK -ne 1 || ${CERT_NAMING_OK:-0} -ne 1 ]]; then
-      echo "[警告] 即将重签证书：CertName 指纹会变化，请在 ACL 更新前预期短暂中断。" >&2
-      generate_selfsigned_cert
-    fi
+    ensure_compatible_certs || exit 1
     check_port_conflicts
     write_systemd_service
     print_firewall_tips
@@ -2842,39 +3392,10 @@ main() {
       install_deps
       install_derper; changed=1; service_reload_needed=1
     fi
-    if [[ $CERT_PRESENT -ne 1 || $CERT_SAN_MATCH -ne 1 || $CERT_EXPIRY_OK -ne 1 || ${CERT_NAMING_OK:-0} -ne 1 ]]; then
-      command -v openssl >/dev/null 2>&1 || install_deps
-      if [[ ${CERT_NAMING_OK:-0} -ne 1 && $CERT_PRESENT -eq 1 ]]; then
-        echo "[信息] 检测到旧证书命名（非 <IP>.crt/.key），将迁移为上游 derper manual 模式兼容命名。"
-      fi
-      if [[ $CERT_PRESENT -eq 1 && $CERT_SAN_MATCH -eq 1 && $CERT_EXPIRY_OK -eq 1 && ${CERT_NAMING_OK:-0} -ne 1 ]]; then
-        # 仅命名不兼容：迁移复制到上游文件名，尽量保留指纹避免无谓 ACL 变更
-        local old_cert old_key new_cert new_key
-        old_cert=$(resolve_disk_cert_pem || true)
-        old_key=$(resolve_disk_key_pem || true)
-        new_cert=$(derper_manual_cert_file)
-        new_key=$(derper_manual_key_file)
-        if [[ -n "$old_cert" && -n "$old_key" && -f "$old_cert" && -f "$old_key" ]]; then
-          mkdir -p "${INSTALL_DIR}/certs"
-          cp -a "$old_cert" "$new_cert"
-          cp -a "$old_key" "$new_key"
-          ln -sfn "$(basename "$new_cert")" "${INSTALL_DIR}/certs/fullchain.pem"
-          ln -sfn "$(basename "$new_key")"  "${INSTALL_DIR}/certs/privkey.pem"
-          ln -sfn "$(basename "$new_cert")" "${INSTALL_DIR}/certs/cert.pem"
-          ln -sfn "$(basename "$new_key")"  "${INSTALL_DIR}/certs/key.pem"
-          chmod 600 "$new_key"
-          chmod 644 "$new_cert"
-          echo "[信息] 已迁移证书到上游命名：${new_cert} / ${new_key}"
-          CERT_NAMING_OK=1
-          changed=1; service_reload_needed=1
-        else
-          echo "[警告] 即将重签证书：CertName 指纹会变化，请同步更新 ACL。" >&2
-          generate_selfsigned_cert; changed=1; service_reload_needed=1
-        fi
-      else
-        echo "[警告] 即将重签证书：CertName 指纹会变化，请同步更新 ACL。" >&2
-        generate_selfsigned_cert; changed=1; service_reload_needed=1
-      fi
+    ensure_compatible_certs || exit 1
+    if [[ ${CERTS_CHANGED:-0} -eq 1 ]]; then
+      changed=1
+      service_reload_needed=1
     fi
     if service_needs_reconcile "$service_reload_needed"; then
       check_port_conflicts
@@ -2888,6 +3409,13 @@ main() {
     runtime_checks
   fi
 
+  finalize_deployment_report || exit 1
+}
+
+# 部署收尾：输出基于 CertName 的安全 derpMap 与验证步骤。
+# 若无法取得证书指纹，宁可失败并要求排查 TLS，也不输出 InsecureForTests 配置：
+# 上游明确说明该字段仅用于单元测试，用户不应在生产配置中设置。
+finalize_deployment_report() {
   local FP
   FP=$(live_cert_sha256_raw || true)
   if [[ -z "$FP" ]]; then FP=$(journal_certname_raw || true); fi
@@ -2895,13 +3423,10 @@ main() {
   if [[ -n "$FP" ]]; then
     print_acl_snippet_cert "${IP_ADDR}" "${DERP_PORT}" "$FP"
     echo "[信息] 已基于实际在线证书指纹生成片段：sha256-raw:${FP}"
-  else
-    print_acl_snippet_insecure
-    echo "[提示] 未能获取证书指纹（可能端口未就绪或缺少 openssl），已回退到 InsecureForTests 片段。"
-  fi
-  print_client_verify_steps
+    print_client_verify_steps
+    print_server_node_acl_advice
 
-  cat <<INFO
+    cat <<INFO
 完成：DERP 服务已部署/修复并尝试运行。
 - 服务：systemctl status derper
 - 日志：journalctl -u derper -f
@@ -2911,6 +3436,25 @@ main() {
 在 Tailscale 后台粘贴 derpMap 后，客户端数十秒内会自动下发。
 若本次重签了证书，请立即用新的 CertName 更新 ACL，避免短暂中断后无法接入。
 INFO
+    return 0
+  fi
+
+  cat >&2 <<EOT
+[错误] 部署步骤已执行，但无法获取证书指纹，无法生成基于 CertName 的安全 derpMap。
+
+为安全起见，脚本不会输出 InsecureForTests 配置：
+上游明确说明该字段仅用于单元测试，用户不应设置（设置后将关闭 TLS 证书校验，
+等同于明文传输，参考 https://github.com/tailscale/tailscale/blob/main/tailcfg/derpmap.go）。
+
+请先排查 TLS 后再重试：
+  1) systemctl status derper && journalctl -u derper -n 100（确认服务与端口）
+  2) ss -tlnp | grep ${DERP_PORT}（确认 DERP TLS 端口在监听）
+  3) openssl s_client -connect ${IP_ADDR}:${DERP_PORT} -servername ${IP_ADDR} -showcerts（确认握手与证书）
+  4) 确认本机已安装 openssl（脚本依赖它计算指纹）
+
+修复后重新运行本脚本（幂等），即可生成安全 derpMap 片段。
+EOT
+  return 1
 }
 
 if [[ "${DERPER_TEST_MODE:-0}" != "1" ]]; then

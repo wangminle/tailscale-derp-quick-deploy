@@ -3,7 +3,7 @@
 > This is the detailed English reference. For the simplified Chinese quickstart now used as the main README, go to `../README.md`. For the detailed Chinese reference, see `REFERENCE_CN.md` in this folder.
 
 > **Script File**: `deploy_derper_ip_selfsigned.sh`  
-> **Current Version**: 0.2.7 (2026-07-11)  
+> **Current Version**: 0.2.9 (2026-08-14)  
 > **Show version**: `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
@@ -63,7 +63,7 @@ Note: This mode is only for local functional verification and cannot serve as a 
 - **`-verify-clients` enabled by default**: Script checks if local `tailscaled` is running and logged in before installation
   - ✅ If not ready, script will abort and show login instructions
   - ⚠️ To skip verification, use `--no-verify-clients` (**testing only**)
-  - 🔒 **Version alignment (v0.2.7)**: `-verify-clients` requires derper and tailscaled to be built from the same git revision. When `--derper-version` is not specified, the script auto-aligns the *target* version to the local tailscale version; **if an installed derper binary does not match that target, it is reinstalled** (no extra `--force` required). Override with `--derper-version`.
+  - 🔒 **Version alignment (v0.2.8)**: `-verify-clients` requires derper and tailscaled to be built from the same git revision. When `--derper-version` is not specified, the script first aligns the *target* to the `tailscale commit` reported by `tailscale version` (true same-source); it falls back to a semver tag with a warning when the commit is unavailable. **If an installed derper binary does not match that target, it is reinstalled** (no extra `--force` required). Override with `--derper-version`.
   - 📝 Detection logic:
     - If `tailscale` CLI detected, checks via `tailscale ip` whether Tailnet IP is assigned
     - If CLI not detected, only checks `tailscaled` running status
@@ -203,7 +203,7 @@ Pre-check outputs several key items, their meanings and solutions (in order of a
 - Suggestions (summary of recommended actions)
   - `<Ready: can skip directly>`: No action needed.
   - `Install derper (missing binary)`: Execute formal installation command from "Quick Start".
-  - `--repair`: Only fix config/certificates, don't interrupt available dependencies.
+  - `--repair`: Only fix config/certificates, don't interrupt available dependencies (reinstalls derper if the binary drifts from the aligned target).
   - `--force`: Full reinstall (binary/certificates/service).
 
 Common paths:
@@ -236,12 +236,16 @@ Common paths:
 -V, --version             Print script version and exit
 -h, --help                Show help and exit
 --check / --dry-run       Only perform status and parameter checks, no install/write service/open ports
---repair                  Only fix/rewrite config (systemd/certificates etc.), don't reinstall derper
+--repair                  Only fix/rewrite config (systemd/certificates etc.); by default no derper reinstall
+                          (reinstalls when the installed binary drifts from the aligned target version)
 --force                   Force full reinstall (reinstall derper, re-sign certs, rewrite service)
+--allow-non-global-ip     Allow private/reserved/documentation IPs (intranet testing only;
+                          deployment mode rejects non-globally-routable addresses by default)
 
 # Operations & Maintenance
 --health-check            Only output health check summary (no system changes, for cron/monitoring; config drift/certificate problems return non-zero)
---metrics-textfile <P>    Export health check as Prometheus text metrics to path P (use with node_exporter)
+--metrics-textfile <P>    Export health check as Prometheus text metrics to path P
+                          (requires --health-check; use with node_exporter)
 --uninstall               Stop and uninstall derper systemd service (keep binary and certificates)
 --purge                   With --uninstall: additionally delete installation directory (/opt/derper)
 --purge-all               With --uninstall: on top of --purge, also delete binary, /etc/derper/derper.env, and the script-created tailscaled socket drop-in; firewall rules and user/group accounts require manual confirmation

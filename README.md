@@ -1,7 +1,7 @@
 # Tailscale DERP Quick Deploy Script
 
 > **Language / 语言**: [English](#english) | [中文](#中文)  
-> **Version / 版本**: `0.2.7` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
+> **Version / 版本**: `0.2.9` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ---
 
@@ -35,7 +35,7 @@ This project provides a **fully automated Tailscale DERP relay service deploymen
 
 - ✅ **Idempotent Design**: Safe to run multiple times, automatically detects existing configurations
 - ✅ **Parameter Auto-Adaptation**: Auto-detects new/old derper parameter differences (`-a` vs `-https-port`)
-- ✅ **Smart Repair**: `--repair` mode rewrites config/certs and restarts the service (no derper/Go reinstall)
+- ✅ **Smart Repair**: `--repair` mode rewrites config/certs and restarts the service (no derper/Go reinstall, unless the installed binary drifts from the aligned target version)
 
 #### 2. Security Hardening
 
@@ -155,10 +155,12 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # Use current login user
 
 | Parameter | Description | Default | Example |
 |-----------|-------------|---------|---------|
-| `--ip <IPv4>` | Server public IP | Auto-detect | `--ip 203.0.113.10` |
+| `--ip <IPv4>` | Server public IP (must be globally routable) | Auto-detect | `--ip 203.0.113.10` |
 | `--derp-port <int>` | DERP TLS port | 30399 | `--derp-port 443` |
-| `--stun-port <int>` | STUN UDP port | 3478 | `--stun-port 3478` |
+| `--stun-port <int>` | STUN UDP port (also written to derpMap `STUNPort`) | 3478 | `--stun-port 3478` |
 | `--auto-ufw` | Auto-configure UFW rules | Off | `--auto-ufw` |
+
+> Private/reserved/documentation/multicast addresses are **rejected** in deployment mode; for intranet testing pass `--allow-non-global-ip` explicitly.
 
 **Port Selection Recommendations:**
 - **30399** (default): Avoids conflicts with web services, suitable for multi-service servers
@@ -179,6 +181,7 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # Use current login user
 | `--use-current-user` | Use current login user | ✅ Default | Personal servers, testing |
 | `--dedicated-user` | Create dedicated `derper` user | Off | **Production strongly recommended** |
 | `--user <username>` | Specify existing user | - | Integration (e.g., `nobody`) |
+| `--allow-non-global-ip` | Allow private/reserved/doc IPs | Off | Intranet testing only |
 | `--security-level <level>` | Security hardening level | `standard` | `basic`/`standard`/`paranoid` |
 
 **Security Level Comparison:**
@@ -200,7 +203,7 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # Use current login user
 
 | Parameter | Description | Default | Purpose |
 |-----------|-------------|---------|---------|
-| `--region-id <int>` | ACL derpMap RegionID | 900 | Unique identifier for your relay node |
+| `--region-id <int>` | ACL derpMap RegionID (must be a JS-safe integer ≤ 2^53-1; 900-999 reserved for user regions) | 900 | Unique identifier for your relay node |
 | `--region-code <string>` | RegionCode | `my-derp` | Short code (displayed in `tailscale status`) |
 | `--region-name <string>` | RegionName | `My IP DERP` | Human-readable name |
 
@@ -209,7 +212,7 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # Use current login user
 | Parameter | Description | System Impact | When to Use |
 |-----------|-------------|---------------|-------------|
 | `--check` / `--dry-run` | Check only, no system changes | ❌ None | Diagnose issues, verify parameters |
-| `--repair` | Fix configuration (certs/service) | 🔧 Service restart | Certificate expiry, config drift |
+| `--repair` | Fix configuration (certs/service); reinstalls derper only if the binary drifts from the aligned version | 🔧 Service restart | Certificate expiry, config drift |
 | `--force` | Force complete reinstall | 🔄 Full rebuild | Version upgrade, complete reset |
 
 ##### Operations & Monitoring
@@ -217,15 +220,17 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # Use current login user
 | Parameter | Description | Output | Use Case |
 |-----------|-------------|--------|----------|
 | `--health-check` | Output health status summary | Text + exit code | cron periodic checks, alerting |
-| `--metrics-textfile <path>` | Export Prometheus metrics | `.prom` file | With node_exporter monitoring |
+| `--metrics-textfile <path>` | Export Prometheus metrics (requires `--health-check`) | `.prom` file | With node_exporter monitoring |
 
 **Prometheus Metrics Example:**
 
 ```prometheus
 derper_up 1                          # Service running status
+derper_healthy 1                     # All health checks pass (0 on any failure)
 derper_tls_listen 1                  # TLS port listening
 derper_stun_listen 1                 # STUN port listening
 derper_cert_days_remaining 287       # Certificate remaining days
+derper_cert_live_match 1             # Live certificate matches disk certificate
 derper_verify_clients 1              # Client verification enabled in deployed unit
 derper_desired_config_ok 1           # Deployed unit matches requested parameters
 derper_process_rss_bytes 3145728     # Process memory usage (bytes)
@@ -460,6 +465,21 @@ fi
    - Once `CertName` is configured in ACL, subsequent certificate replacement (re-signing, rotation) will cause connection failures
    - Solution: Re-run script to get new fingerprint, update ACL
 
+4. **Upstream Limitations of Self-Hosted DERP** (from `cmd/derper/README.md`):
+   - Self-hosted DERP **does not support** cross-Tailnet/shared-node scenarios where nodes join multiple Tailnets.
+   - Do **not** place the relay behind a generic HTTP reverse proxy or a global load balancer (DERP traffic must terminate directly at derper).
+   - For production, prefer a host with **both static IPv4 and static IPv6**; changing the IP breaks the `HostName`/certificate pin.
+   - Use `derpprobe` for protocol-level monitoring of your DERP node, in addition to this script's health checks.
+   - A self-signed certificate is verified via `CertName` fingerprint pinning only; it is not suitable for browser-facing services.
+
+5. **Host & Tailnet Hardening** (the real risk of a public relay is the host itself):
+   - Cloud security group inbound: only `DERP TLS` + `STUN` ports; never open `22/tcp` to `0.0.0.0/0`.
+   - SSH preferably via Tailscale only (keep the cloud VNC/console as fallback), or source-restricted with password auth disabled.
+   - Do **not** restrict egress: tailscaled needs the control plane and official DERP/STUN probes.
+   - Single-purpose host: run only derper + tailscaled; enable automatic security updates (`unattended-upgrades` / `dnf-automatic`).
+   - Tailscale ACLs are allow-all by default: tag this server (e.g. `tag:derper-server`) and grant it no `src` access, so "relay compromise ≠ tailnet compromise".
+   - The script's deploy/check/health-check runs report extra non-loopback listeners and auto-update status; watch `journalctl -u derper` for `-verify-clients` rejections.
+
 ---
 
 ### 🎓 Summary
@@ -513,7 +533,7 @@ Whether you're an **individual user quickly setting up a testing environment** o
 
 - ✅ **幂等设计**：多次运行安全，自动识别已有配置
 - ✅ **参数自适应**：自动检测新旧版本 derper 参数差异（`-a` vs `-https-port`）
-- ✅ **智能修复**：`--repair` 仅重写配置/证书并重启服务，不重装 derper/Go
+- ✅ **智能修复**：`--repair` 仅重写配置/证书并重启服务，不重装 derper/Go（已部署二进制与目标版本不一致时除外）
 
 #### 2. 安全加固
 
@@ -633,10 +653,12 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # 使用当前登录用户
 
 | 参数 | 说明 | 默认值 | 示例 |
 |------|------|--------|------|
-| `--ip <IPv4>` | 服务器公网 IP | 自动探测 | `--ip 203.0.113.10` |
+| `--ip <IPv4>` | 服务器公网 IP（必须全局可路由） | 自动探测 | `--ip 203.0.113.10` |
 | `--derp-port <int>` | DERP TLS 端口 | 30399 | `--derp-port 443` |
-| `--stun-port <int>` | STUN UDP 端口 | 3478 | `--stun-port 3478` |
+| `--stun-port <int>` | STUN UDP 端口（同时写入 derpMap 的 STUNPort） | 3478 | `--stun-port 3478` |
 | `--auto-ufw` | 自动配置 UFW 规则 | 关闭 | `--auto-ufw` |
+
+> 部署模式会**拒绝**私有/保留/文档/组播等非公网地址；内网测试请显式添加 `--allow-non-global-ip`。
 
 **端口选择建议：**
 - **30399**（默认）：避免与 Web 服务冲突，适合多服务器
@@ -657,6 +679,7 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # 使用当前登录用户
 | `--use-current-user` | 使用当前登录用户 | ✅ 默认 | 个人服务器、测试环境 |
 | `--dedicated-user` | 创建专用 `derper` 用户 | 关闭 | **生产环境强烈推荐** |
 | `--user <username>` | 指定已有用户 | - | 集成到现有环境（如 `nobody`） |
+| `--allow-non-global-ip` | 允许私有/保留/文档等非公网 IP | 关闭 | 仅内网测试 |
 | `--security-level <level>` | 安全加固级别 | `standard` | `basic`/`standard`/`paranoid` |
 
 **安全级别对比：**
@@ -678,7 +701,7 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # 使用当前登录用户
 
 | 参数 | 说明 | 默认值 | 用途 |
 |------|------|--------|------|
-| `--region-id <int>` | ACL derpMap 的 RegionID | 900 | 唯一标识你的中继节点 |
+| `--region-id <int>` | ACL derpMap 的 RegionID（须为 JS 安全整数 ≤ 2^53-1；900-999 保留给用户自建区域） | 900 | 唯一标识你的中继节点 |
 | `--region-code <string>` | RegionCode | `my-derp` | 短代码（在 `tailscale status` 中显示） |
 | `--region-name <string>` | RegionName | `My IP DERP` | 人类可读名称 |
 
@@ -687,7 +710,7 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # 使用当前登录用户
 | 参数 | 说明 | 系统影响 | 使用时机 |
 |------|------|----------|----------|
 | `--check` / `--dry-run` | 仅检查，不修改系统 | ❌ 无 | 诊断问题、验证参数 |
-| `--repair` | 修复配置（证书/服务） | 🔧 重启服务 | 证书过期、配置漂移 |
+| `--repair` | 修复配置（证书/服务）；仅当已部署二进制与对齐目标版本不一致时才重装 derper | 🔧 重启服务 | 证书过期、配置漂移 |
 | `--force` | 强制全量重装 | 🔄 完全重建 | 版本升级、彻底重置 |
 
 ##### 运维与监控
@@ -695,15 +718,17 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # 使用当前登录用户
 | 参数 | 说明 | 输出 | 适用场景 |
 |------|------|------|----------|
 | `--health-check` | 输出健康状态摘要 | 文本 + 退出码 | cron 定时检查、告警脚本 |
-| `--metrics-textfile <path>` | 导出 Prometheus 指标 | `.prom` 文件 | 配合 node_exporter 监控 |
+| `--metrics-textfile <path>` | 导出 Prometheus 指标（必须与 `--health-check` 一起使用） | `.prom` 文件 | 配合 node_exporter 监控 |
 
 **Prometheus 指标示例：**
 
 ```prometheus
 derper_up 1                          # 服务是否运行
+derper_healthy 1                     # 全部健康检查是否通过（任一失败为 0）
 derper_tls_listen 1                  # TLS 端口是否监听
 derper_stun_listen 1                 # STUN 端口是否监听
 derper_cert_days_remaining 287       # 证书剩余天数
+derper_cert_live_match 1             # 在线证书与磁盘证书是否一致
 derper_verify_clients 1              # 已部署 unit 是否启用客户端校验
 derper_desired_config_ok 1           # 已部署 unit 是否与本次目标参数一致
 derper_process_rss_bytes 3145728     # 进程内存占用（字节）
@@ -937,6 +962,21 @@ fi
 3. **证书指纹固定机制**：
    - 一旦在 ACL 中配置 `CertName`，后续证书更换（如重签、轮换）会导致连接失败
    - 解决方法：重新运行脚本获取新指纹，更新 ACL
+
+4. **自建 DERP 的上游限制**（摘自 `cmd/derper/README.md`）：
+   - 自建 DERP **不支持**部分跨 Tailnet/节点分享（多 Tailnet 加入）场景。
+   - 不要把中继放在普通 HTTP 反向代理或全局负载均衡后面（DERP 流量必须直连 derper）。
+   - 生产环境建议使用**同时具备静态 IPv4 与静态 IPv6** 的服务器；更换 IP 会破坏 HostName/证书固定。
+   - 除本脚本健康检查外，建议使用 `derpprobe` 做协议级监控。
+   - 自签证书仅通过 `CertName` 指纹固定校验，不适用于面向浏览器的服务。
+
+5. **主机与 Tailnet 加固**（公网中继的真正风险在主机本身）：
+   - 云安全组入方向只放行 DERP TLS + STUN 两个端口，`22/tcp` 绝不对 `0.0.0.0/0` 开放。
+   - SSH 优先只走 Tailscale（保留云厂商 VNC/控制台兜底），或限源 IP + 禁用密码登录。
+   - 出方向不要收紧：tailscaled 需要访问控制面与官方 DERP/STUN 探测。
+   - 单机单用途：只跑 derper + tailscaled；开启自动安全更新（`unattended-upgrades` / `dnf-automatic`）。
+   - Tailscale 默认 ACL 全通：给本服务器打 tag（如 `tag:derper-server`）且不授予任何 `src` 放行，“中继被攻破 ≠ 内网失守”。
+   - 脚本的部署/检查/健康检查会自动报告非回环额外监听端口与自动更新状态；定期查看 `journalctl -u derper` 的 `-verify-clients` 拒绝记录。
 
 ---
 

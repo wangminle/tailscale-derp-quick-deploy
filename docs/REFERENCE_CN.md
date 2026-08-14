@@ -3,7 +3,7 @@
 > 本文是中文的详细技术参考。主仓库首页 `README.md` 为精简版中文快速上手；英文详细参考见同目录的 `REFERENCE_EN.md`。
 
 > **脚本文件**：`deploy_derper_ip_selfsigned.sh`  
-> **当前版本**：0.2.7（2026-07-11）  
+> **当前版本**：0.2.9（2026-08-14）  
 > **查看版本**：`bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
@@ -71,7 +71,7 @@ derper -c ./derper.json -hostname 127.0.0.1 -certmode manual -certdir ./certs \
 - **默认启用 `-verify-clients`**：脚本会在安装前检查本机 `tailscaled` 是否运行且已登录
   - ✅ 若未就绪，脚本会中止并提示登录方法
   - ⚠️ 若确需跳过校验，可使用 `--no-verify-clients`（**仅限测试环境**）
-  - 🔒 **版本对齐（v0.2.7）**：`-verify-clients` 要求 derper 与 tailscaled 由同一 Git revision 构建。未显式指定 `--derper-version` 时，脚本会自动把目标版本对齐到本机 tailscale 版本；**若已安装 derper 与目标版本不一致，会实际重新安装二进制**（无需额外 `--force`）。可用 `--derper-version` 覆盖。
+  - 🔒 **版本对齐（v0.2.8）**：`-verify-clients` 要求 derper 与 tailscaled 由同一 Git revision 构建。未显式指定 `--derper-version` 时，脚本优先把目标对齐到 `tailscale version` 输出的 `tailscale commit`（真正同源）；取不到 commit 时退化为版本标签并给出警告。**若已安装 derper 与目标不一致，会实际重新安装二进制**（无需额外 `--force`）。可用 `--derper-version` 覆盖。
   - 📝 检测逻辑：
     - 若检测到 `tailscale` CLI，通过 `tailscale ip` 判断是否已分配 Tailnet IP
     - 若未检测到 CLI，则仅依据 `tailscaled` 运行状态判断
@@ -238,7 +238,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 - 建议（建议动作汇总）
   - `<已就绪：可直接跳过>`：无需操作。
   - `安装 derper（缺少二进制）`：执行“快速开始”的正式安装命令。
-  - `--repair`：仅修复配置/证书，不中断可用依赖。
+  - `--repair`：仅修复配置/证书，不中断可用依赖（已部署二进制与对齐目标版本不一致时会重装）。
   - `--force`：全量重装（二进制/证书/服务）。
 
 常见路线：
@@ -271,12 +271,16 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 -V, --version             打印脚本版本并退出
 -h, --help                显示帮助并退出
 --check / --dry-run       仅进行状态与参数检查，不执行安装/写服务/放行等
---repair                  仅修复/重写配置（systemd/证书等），不重装 derper
+--repair                  仅修复/重写配置（systemd/证书等），默认不重装 derper
+                          （已部署二进制与对齐目标版本不一致时会重装）
 --force                   强制全量重装（重装 derper、重签证书、重写服务）
+--allow-non-global-ip     允许私有/保留/文档等非公网 IP（仅内网测试；
+                          正式部署默认拒绝非全局可路由地址）
 
 # 运行与维护
 --health-check            仅输出健康检查摘要（不更改系统，可用于 cron/监控；配置漂移/证书异常会返回非 0）
---metrics-textfile <P>    将健康检查导出为 Prometheus 文本指标到路径 P（结合 node_exporter 使用）
+--metrics-textfile <P>    将健康检查导出为 Prometheus 文本指标到路径 P
+                          （必须与 --health-check 一起使用；结合 node_exporter 使用）
 --uninstall               停止并卸载 derper 的 systemd 服务（保留二进制与证书）
 --purge                   搭配 --uninstall：额外删除安装目录（/opt/derper）
 --purge-all               搭配 --uninstall：在 --purge 基础上同时删除二进制、/etc/derper/derper.env 和脚本创建的 tailscaled socket drop-in；防火墙规则和用户/组账户需手动确认

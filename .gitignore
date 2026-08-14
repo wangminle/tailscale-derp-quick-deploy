@@ -12,6 +12,7 @@ records/
 # 测试部署生成的临时文件
 test-deploy/
 *.test.sh
+derper_deploy_cmd.sh
 
 # ============ 系统文件 ============
 # macOS
@@ -56,6 +57,9 @@ $RECYCLE.BIN/
 
 # VS Code（完全忽略，不上传到 GitHub）
 .vscode/
+
+# Claude Code 本地配置
+.claude/
 
 # JetBrains IDEs
 .idea/
