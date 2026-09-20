@@ -1,5 +1,38 @@
 # 更新日志
 
+## [0.2.11] - 2026-09-20
+
+### 🔧 Bug 修复
+
+1. **证书 SAN 改为精确比对，extras 失败不再回滚已验证部署**
+   - SAN 按逗号拆项精确匹配 IP，避免 `3.4.5.6` 命中 `13.4.5.6`。
+   - 服务验证通过后立即 `commit_cert_update`；`--tls-connlimit`/cron 失败只报告，不撤销证书。
+   - 卸载删除 `.certs-rollback`；unit 原子写入并拒绝符号链接；缺 ss/openssl 不再误报启动失败。
+
+2. **超大数值不再靠 Bash 64 位算术做范围校验**
+   - 端口、证书天数、RegionID、`--tls-connlimit` 改为去前导零后的十进制字符串比较，避免 `2^64+443` 一类溢出被当成合法小数。
+
+3. **无 `timeout` 时空数组崩溃；GOPROXY 含 `direct` 时预检过严**
+   - 改走已有 `_timeout_run`，避免 Bash 3.2~4.3 在 `set -u` 下对空数组 `"${runner[@]}"` 崩溃。
+   - GOPROXY 含 `direct` 且代理全不可达时警告并交由 Go 直连，不再中止。
+
+4. **参数互斥与 cron/限流行为对齐实现**
+   - `--install-healthcheck-cron` 与 `--health-check` 互斥；显式 `--tls-connlimit` 不能配只读模式；显式 `0` 移除已装规则。
+   - cron 固化完整部署参数，并用 `printf %q` 转义路径；nftables 改用脚本专属表 `inet derper_tls_connlimit`。
+
+### 📖 文档
+
+5. **README/REFERENCE 与实现对齐**
+   - 补齐 `--cert-days`/`--derper-version`；正式示例改公网 IP 占位符；专用用户示例、证书目录所有权、断链与 `--metrics-textfile` 文案已校正。
+
+### 🧪 测试
+
+- 主套件 `tests/test_deploy_script.sh` 84 项；`tests/test_review_regressions.sh` 14 项。
+- GitHub Actions `.github/workflows/tests.yml` 在 Ubuntu（Bash 5）上跑两套测试。
+- 审查记录见仓库根目录 `task-list.md`（CHK-004～CHK-007）。
+
+---
+
 ## [0.2.10] - 2026-09-20
 
 ### 🔧 Bug 修复
@@ -584,4 +617,4 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 **更新日期**：2026-09-20
 
-**版本**：0.2.10
+**版本**：0.2.11

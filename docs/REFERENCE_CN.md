@@ -3,7 +3,7 @@
 > 本文是中文的详细技术参考。主仓库首页 `README.md` 为精简版中文快速上手；英文详细参考见同目录的 `REFERENCE_EN.md`。
 
 > **脚本文件**：`deploy_derper_ip_selfsigned.sh`  
-> **当前版本**：0.2.10（2026-09-20）  
+> **当前版本**：0.2.11（2026-09-20）  
 > **查看版本**：`bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
@@ -268,14 +268,17 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 --region-name             ACL derpMap 的 RegionName（默认 "My IP DERP"）
 --user <username>         指定运行 derper 的用户（默认：当前登录用户）
                           可指定现有用户（如 nobody、www-data 等）
---use-current-user        使用当前登录用户运行 derper（等价于 --user $USER）
+--use-current-user        使用当前登录用户运行 derper（sudo 下为 $SUDO_USER，否则为当前用户；默认行为）
                           显式指定后不会被非交互 root 默认覆盖
 --dedicated-user          强制创建专用 derper 系统账户（生产推荐）
 --security-level LEVEL    安全加固级别：basic|standard|paranoid（默认 standard）
 --accept-cert-rotation    确认已有证书换指纹及 ACL 更新窗口（--yes 不代替此确认）
 --relax-socket-perms      临时放宽 tailscaled socket 到 0666（不推荐，仅紧急情况；脚本退出时恢复）
---tls-connlimit N         单 IP 并发 DERP TLS 连接上限（nft/iptables connlimit；0 关闭）
+--tls-connlimit N         单 IP 并发 DERP TLS 连接上限（nft/iptables connlimit）
+                          显式传 0 移除已装规则；省略该选项则不改动已有规则
+                          不能与 --health-check/--check/--dry-run 同用
 --install-healthcheck-cron  写入 /etc/cron.d/derper-healthcheck（每 5 分钟 --health-check）
+                          不能与 --uninstall/--health-check/--check/--dry-run 同用
 --yes, --non-interactive  非交互模式；不能代替证书指纹轮换确认
 --derper-version VER      指定 derper 版本（默认 latest），也接受 Git commit
 -V, --version             打印脚本版本并退出
@@ -293,7 +296,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 # 运行与维护
 --health-check            仅输出健康检查摘要（不更改系统，可用于 cron/监控；配置漂移/证书异常会返回非 0）
 --metrics-textfile <P>    将健康检查导出为 Prometheus 文本指标到路径 P
-                          （必须与 --health-check 一起使用；结合 node_exporter 使用）
+                          （必须与 --health-check 或 --install-healthcheck-cron 一起使用；结合 node_exporter 使用）
 --uninstall               停止并卸载 derper 的 systemd 服务（保留二进制与证书；同时删除健康检查 cron 与 --tls-connlimit 规则）
 --purge                   搭配 --uninstall：额外删除安装目录（/opt/derper）
 --purge-all               搭配 --uninstall：在 --purge 基础上同时删除二进制、/etc/derper/derper.env 和脚本创建的 tailscaled socket drop-in；防火墙规则和用户/组账户需手动确认
@@ -424,8 +427,8 @@ SystemCallErrorNumber=EPERM       # 拒绝返回 EPERM 而非杀死进程
 
 ### 证书安全
 
-- **私钥保护**：`privkey.pem` 设置为 `600`（仅所有者读写）
-- **目录隔离**：证书目录（`/opt/derper/certs`）设置为 `750`，所有权为 `derper:derper`
+- **私钥保护**：密钥文件权限 `640`（root + 服务组可读）
+- **目录隔离**：证书目录（`/opt/derper/certs`）权限 `750`，所有权为 `root:<服务组>`（服务账户只读）
 - **SHA256 校验**：Go 工具链下载前进行完整性检查
 
 ### 网络安全

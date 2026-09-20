@@ -26,6 +26,8 @@ test_commit_versions() {
   DERPER_VERSION=abcdef1234567890abcdef1234567890abcdef12
   get_installed_derper_version() { echo '1.2.3-0.20260920000000-abcdef123456'; }
   derper_binary_needs_install && fail '完整 commit 未匹配 12 位伪版本'
+  DERPER_VERSION=ABCDEF1234567890ABCDEF1234567890ABCDEF12
+  derper_binary_needs_install && fail '大写 commit 未匹配 12 位伪版本'
   get_installed_derper_version() { echo 1.102.4; }
   resolve_derper_module_version() { echo v1.102.4; }
   derper_binary_needs_install && fail '发布标签未匹配 commit'
@@ -61,6 +63,8 @@ test_certificate_rollback() {
   printf oldcert > "$INSTALL_DIR/certs/$IP_ADDR.crt"
   printf oldkey > "$INSTALL_DIR/certs/$IP_ADDR.key"
   printf oldunit > "$SERVICE_PATH"
+  # CI 环境存在真实 systemctl（非 root 时 daemon-reload 被拒），必须 stub 隔离
+  systemctl() { [[ "$1" == daemon-reload ]]; }
   begin_cert_update
   printf newunit > "$SERVICE_PATH"
   printf newcert > "$INSTALL_DIR/certs/$IP_ADDR.crt"
@@ -82,6 +86,8 @@ test_real_certificate_write_failure() {
   INSTALL_DIR="$case_tmp/install"; IP_ADDR=203.0.113.10; CERT_DAYS=365
   harden_cert_dir() { :; }
   generate_derper_config() { :; }
+  # 回滚路径同样会触发 daemon-reload，保持与 CI 一致的 stub
+  systemctl() { [[ "$1" == daemon-reload ]]; }
   generate_selfsigned_cert >/dev/null
   commit_cert_update
   local old_cert old_key
@@ -96,6 +102,22 @@ test_real_certificate_write_failure() {
   [[ "$(sha256_hex < "$INSTALL_DIR/certs/$IP_ADDR.crt")" == "$old_cert" ]] || fail '写入失败改变旧证书'
   [[ "$(sha256_hex < "$INSTALL_DIR/certs/$IP_ADDR.key")" == "$old_key" ]] || fail '写入失败改变旧私钥'
   [[ -L "$INSTALL_DIR/certs/fullchain.pem" ]] || fail '回滚丢失链接'
+}
+test_recover_restart_failure_is_warning() {
+  INSTALL_DIR="$case_tmp/install"; mkdir -p "$INSTALL_DIR/certs"
+  printf old > "$INSTALL_DIR/certs/cert"
+  printf oldunit > "$SERVICE_PATH"
+  systemctl() { [[ "$1" == is-active || "$1" == daemon-reload ]]; }
+  begin_cert_update
+  systemctl() {
+    case "$1" in
+      daemon-reload) return 0 ;;
+      restart) return 1 ;;
+      *) return 1 ;;
+    esac
+  }
+  verify_restored_service() { return 1; }
+  recover_cert_update || fail 'restart failure after cert restore should warn, not abort'
 }
 test_interrupted_rollback() {
   INSTALL_DIR="$case_tmp/install"; mkdir -p "$INSTALL_DIR/certs"
@@ -132,11 +154,15 @@ test_module_query_preserves_network_settings() {
 test_cleanup_restarts_previously_running_service() {
   INSTALL_DIR="$case_tmp/install"; mkdir -p "$INSTALL_DIR/certs"
   printf old > "$INSTALL_DIR/certs/cert"
-  systemctl() { [[ "$1" == is-active ]]; }
+  printf oldunit > "$SERVICE_PATH"
+  systemctl() { [[ "$1" == is-active || "$1" == daemon-reload ]]; }
   begin_cert_update
   systemctl() {
-    if [[ "$1" == restart ]]; then touch "$case_tmp/restarted"; return 0; fi
-    return 1
+    case "$1" in
+      restart) touch "$case_tmp/restarted"; return 0 ;;
+      daemon-reload) return 0 ;;
+      *) return 1 ;;
+    esac
   }
   read_derper_unit_content() { echo "ExecStart=derper -hostname 203.0.113.99 -a :30443 -stun-port 40000"; }
   service_verified_running() {
@@ -160,7 +186,7 @@ test_legacy_symlink_migration() {
   [[ -f "$INSTALL_DIR/certs/$IP_ADDR.crt" && ! -L "$INSTALL_DIR/certs/$IP_ADDR.crt" ]] || fail '迁移证书形成链接环'
   [[ "$(cat "$INSTALL_DIR/certs/$IP_ADDR.key")" == oldkey ]] || fail '迁移私钥内容改变'
 }
-for test_name in test_legacy_symlink_migration test_cleanup_restarts_previously_running_service test_new_root_default test_real_certificate_write_failure test_interrupted_rollback test_rotation_decline_preserves_certificate test_module_query_preserves_network_settings test_explicit_user test_existing_user test_commit_versions test_certificate_resume test_rotation_requires_ack test_certificate_rollback; do
+for test_name in test_legacy_symlink_migration test_cleanup_restarts_previously_running_service test_new_root_default test_real_certificate_write_failure test_interrupted_rollback test_rotation_decline_preserves_certificate test_module_query_preserves_network_settings test_explicit_user test_existing_user test_commit_versions test_certificate_resume test_rotation_requires_ack test_certificate_rollback test_recover_restart_failure_is_warning; do
   (
     DERPER_TEST_MODE=1 source "$SCRIPT"
     case_tmp=$(mktemp -d)

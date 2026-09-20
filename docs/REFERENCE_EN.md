@@ -3,7 +3,7 @@
 > This is the detailed English reference. For the simplified Chinese quickstart now used as the main README, go to `../README.md`. For the detailed Chinese reference, see `REFERENCE_CN.md` in this folder.
 
 > **Script File**: `deploy_derper_ip_selfsigned.sh`  
-> **Current Version**: 0.2.10 (2026-09-20)  
+> **Current Version**: 0.2.11 (2026-09-20)  
 > **Show version**: `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
@@ -111,7 +111,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 ```bash
 sudo bash scripts/deploy_derper_ip_selfsigned.sh \
   --ip <your-public-ip> \
-  --use-current-user \
+  --dedicated-user \
   --derp-port 30399 --stun-port 3478 --auto-ufw
 ```
 
@@ -233,14 +233,17 @@ Common paths:
 --region-name             ACL derpMap RegionName (default "My IP DERP")
 --user <username>         Specify which user runs derper (default: current login user)
                           Can specify existing users (e.g., nobody, www-data)
---use-current-user        Use current login user to run derper (equivalent to --user $USER; default)
+--use-current-user        Use the current login user to run derper (under sudo this is $SUDO_USER; default)
                           An explicit flag is never overridden by the non-interactive root default
 --dedicated-user          Force a dedicated derper system account (recommended for production)
 --security-level LEVEL    Hardening level: basic|standard|paranoid (default standard)
 --accept-cert-rotation    Acknowledge fingerprint change and ACL cutover (--yes does not replace this)
 --relax-socket-perms      Temporarily chmod tailscaled socket to 0666 (emergency only; restored on exit)
---tls-connlimit N         Cap concurrent DERP TLS connections per source IP (nft/iptables connlimit; 0=off)
+--tls-connlimit N         Cap concurrent DERP TLS connections per source IP (nft/iptables connlimit)
+                          Explicit 0 removes installed rules; omit the flag to leave existing rules
+                          Incompatible with --health-check/--check/--dry-run
 --install-healthcheck-cron  Write /etc/cron.d/derper-healthcheck (every 5 minutes --health-check)
+                          Incompatible with --uninstall/--health-check/--check/--dry-run
 --yes, --non-interactive  Non-interactive mode; does not confirm certificate rotation
 --derper-version VER      Pin derper version (default latest); also accepts a Git commit
 -V, --version             Print script version and exit
@@ -258,7 +261,7 @@ Common paths:
 # Operations & Maintenance
 --health-check            Only output health check summary (no system changes, for cron/monitoring; config drift/certificate problems return non-zero)
 --metrics-textfile <P>    Export health check as Prometheus text metrics to path P
-                          (requires --health-check; use with node_exporter)
+                          (requires --health-check or --install-healthcheck-cron; use with node_exporter)
 --uninstall               Stop and uninstall derper systemd service (keep binary and certificates; also removes health-check cron and --tls-connlimit rules)
 --purge                   With --uninstall: additionally delete installation directory (/opt/derper)
 --purge-all               With --uninstall: on top of --purge, also delete binary, /etc/derper/derper.env, and the script-created tailscaled socket drop-in; firewall rules and user/group accounts require manual confirmation
@@ -392,8 +395,8 @@ SystemCallErrorNumber=EPERM       # Deny with EPERM instead of killing
 
 ### Certificate Security
 
-- **Private key protection**: `privkey.pem` set to `600` (owner read/write only)
-- **Directory isolation**: Certificate directory (`/opt/derper/certs`) set to `750` with `derper:derper` ownership
+- **Private key protection**: key file mode `640` (root + service group readable)
+- **Directory isolation**: Certificate directory (`/opt/derper/certs`) mode `750`, owned by `root:<service group>` (service account read-only)
 - **SHA256 verification**: Go toolchain downloads are integrity-checked before extraction
 
 ### Network Security

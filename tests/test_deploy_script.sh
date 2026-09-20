@@ -264,6 +264,22 @@ test_cert_san_matches_literal_ip_only() {
     }
     check_cert_status
     [[ $CERT_SAN_MATCH -eq 1 ]] || fail "exact certificate SAN IP should match"
+
+    IP_ADDR="3.4.5.6"
+    openssl() {
+      if [[ " $* " == *" -checkend "* ]]; then return 0; fi
+      printf '%s\n' "X509v3 Subject Alternative Name:" "    IP Address:13.4.5.6"
+    }
+    check_cert_status
+    [[ $CERT_SAN_MATCH -eq 0 ]] || fail "new IP that is a suffix of the old SAN must not match"
+
+    IP_ADDR="13.4.5.6"
+    openssl() {
+      if [[ " $* " == *" -checkend "* ]]; then return 0; fi
+      printf '%s\n' "X509v3 Subject Alternative Name:" "    IP Address:3.4.5.6"
+    }
+    check_cert_status
+    [[ $CERT_SAN_MATCH -eq 0 ]] || fail "old SAN that is a suffix of the new IP must not match"
   )
   ok "certificate SAN matching treats IP dots literally"
 }
@@ -503,6 +519,10 @@ test_derper_binary_needs_reinstall_on_version_mismatch() {
     if derper_binary_needs_install; then
       fail "installed pseudo-version containing the target commit should be considered aligned"
     fi
+    DERPER_VERSION="ABCDEF1234567890ABCDEF12"
+    if derper_binary_needs_install; then
+      fail "uppercase commit must match lowercase pseudo-version revision"
+    fi
     get_installed_derper_version() { echo "1.80.0"; }
     if ! derper_binary_needs_install; then
       fail "plain version without the target commit should require reinstall"
@@ -667,9 +687,11 @@ test_argument_combinations_are_validated() {
   PURGE=0 UNINSTALL=1
   validate_arg_combos || fail "--uninstall alone should be valid"
 
-  PURGE=0 UNINSTALL=0 METRICS_TEXTFILE="/tmp/x.prom" HEALTH_CHECK=0
+  PURGE=0 UNINSTALL=0 METRICS_TEXTFILE="/tmp/x.prom" HEALTH_CHECK=0 INSTALL_HEALTHCHECK_CRON=0
   validate_arg_combos && fail "--metrics-textfile without --health-check must be rejected"
-  METRICS_TEXTFILE="" HEALTH_CHECK=0
+  INSTALL_HEALTHCHECK_CRON=1
+  validate_arg_combos || fail "--metrics-textfile with --install-healthcheck-cron should be valid"
+  METRICS_TEXTFILE="" HEALTH_CHECK=0 INSTALL_HEALTHCHECK_CRON=0
 
   FORCE=1 REPAIR=1
   validate_arg_combos && fail "--force with --repair must be rejected"
@@ -1053,39 +1075,43 @@ test_tls_connlimit_zero_is_noop() {
 }
 
 test_tls_connlimit_iptables_rule() {
-  DERPER_TEST_MODE=1 source "$SCRIPT"
-  TLS_CONNLIMIT=32
-  DERP_PORT=30399
-  local cmds=""
-  command() {
-    if [[ "$1" == -v && "$2" == nft ]]; then return 1; fi
-    if [[ "$1" == -v && "$2" == iptables ]]; then return 0; fi
-    builtin command "$@"
-  }
-  iptables() {
-    cmds+="$*"$'\n'
-    return 0
-  }
-  apply_tls_connlimit || fail "iptables connlimit should apply"
-  echo "$cmds" | grep -q 'connlimit-above 32' || fail "missing connlimit-above, commands: $cmds"
-  echo "$cmds" | grep -q -- '--dport 30399' || fail "missing dport, commands: $cmds"
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    TLS_CONNLIMIT=32
+    DERP_PORT=30399
+    local cmds=""
+    command() {
+      if [[ "$1" == -v && "$2" == nft ]]; then return 1; fi
+      if [[ "$1" == -v && "$2" == iptables ]]; then return 0; fi
+      builtin command "$@"
+    }
+    iptables() {
+      cmds+="$*"$'\n'
+      return 0
+    }
+    apply_tls_connlimit || fail "iptables connlimit should apply"
+    echo "$cmds" | grep -q 'connlimit-above 32' || fail "missing connlimit-above, commands: $cmds"
+    echo "$cmds" | grep -q -- '--dport 30399' || fail "missing dport, commands: $cmds"
+  )
   ok "tls connlimit installs iptables connlimit rule"
 }
 
 test_tls_connlimit_removed_on_uninstall() {
-  DERPER_TEST_MODE=1 source "$SCRIPT"
-  local cmds=""
-  command() {
-    if [[ "$1" == -v && "$2" == nft ]]; then return 1; fi
-    if [[ "$1" == -v && "$2" == iptables ]]; then return 0; fi
-    builtin command "$@"
-  }
-  iptables() {
-    cmds+="$*"$'\n'
-    return 0
-  }
-  remove_tls_connlimit || fail "remove should succeed"
-  echo "$cmds" | grep -q 'DERPER-CONNLIMIT' || fail "remove must target DERPER-CONNLIMIT, got: $cmds"
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local cmds=""
+    command() {
+      if [[ "$1" == -v && "$2" == nft ]]; then return 1; fi
+      if [[ "$1" == -v && "$2" == iptables ]]; then return 0; fi
+      builtin command "$@"
+    }
+    iptables() {
+      cmds+="$*"$'\n'
+      return 0
+    }
+    remove_tls_connlimit || fail "remove should succeed"
+    echo "$cmds" | grep -q 'DERPER-CONNLIMIT' || fail "remove must target DERPER-CONNLIMIT, got: $cmds"
+  )
   ok "tls connlimit chain is removed"
 }
 
@@ -1103,6 +1129,8 @@ test_install_healthcheck_cron_writes_job() {
     [[ -f "$HEALTHCHECK_CRON_PATH" ]] || fail "cron file missing"
     grep -q -- '--health-check' "$HEALTHCHECK_CRON_PATH" || fail "cron must call --health-check"
     grep -q -- '--ip 203.0.113.10' "$HEALTHCHECK_CRON_PATH" || fail "cron must pin --ip"
+    grep -q -- '--derp-port' "$HEALTHCHECK_CRON_PATH" || fail "cron must pin --derp-port"
+    grep -q -- '--stun-port' "$HEALTHCHECK_CRON_PATH" || fail "cron must pin --stun-port"
     grep -q -- '--metrics-textfile' "$HEALTHCHECK_CRON_PATH" || fail "cron must write metrics textfile"
   )
   ok "healthcheck cron file is installed"
@@ -1119,6 +1147,8 @@ test_uninstall_removes_healthcheck_cron() {
     INSTALL_DIR="${local_tmp}/install"
     BIN_PATH="${local_tmp}/derper"
     UNINSTALL=1
+    mkdir -p "${SERVICE_PATH}.certs-rollback/certs"
+    printf leftover-key >"${SERVICE_PATH}.certs-rollback/certs/old.key"
     command() {
       if [[ "$1" == -v && ( "$2" == systemctl || "$2" == nft || "$2" == iptables ) ]]; then return 1; fi
       builtin command "$@"
@@ -1128,18 +1158,22 @@ test_uninstall_removes_healthcheck_cron() {
     require_root() { :; }
     uninstall_derper >/dev/null 2>&1
     [[ ! -e "$HEALTHCHECK_CRON_PATH" ]] || fail "cron file should be removed on uninstall"
+    [[ ! -e "${SERVICE_PATH}.certs-rollback" ]] || fail "certs-rollback backup should be removed on uninstall"
   )
   ok "uninstall removes healthcheck cron"
 }
 
 test_healthcheck_cron_conflicts_with_uninstall() {
-  DERPER_TEST_MODE=1 source "$SCRIPT"
-  INSTALL_HEALTHCHECK_CRON=1 UNINSTALL=1 PURGE=0 FORCE=0 REPAIR=0 DRY_RUN=0 HEALTH_CHECK=0 METRICS_TEXTFILE=""
-  validate_arg_combos && fail "--install-healthcheck-cron with --uninstall must be rejected"
-  UNINSTALL=0
-  parse_args --install-healthcheck-cron
-  [[ "$INSTALL_HEALTHCHECK_CRON" -eq 1 ]] || fail "parse_args should set INSTALL_HEALTHCHECK_CRON"
-  validate_arg_combos || fail "install-healthcheck-cron alone should be valid"
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    INSTALL_HEALTHCHECK_CRON=1 UNINSTALL=1 PURGE=0 FORCE=0 REPAIR=0 DRY_RUN=0 HEALTH_CHECK=0 METRICS_TEXTFILE=""
+    validate_arg_combos && fail "--install-healthcheck-cron with --uninstall must be rejected"
+    UNINSTALL=0
+    parse_args --install-healthcheck-cron
+    [[ "$INSTALL_HEALTHCHECK_CRON" -eq 1 ]] || fail "parse_args should set INSTALL_HEALTHCHECK_CRON"
+    validate_arg_combos || fail "install-healthcheck-cron alone should be valid"
+    true
+  )
   ok "healthcheck cron argument combinations are validated"
 }
 
@@ -1147,6 +1181,7 @@ test_tls_connlimit_parse_and_reject() {
   DERPER_TEST_MODE=1 source "$SCRIPT"
   parse_args --tls-connlimit 16
   [[ "$TLS_CONNLIMIT" == "16" ]] || fail "parse_args should set TLS_CONNLIMIT, got $TLS_CONNLIMIT"
+  [[ "${TLS_CONNLIMIT_EXPLICIT:-0}" -eq 1 ]] || fail "explicit --tls-connlimit must set TLS_CONNLIMIT_EXPLICIT"
   TLS_CONNLIMIT="nope"
   IP_ADDR="8.8.8.8"
   RUN_USER="$(id -un)"
@@ -1154,6 +1189,388 @@ test_tls_connlimit_parse_and_reject() {
     fail "non-numeric tls-connlimit must be rejected"
   fi
   ok "tls-connlimit is parsed and validated"
+}
+
+test_module_query_survives_missing_timeout() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    command() {
+      if [[ "$1" == -v && "$2" == timeout ]]; then return 1; fi
+      builtin command "$@"
+    }
+    go() { :; }
+    env() { echo v1.102.4; }
+    local out
+    out=$(resolve_derper_module_version abcdef123456) || fail "missing timeout must not crash module query"
+    [[ "$out" == v1.102.4 ]] || fail "expected v1.102.4, got $out"
+  )
+  ok "module query works when timeout is absent"
+}
+
+test_install_derper_survives_missing_timeout() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local_tmp=$(mktemp -d)
+    trap 'rm -rf "$local_tmp"' EXIT
+    BIN_PATH="${local_tmp}/derper"
+    _tmpdir="$local_tmp"
+    DERPER_VERSION=v1.80.0
+    GOPROXY_ARG=""
+    GOSUMDB_ARG=""
+    command() {
+      if [[ "$1" == -v && "$2" == timeout ]]; then return 1; fi
+      builtin command "$@"
+    }
+    precheck_go_network() { return 0; }
+    ensure_go() { return 0; }
+    go() {
+      printf '#!/bin/sh\n' >"$BIN_PATH"
+      chmod +x "$BIN_PATH"
+    }
+    env() { go; }
+    install_derper >/dev/null || fail "install_derper must succeed without timeout"
+    [[ -x "$BIN_PATH" ]] || fail "derper binary missing after install without timeout"
+  )
+  ok "install_derper works when timeout is absent"
+}
+
+test_healthcheck_cron_conflicts_with_health_check() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    parse_args --install-healthcheck-cron --health-check --ip 203.0.113.10
+    if validate_arg_combos; then fail "--install-healthcheck-cron with --health-check must be rejected"; fi
+  )
+  ok "healthcheck cron cannot combine with --health-check"
+}
+
+test_tls_connlimit_conflicts_with_readonly_modes() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    INSTALL_HEALTHCHECK_CRON=0 HEALTH_CHECK=0 DRY_RUN=0 CHECK_ONLY=0 TLS_CONNLIMIT_EXPLICIT=0
+    parse_args --tls-connlimit 32 --health-check --ip 203.0.113.10
+    [[ "${INSTALL_HEALTHCHECK_CRON:-0}" -eq 0 ]] || fail "tls conflict test must not inherit INSTALL_HEALTHCHECK_CRON"
+    local err="" rc=0
+    err=$(validate_arg_combos 2>&1) || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "--tls-connlimit with --health-check must be rejected"
+    echo "$err" | grep -q 'tls-connlimit' || fail "rejection must cite tls-connlimit, got: $err"
+    HEALTH_CHECK=0 DRY_RUN=0 CHECK_ONLY=0 INSTALL_HEALTHCHECK_CRON=0
+    parse_args --tls-connlimit 32 --check --ip 203.0.113.10
+    rc=0
+    err=$(validate_arg_combos 2>&1) || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "--tls-connlimit with --check must be rejected"
+    echo "$err" | grep -q 'tls-connlimit' || fail "check rejection must cite tls-connlimit, got: $err"
+    HEALTH_CHECK=0 DRY_RUN=0 CHECK_ONLY=0 INSTALL_HEALTHCHECK_CRON=0
+    parse_args --tls-connlimit 32 --ip 203.0.113.10
+    validate_arg_combos || fail "--tls-connlimit alone should be valid"
+  )
+  ok "tls-connlimit is rejected with check/health-check"
+}
+
+test_tls_connlimit_explicit_zero_removes_rules() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    parse_args --tls-connlimit 0
+    local cmds=""
+    command() {
+      if [[ "$1" == -v && "$2" == nft ]]; then return 1; fi
+      if [[ "$1" == -v && "$2" == iptables ]]; then return 0; fi
+      builtin command "$@"
+    }
+    iptables() {
+      cmds+="$*"$'\n'
+      return 0
+    }
+    apply_tls_connlimit || fail "explicit --tls-connlimit 0 should succeed"
+    echo "$cmds" | grep -q 'DERPER-CONNLIMIT' || fail "explicit 0 must remove existing rules, commands: $cmds"
+  )
+  ok "explicit --tls-connlimit 0 removes installed rules"
+}
+
+test_install_healthcheck_cron_quotes_paths() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local_tmp=$(mktemp -d)
+    trap 'rm -rf "$local_tmp"' EXIT
+    HEALTHCHECK_CRON_PATH="${local_tmp}/derper-healthcheck"
+    IP_ADDR="203.0.113.10"
+    mkdir -p "${local_tmp}/metrics dir"
+    METRICS_TEXTFILE="${local_tmp}/metrics dir/derper.prom"
+    SCRIPT_SELF="${local_tmp}/deploy derper.sh"
+    printf '#!/bin/bash\n' >"$SCRIPT_SELF"
+    install_healthcheck_cron || fail "cron install should succeed with spaces in paths"
+    local expected_self expected_metrics
+    expected_self=$(printf '%q' "$SCRIPT_SELF")
+    expected_metrics=$(printf '%q' "$METRICS_TEXTFILE")
+    grep -qF -- "$expected_self" "$HEALTHCHECK_CRON_PATH" || fail "script path with spaces must be quoted, cron=$(cat "$HEALTHCHECK_CRON_PATH")"
+    grep -qF -- "$expected_metrics" "$HEALTHCHECK_CRON_PATH" || fail "metrics path with spaces must be quoted, cron=$(cat "$HEALTHCHECK_CRON_PATH")"
+  )
+  ok "healthcheck cron quotes paths that contain spaces"
+}
+
+test_precheck_go_network_allows_direct_fallback() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    GOPROXY_ARG="https://example.invalid,direct"
+    curl() { return 7; }
+    local out
+    out=$(precheck_go_network 2>&1) || fail "GOPROXY with ,direct must not abort when proxies are down, got: $out"
+    echo "$out" | grep -qi 'direct' || fail "should mention direct fallback, got: $out"
+  )
+  ok "module proxy precheck falls back to GOPROXY direct"
+}
+
+test_overflow_numeric_args_are_rejected() {
+  DERPER_TEST_MODE=1 source "$SCRIPT"
+  IP_ADDR="8.8.8.8"
+  RUN_USER="$(id -un)"
+  DERP_PORT="18446744073709552059"
+  STUN_PORT="3478"
+  CERT_DAYS="365"
+  REGION_ID="900"
+  TLS_CONNLIMIT="0"
+  if validate_settings >/dev/null 2>&1; then fail "overflow --derp-port wrapping to 443 must be rejected"; fi
+  DERP_PORT="30399"
+  STUN_PORT="18446744073709551616"
+  if validate_settings >/dev/null 2>&1; then fail "overflow --stun-port wrapping to 0 must be rejected"; fi
+  STUN_PORT="3478"
+  CERT_DAYS="18446744073709551981"
+  if validate_settings >/dev/null 2>&1; then fail "overflow --cert-days wrapping to 365 must be rejected"; fi
+  CERT_DAYS="365"
+  REGION_ID="18446744073709552516"
+  if validate_settings >/dev/null 2>&1; then fail "overflow --region-id wrapping to 900 must be rejected"; fi
+  REGION_ID="900"
+  TLS_CONNLIMIT="18446744073709551617"
+  if validate_settings >/dev/null 2>&1; then fail "overflow --tls-connlimit must be rejected"; fi
+  ok "64-bit arithmetic overflow values are rejected"
+}
+
+test_healthcheck_cron_preserves_custom_deploy_flags() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local_tmp=$(mktemp -d)
+    trap 'rm -rf "$local_tmp"' EXIT
+    HEALTHCHECK_CRON_PATH="${local_tmp}/derper-healthcheck"
+    IP_ADDR="203.0.113.10"
+    DERP_PORT="443"
+    STUN_PORT="40000"
+    VERIFY_CLIENTS_MODE="off"
+    SECURITY_LEVEL="paranoid"
+    METRICS_TEXTFILE="${local_tmp}/derper.prom"
+    SCRIPT_SELF="${local_tmp}/deploy_derper_ip_selfsigned.sh"
+    printf '#!/bin/bash\n' >"$SCRIPT_SELF"
+    install_healthcheck_cron || fail "cron install should succeed"
+    grep -q -- '--derp-port 443' "$HEALTHCHECK_CRON_PATH" || fail "cron must pin custom DERP port"
+    grep -q -- '--stun-port 40000' "$HEALTHCHECK_CRON_PATH" || fail "cron must pin custom STUN port"
+    grep -q -- '--no-verify-clients' "$HEALTHCHECK_CRON_PATH" || fail "cron must pin --no-verify-clients"
+    grep -q -- '--security-level paranoid' "$HEALTHCHECK_CRON_PATH" || fail "cron must pin security level"
+  )
+  ok "healthcheck cron preserves custom ports and security flags"
+}
+
+test_healthcheck_infers_settings_from_unit() {
+  DERPER_TEST_MODE=1 source "$SCRIPT"
+  DERP_PORT="30399"
+  STUN_PORT="3478"
+  VERIFY_CLIENTS_MODE="on"
+  SECURITY_LEVEL="standard"
+  DERP_PORT_EXPLICIT=0
+  STUN_PORT_EXPLICIT=0
+  VERIFY_CLIENTS_EXPLICIT=0
+  SECURITY_LEVEL_EXPLICIT=0
+  local unit
+  unit="ExecStart=/usr/local/bin/derper -a :443 -stun-port 40000 -hostname 8.8.8.8"$'\n'"# 安全加固（级别：basic）"
+  infer_healthcheck_settings_from_unit "$unit"
+  [[ "$DERP_PORT" == "443" ]] || fail "must infer DERP port 443, got $DERP_PORT"
+  [[ "$STUN_PORT" == "40000" ]] || fail "must infer STUN port 40000, got $STUN_PORT"
+  [[ "$VERIFY_CLIENTS_MODE" == "off" ]] || fail "unit without -verify-clients must infer off, got $VERIFY_CLIENTS_MODE"
+  [[ "$SECURITY_LEVEL" == "basic" ]] || fail "must infer security level basic, got $SECURITY_LEVEL"
+  DERP_PORT_EXPLICIT=1 DERP_PORT="30399"
+  infer_healthcheck_settings_from_unit "$unit"
+  [[ "$DERP_PORT" == "30399" ]] || fail "explicit --derp-port must not be overwritten"
+  ok "health-check infers custom ports, verify-clients, and security level from unit"
+}
+
+test_tls_connlimit_nft_uses_script_owned_table() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    TLS_CONNLIMIT=32
+    DERP_PORT=30399
+    local cmds=""
+    command() {
+      if [[ "$1" == -v && "$2" == nft ]]; then return 0; fi
+      if [[ "$1" == -v && "$2" == iptables ]]; then return 1; fi
+      builtin command "$@"
+    }
+    nft() { cmds+="$*"$'\n'; return 0; }
+    apply_tls_connlimit || fail "nft connlimit should apply"
+    echo "$cmds" | grep -q 'derper_tls_connlimit' || fail "must use script-owned table, commands: $cmds"
+    if echo "$cmds" | grep -qE 'flush chain inet derper[[:space:]]'; then
+      fail "must not flush generic inet derper chain, commands: $cmds"
+    fi
+    cmds=""
+    remove_tls_connlimit || fail "nft remove should succeed"
+    echo "$cmds" | grep -q 'delete table inet derper_tls_connlimit' || fail "remove must delete script-owned table, commands: $cmds"
+    if echo "$cmds" | grep -qE 'delete table inet derper$'; then
+      fail "must not delete generic inet derper table, commands: $cmds"
+    fi
+  )
+  ok "nft connlimit uses a script-owned table"
+}
+
+test_readme_documents_missing_flags_and_runnable_examples() {
+  grep -q -- '--cert-days' "$ROOT_DIR/README.md" || fail "README must document --cert-days"
+  grep -q -- '--derper-version' "$ROOT_DIR/README.md" || fail "README must document --derper-version"
+  if awk '/Complete Example: Zero to Production/,/^#### Output Example/' "$ROOT_DIR/README.md" | grep -q -- '--ip 203.0.113.10'; then
+    fail "EN formal deploy example must not use TEST-NET-3 as --ip"
+  fi
+  if awk '/完整示例：从零到可用/,/^#### 输出示例/' "$ROOT_DIR/README.md" | grep -q -- '--ip 203.0.113.10'; then
+    fail "CN formal deploy example must not use TEST-NET-3 as --ip"
+  fi
+  grep -q -- '--install-healthcheck-cron' "$ROOT_DIR/README.md" || fail "scenario table should use --install-healthcheck-cron"
+  if awk '/Typical Application Scenarios/,/^### ⚠️/' "$ROOT_DIR/README.md" | grep -q -- '`--dedicated-user --health-check`'; then
+    fail "EN scenario table must not treat --health-check as a deploy combo"
+  fi
+  if awk '/典型应用场景对比/,/^### ⚠️/' "$ROOT_DIR/README.md" | grep -q -- '`--dedicated-user --health-check`'; then
+    fail "CN scenario table must not treat --health-check as a deploy combo"
+  fi
+  if grep -q 'docs/BUGFIX_REVIEW_20260920.md' "$ROOT_DIR/README.md"; then
+    fail "README must not link to missing docs/BUGFIX_REVIEW_20260920.md"
+  fi
+  ok "README documents flags and uses runnable public-IP examples"
+}
+
+test_unit_atomic_write_refuses_symlink() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local_tmp=$(mktemp -d)
+    trap 'rm -rf "$local_tmp"' EXIT
+    local dest="${local_tmp}/derper.service" target="${local_tmp}/target"
+    printf 'old\n' >"$target"
+    ln -s "$target" "$dest"
+    if printf '[Service]\n' | atomic_install_file "$dest" 2>/dev/null; then
+      fail "atomic_install_file must refuse symlink dest"
+    fi
+    [[ "$(cat "$target")" == "old" ]] || fail "symlink target must not be overwritten"
+    rm -f "$dest"
+    printf '[Unit]\nDescription=ok\n' | atomic_install_file "$dest" || fail "atomic write of regular file should succeed"
+    [[ -f "$dest" && ! -L "$dest" ]] || fail "dest should be a regular file"
+    grep -q 'Description=ok' "$dest" || fail "unit content missing"
+  )
+  ok "systemd unit writes are atomic and refuse symlinks"
+}
+
+test_sha256_hex_rejects_empty_input() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    if printf '' | sha256_hex >/dev/null 2>&1; then
+      fail "empty input hash must not be treated as a fingerprint"
+    fi
+    local out
+    out=$(printf 'derper\n' | sha256_hex) || fail "non-empty input should hash"
+    [[ "$out" != "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ]] || fail "non-empty hash collided with empty"
+  )
+  ok "sha256_hex rejects empty-input digest"
+}
+
+test_install_healthcheck_cron_rejects_missing_script() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local_tmp=$(mktemp -d)
+    trap 'rm -rf "$local_tmp"' EXIT
+    HEALTHCHECK_CRON_PATH="${local_tmp}/derper-healthcheck"
+    IP_ADDR="203.0.113.10"
+    SCRIPT_SELF="${local_tmp}/not-here.sh"
+    if install_healthcheck_cron >/dev/null 2>&1; then
+      fail "cron install must refuse missing script path"
+    fi
+    [[ ! -e "$HEALTHCHECK_CRON_PATH" ]] || fail "cron file must not be written when script is missing"
+  )
+  ok "healthcheck cron refuses missing script path"
+}
+
+test_resolve_run_user_survives_unreadable_unit() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    RUN_USER_EXPLICIT=0
+    RUN_USER=root
+    NON_INTERACTIVE=0
+    unset SUDO_USER
+    id() { echo 1; }
+    read_derper_unit_content() { return 1; }
+    resolve_run_user || fail "unreadable unit must not abort resolve_run_user"
+  )
+  ok "resolve_run_user survives unreadable unit content"
+}
+
+test_commit_cert_update_clears_active_transaction() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local_tmp=$(mktemp -d)
+    trap 'rm -rf "$local_tmp"' EXIT
+    SERVICE_PATH="${local_tmp}/derper.service"
+    INSTALL_DIR="${local_tmp}/install"
+    mkdir -p "${INSTALL_DIR}/certs"
+    printf old >"${INSTALL_DIR}/certs/cert"
+    printf unit >"$SERVICE_PATH"
+    systemctl() { return 1; }
+    begin_cert_update || fail "begin should succeed"
+    [[ "${CERT_TRANSACTION_ACTIVE}" -eq 1 ]] || fail "transaction should be active"
+    [[ -d "${SERVICE_PATH}.certs-rollback" ]] || fail "backup dir missing"
+    commit_cert_update || fail "commit should succeed"
+    [[ "${CERT_TRANSACTION_ACTIVE}" -eq 0 ]] || fail "commit must clear CERT_TRANSACTION_ACTIVE"
+    [[ ! -e "${SERVICE_PATH}.certs-rollback" ]] || fail "commit must remove backup"
+    cleanup_deployment 1
+    [[ "$(cat "${INSTALL_DIR}/certs/cert")" == old ]] || fail "inactive transaction must not rollback certs"
+  )
+  ok "commit_cert_update clears the rollback transaction"
+}
+
+test_run_post_deploy_extras_keeps_verified_deploy() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    apply_tls_connlimit() { return 1; }
+    INSTALL_HEALTHCHECK_CRON=0
+    local out="" rc=0
+    out=$(run_post_deploy_extras 2>&1) || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "extras failure should return 1"
+    echo "$out" | grep -q '不会回滚' || fail "must say it will not rollback, got: $out"
+  )
+  ok "post-deploy extras failure does not imply cert rollback"
+}
+
+test_service_verified_skips_missing_probe_tools() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    DERP_PORT=30399
+    STUN_PORT=3478
+    IP_ADDR=203.0.113.10
+    command() {
+      if [[ "$1" == -v && ( "$2" == ss || "$2" == netstat || "$2" == openssl ) ]]; then return 1; fi
+      if [[ "$1" == -v && "$2" == systemctl ]]; then return 0; fi
+      builtin command "$@"
+    }
+    systemctl() {
+      case "$1" in
+        is-active) return 0 ;;
+        show) echo 1 ;;
+        *) return 1 ;;
+      esac
+    }
+    kill() { return 0; }
+    service_verified_running || fail "active service must verify when ss/openssl are missing"
+  )
+  ok "service verification skips missing ss/openssl instead of failing"
+}
+
+test_wizard_read_choice_rejects_invalid() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local out rc=0
+    out=$(printf 'z\n' | wizard_read_choice "prompt: " "ab" 2>&1) || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "invalid then EOF should fail"
+    echo "$out" | grep -q '无效选项' || fail "must report invalid option, got: $out"
+  )
+  ok "wizard choice prompt rejects invalid input"
 }
 
 test_no_crlf_and_syntax
@@ -1217,3 +1634,23 @@ test_install_healthcheck_cron_writes_job
 test_uninstall_removes_healthcheck_cron
 test_healthcheck_cron_conflicts_with_uninstall
 test_tls_connlimit_parse_and_reject
+test_module_query_survives_missing_timeout
+test_install_derper_survives_missing_timeout
+test_healthcheck_cron_conflicts_with_health_check
+test_tls_connlimit_conflicts_with_readonly_modes
+test_tls_connlimit_explicit_zero_removes_rules
+test_install_healthcheck_cron_quotes_paths
+test_precheck_go_network_allows_direct_fallback
+test_overflow_numeric_args_are_rejected
+test_healthcheck_cron_preserves_custom_deploy_flags
+test_healthcheck_infers_settings_from_unit
+test_tls_connlimit_nft_uses_script_owned_table
+test_readme_documents_missing_flags_and_runnable_examples
+test_unit_atomic_write_refuses_symlink
+test_sha256_hex_rejects_empty_input
+test_install_healthcheck_cron_rejects_missing_script
+test_resolve_run_user_survives_unreadable_unit
+test_commit_cert_update_clears_active_transaction
+test_run_post_deploy_extras_keeps_verified_deploy
+test_service_verified_skips_missing_probe_tools
+test_wizard_read_choice_rejects_invalid

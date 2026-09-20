@@ -9,13 +9,16 @@
 set -euo pipefail
 
 # 脚本自身版本（与 docs/CHANGELOG_*.md、仓库根目录 VERSION 保持同步）
-SCRIPT_VERSION="0.2.10"
+SCRIPT_VERSION="0.2.11"
 SCRIPT_VERSION_DATE="2026-09-20"
 
 # 默认端口
 DERP_PORT="30399"        # DERP TLS 端口
+DERP_PORT_EXPLICIT=0
 STUN_PORT="3478"         # STUN 端口（UDP）
+STUN_PORT_EXPLICIT=0
 CERT_DAYS="365"          # 自签证书有效期（天）
+CERT_DAYS_MAX="365000"   # 约 1000 年，避免超大数字在 Bash 算术中溢出
 INSTALL_DIR="/opt/derper" # 安装/证书目录
 BIN_PATH="/usr/local/bin/derper"
 SERVICE_PATH="/etc/systemd/system/derper.service"
@@ -40,6 +43,7 @@ DERPER_VERSION="${DERPER_VERSION:-latest}"
 
 # 客户端校验：on=强制启用；off=禁用（默认 on）
 VERIFY_CLIENTS_MODE="on"
+VERIFY_CLIENTS_EXPLICIT=0
 
 # ACL Region 配置（可自定义）
 REGION_ID="900"
@@ -69,7 +73,11 @@ SOCKET_RELAXED_PATH=""   # --relax-socket-perms 改过的 socket，退出时恢�
 SOCKET_RELAXED_ORIG_MODE=""
 NON_INTERACTIVE=0        # 非交互模式（CI/自动化）
 SECURITY_LEVEL="standard" # 安全加固级别：basic|standard|paranoid
+SECURITY_LEVEL_EXPLICIT=0
 TLS_CONNLIMIT=0          # 单 IP 并发 TLS 连接上限，0 表示不安装限速规则
+TLS_CONNLIMIT_EXPLICIT=0 # 是否在命令行显式传入 --tls-connlimit
+TLS_CONNLIMIT_MAX="1000000"
+NFT_CONNLIMIT_TABLE="derper_tls_connlimit"  # 脚本专属表，禁止动用用户的 inet derper
 INSTALL_HEALTHCHECK_CRON=0
 HEALTHCHECK_CRON_PATH="/etc/cron.d/derper-healthcheck"
 HEALTHCHECK_CRON_METRICS_DEFAULT="/var/lib/node_exporter/textfile_collector/derper.prom"
@@ -134,16 +142,19 @@ usage() {
   --region-name           ACL derpMap 的 RegionName（默认 "My IP DERP"）。
   --user <username>       指定运行 derper 的用户（默认：当前登录用户）。
                           可指定现有用户（如 nobody、www-data 等）。
-  --use-current-user      使用当前登录用户运行 derper（等价于 --user \$USER，默认行为）。
+  --use-current-user      使用当前登录用户运行 derper（sudo 下为 \$SUDO_USER，否则为当前用户；默认行为）。
   --dedicated-user        强制创建专用 derper 系统账户（生产环境推荐）。
   --allow-non-global-ip   允许使用私有/保留/文档/组播等非全局可路由 IP（仅内网测试）。
   --security-level LEVEL  安全加固级别：basic|standard|paranoid（默认 standard）。
   --accept-cert-rotation  确认已有证书换指纹及 ACL 更新期间的中断风险（--yes 不代替此确认）。
   --relax-socket-perms    允许临时放宽 tailscaled socket 权限到 0666（不推荐，仅紧急情况）。
                           脚本退出时恢复原权限。
-  --tls-connlimit N       限制单 IP 并发 DERP TLS 连接数（nftables/iptables connlimit）；0 表示关闭。
+  --tls-connlimit N       限制单 IP 并发 DERP TLS 连接数（nftables/iptables connlimit）。
+                          显式传 0 会移除已安装规则；省略该选项则不改动已有规则。
+                          不能与 --health-check/--check/--dry-run 同时使用。
   --install-healthcheck-cron  写入 /etc/cron.d/derper-healthcheck（每 5 分钟 --health-check）。
-                          --uninstall 会删除该 cron。不能与 --uninstall 同时使用。
+                          --uninstall 会删除该 cron。
+                          不能与 --uninstall/--health-check/--check/--dry-run 同时使用。
   --yes, --non-interactive 非交互模式，自动确认所有选择（适合 CI/自动化脚本）。
   --check, --dry-run      仅进行状态与参数检查，不执行安装/写服务/放行端口等操作。
   --repair                仅修复/重写配置（systemd/证书等），不中断可用的依赖；
@@ -155,7 +166,7 @@ usage() {
 
   --health-check          输出健康检查摘要（适合 cron 周期探测；不更改系统）。
   --metrics-textfile P    将健康检查结果以 Prometheus 文本格式写入到文件 P。
-                          必须与 --health-check 一起使用；
+                          必须与 --health-check 或 --install-healthcheck-cron 一起使用；
                           建议结合 node_exporter 的 textfile collector 使用。
   --uninstall             停止并卸载 derper systemd 服务（保留二进制与证书）。
   --purge                 必须与 --uninstall 一起使用：额外删除 ${INSTALL_DIR}（证书等）。
@@ -324,10 +335,12 @@ parse_args() {
       --derp-port)
         require_arg_value "$1" "${2-}"
         DERP_PORT="$2"
+        DERP_PORT_EXPLICIT=1
         shift 2;;
       --stun-port)
         require_arg_value "$1" "${2-}"
         STUN_PORT="$2"
+        STUN_PORT_EXPLICIT=1
         shift 2;;
       --cert-days)
         require_arg_value "$1" "${2-}"
@@ -350,9 +363,11 @@ parse_args() {
         shift 2;;
       --no-verify-clients)
         VERIFY_CLIENTS_MODE="off"
+        VERIFY_CLIENTS_EXPLICIT=1
         shift 1;;
       --force-verify-clients)
         VERIFY_CLIENTS_MODE="on"
+        VERIFY_CLIENTS_EXPLICIT=1
         shift 1;;
       --region-id)
         require_arg_value "$1" "${2-}"
@@ -392,6 +407,7 @@ parse_args() {
       --security-level)
         require_arg_value "$1" "${2-}"
         SECURITY_LEVEL="$2"
+        SECURITY_LEVEL_EXPLICIT=1
         shift 2;;
       --relax-socket-perms)
         RELAX_SOCKET_PERMS=1
@@ -399,6 +415,7 @@ parse_args() {
       --tls-connlimit)
         require_arg_value "$1" "${2-}"
         TLS_CONNLIMIT="$2"
+        TLS_CONNLIMIT_EXPLICIT=1
         shift 2;;
       --install-healthcheck-cron)
         INSTALL_HEALTHCHECK_CRON=1
@@ -467,6 +484,18 @@ validate_arg_combos() {
   fi
   if [[ "${INSTALL_HEALTHCHECK_CRON:-0}" -eq 1 && "${DRY_RUN}" -eq 1 ]]; then
     echo "[错误] --install-healthcheck-cron 不能与 --check/--dry-run 一起使用。" >&2
+    err=1
+  fi
+  if [[ "${INSTALL_HEALTHCHECK_CRON:-0}" -eq 1 && "${HEALTH_CHECK}" -eq 1 ]]; then
+    echo "[错误] --install-healthcheck-cron 不能与 --health-check 一起使用；请单独安装 cron，或只做健康检查。" >&2
+    err=1
+  fi
+  if [[ "${TLS_CONNLIMIT_EXPLICIT:-0}" -eq 1 && "${HEALTH_CHECK}" -eq 1 ]]; then
+    echo "[错误] --tls-connlimit 不能与 --health-check 一起使用；连接上限只在部署/修复时生效。" >&2
+    err=1
+  fi
+  if [[ "${TLS_CONNLIMIT_EXPLICIT:-0}" -eq 1 && "${DRY_RUN}" -eq 1 ]]; then
+    echo "[错误] --tls-connlimit 不能与 --check/--dry-run 一起使用；连接上限只在部署/修复时生效。" >&2
     err=1
   fi
   if [[ "${FORCE}" -eq 1 && "${REPAIR}" -eq 1 ]]; then
@@ -658,9 +687,7 @@ resolve_derper_module_version() {
   local envs=("GO111MODULE=on" "GOTOOLCHAIN=${GOTOOLCHAIN_ARG}" "GIT_TERMINAL_PROMPT=0")
   [[ -z "$GOPROXY_ARG" ]] || envs+=("GOPROXY=$GOPROXY_ARG")
   [[ -z "$GOSUMDB_ARG" ]] || envs+=("GOSUMDB=$GOSUMDB_ARG")
-  local runner=()
-  command -v timeout >/dev/null 2>&1 && runner=(timeout 60)
-  "${runner[@]}" env "${envs[@]}" go list -m -f '{{.Version}}' "tailscale.com@$1" 2>/dev/null
+  _timeout_run 60 env "${envs[@]}" go list -m -f '{{.Version}}' "tailscale.com@$1" 2>/dev/null
 }
 
 # 判断是否需要安装/重装 derper：缺失、或目标版本（非 latest）与已安装不一致。
@@ -679,14 +706,20 @@ derper_binary_needs_install() {
     return 0
   fi
   if [[ "$have" != "$want" ]]; then
-    if [[ "$want" =~ ^[0-9a-f]{7,40}$ ]]; then
+    local want_lc have_lc
+    want_lc=$(printf '%s' "$want" | tr 'A-Z' 'a-z')
+    have_lc=$(printf '%s' "$have" | tr 'A-Z' 'a-z')
+    if [[ "$want_lc" == "$have_lc" ]]; then
+      return 1
+    fi
+    if [[ "$want_lc" =~ ^[0-9a-f]{7,40}$ ]]; then
       # Go 伪版本只保存 12 位 revision；必须比较末尾，不能任意子串命中。
-      local revision="${have##*-}" canonical=""
-      if [[ "$have" =~ [.-][0-9]{14}-[0-9a-f]{12}$ && "$want" == "$revision"* ]]; then
+      local revision="${have_lc##*-}" canonical=""
+      if [[ "$have_lc" =~ [.-][0-9]{14}-[0-9a-f]{12}$ && "$want_lc" == "$revision"* ]]; then
         return 1
       fi
       # commit 恰好是发布标签时，Go 记录规范标签而非伪版本。
-      canonical=$(resolve_derper_module_version "$want" || true)
+      canonical=$(resolve_derper_module_version "$want_lc" || true)
       if [[ -n "$canonical" && "$(normalize_version_tag "$canonical")" == "$have" ]]; then
         return 1
       fi
@@ -764,23 +797,45 @@ ipv4_address_class() {
   else echo "global"; fi
 }
 
+# 无溢出的无符号十进制比较：去掉前导零后按位数再按字典序比较。
+_decimal_norm() {
+  local s="$1"
+  while [[ "$s" == 0* && ${#s} -gt 1 ]]; do
+    s="${s#0}"
+  done
+  printf '%s' "$s"
+}
+
+_decimal_ge() {
+  local a b la lb
+  a=$(_decimal_norm "$1")
+  b=$(_decimal_norm "$2")
+  la=${#a}; lb=${#b}
+  if (( la != lb )); then
+    (( la > lb ))
+    return
+  fi
+  [[ "$a" > "$b" || "$a" == "$b" ]]
+}
+
+decimal_in_closed_range() {
+  local val="$1" min="$2" max="$3"
+  [[ "$val" =~ ^[0-9]+$ ]] || return 1
+  _decimal_ge "$val" "$min" && _decimal_ge "$max" "$val"
+}
+
 validate_settings() {
-  # 端口合法性（10# 强制十进制，避免前导零被当作八进制解析）
-  local derp_port_dec stun_port_dec cert_days_dec
-  derp_port_dec=0; stun_port_dec=0; cert_days_dec=0
-  if [[ "${DERP_PORT}" =~ ^[0-9]+$ ]]; then derp_port_dec=$((10#$DERP_PORT)); fi
-  if [[ "${STUN_PORT}" =~ ^[0-9]+$ ]]; then stun_port_dec=$((10#$STUN_PORT)); fi
-  if [[ "${CERT_DAYS}" =~ ^[0-9]+$ ]]; then cert_days_dec=$((10#$CERT_DAYS)); fi
-  if (( derp_port_dec < 1 || derp_port_dec > 65535 )); then
+  # 端口/天数用字符串范围比较，避免 Bash 64 位算术溢出把超大非法值折成合法小数。
+  if ! decimal_in_closed_range "${DERP_PORT}" 1 65535; then
     echo "[错误] --derp-port 必须为 1-65535 的整数，当前：${DERP_PORT}" >&2
     return 1
   fi
-  if (( stun_port_dec < 1 || stun_port_dec > 65535 )); then
+  if ! decimal_in_closed_range "${STUN_PORT}" 1 65535; then
     echo "[错误] --stun-port 必须为 1-65535 的整数，当前：${STUN_PORT}" >&2
     return 1
   fi
-  if (( cert_days_dec < 1 )); then
-    echo "[错误] --cert-days 必须为正整数，当前：${CERT_DAYS}" >&2
+  if ! decimal_in_closed_range "${CERT_DAYS}" 1 "${CERT_DAYS_MAX}"; then
+    echo "[错误] --cert-days 必须为 1-${CERT_DAYS_MAX} 的整数，当前：${CERT_DAYS}" >&2
     return 1
   fi
   # IPv4 合法性校验：格式 + 每段范围 0-255
@@ -834,19 +889,14 @@ validate_settings() {
     echo "[错误] --region-id 必须为正整数：${REGION_ID}" >&2
     return 1
   fi
-  # 10# 强制十进制，避免前导零被当作八进制解析
-  local region_id_dec=$((10#$REGION_ID))
-  if (( region_id_dec < 1 )); then
-    echo "[错误] --region-id 必须为正整数：${REGION_ID}" >&2
+  if ! decimal_in_closed_range "${REGION_ID}" 1 9007199254740991; then
+    echo "[错误] --region-id 超出 JavaScript 安全整数范围（1–9007199254740991）：${REGION_ID}" >&2
     return 1
   fi
-  # 上游要求 RegionID 能安全放入 JavaScript number（Number.MAX_SAFE_INTEGER = 2^53-1）
-  if (( region_id_dec > 9007199254740991 )); then
-    echo "[错误] --region-id 超出 JavaScript 安全整数范围（最大 9007199254740991）：${REGION_ID}" >&2
-    return 1
-  fi
-  # 上游约定 900-999 保留给用户自建区域
-  if (( region_id_dec < 900 || region_id_dec > 999 )); then
+  local region_id_norm
+  region_id_norm=$(_decimal_norm "${REGION_ID}")
+  # 上游约定 900-999 保留给用户自建区域（位数很少，算术安全）
+  if (( 10#$region_id_norm < 900 || 10#$region_id_norm > 999 )); then
     echo "[警告] --region-id ${REGION_ID} 不在 900-999 范围；上游约定该范围保留给用户自建区域，建议使用 900-999。" >&2
   fi
 
@@ -856,8 +906,8 @@ validate_settings() {
     *) echo "[错误] --security-level 必须为 basic|standard|paranoid，当前：${SECURITY_LEVEL}" >&2; return 1 ;;
   esac
 
-  if [[ ! "${TLS_CONNLIMIT:-0}" =~ ^[0-9]+$ ]]; then
-    echo "[错误] --tls-connlimit 必须为非负整数，当前：${TLS_CONNLIMIT}" >&2
+  if ! decimal_in_closed_range "${TLS_CONNLIMIT:-0}" 0 "${TLS_CONNLIMIT_MAX}"; then
+    echo "[错误] --tls-connlimit 必须为 0-${TLS_CONNLIMIT_MAX} 的整数，当前：${TLS_CONNLIMIT}" >&2
     return 1
   fi
 }
@@ -894,6 +944,41 @@ infer_ip_from_existing_deployment() {
     return 0
   fi
   return 1
+}
+
+# 健康检查按已部署 unit 恢复端口/校验/安全级别，避免 cron 只带 IP 时用默认值误报。
+infer_healthcheck_settings_from_unit() {
+  local content="${1-}"
+  [[ -n "$content" ]] || content=$(read_derper_unit_content || true)
+  [[ -n "$content" ]] || return 0
+
+  if [[ "${DERP_PORT_EXPLICIT:-0}" -ne 1 ]]; then
+    local p=""
+    p=$(printf '%s\n' "$content" | grep -oE -- '-a[[:space:]]+:[0-9]+' | grep -oE '[0-9]+$' | head -n1 || true)
+    [[ -n "$p" ]] || p=$(printf '%s\n' "$content" | grep -oE -- '-https-port[[:space:]]+[0-9]+' | awk '{print $2}' | head -n1 || true)
+    [[ -n "$p" ]] && DERP_PORT="$p"
+  fi
+  if [[ "${STUN_PORT_EXPLICIT:-0}" -ne 1 ]]; then
+    local s=""
+    s=$(printf '%s\n' "$content" | grep -oE -- '-stun-port[[:space:]]+[0-9]+' | awk '{print $2}' | head -n1 || true)
+    if [[ -n "$s" ]]; then
+      STUN_PORT="$s"
+    fi
+  fi
+  if [[ "${VERIFY_CLIENTS_EXPLICIT:-0}" -ne 1 ]]; then
+    if printf '%s\n' "$content" | grep -qE -- '(^|[[:space:]])-verify-clients([[:space:]]|$)'; then
+      VERIFY_CLIENTS_MODE="on"
+    else
+      VERIFY_CLIENTS_MODE="off"
+    fi
+  fi
+  if [[ "${SECURITY_LEVEL_EXPLICIT:-0}" -ne 1 ]]; then
+    local lvl=""
+    lvl=$(printf '%s\n' "$content" | grep -oE '安全加固（级别：[a-z]+' | head -n1 | sed 's/.*级别：//' || true)
+    case "$lvl" in
+      basic|standard|paranoid) SECURITY_LEVEL="$lvl" ;;
+    esac
+  fi
 }
 
 # 兼容 timeout：优先使用系统 timeout，缺失时用后台进程模拟
@@ -1041,7 +1126,7 @@ read_derper_unit_content() {
   local unit
   unit=$(get_derper_unit_path)
   if [[ -n "$unit" && -f "$unit" ]]; then
-    cat "$unit"
+    cat "$unit" 2>/dev/null || true
   elif command -v systemctl >/dev/null 2>&1; then
     systemctl cat derper 2>/dev/null || true
   fi
@@ -1060,6 +1145,26 @@ check_ports_status() {
 
 regex_escape() {
   printf '%s' "$1" | sed -e 's/[][\/.^$*+?{}()|]/\\&/g'
+}
+
+# 按逗号拆开 SAN 项后做精确字符串比对，避免 3.4.5.6 命中 13.4.5.6 这类子串。
+cert_text_san_has_ip() {
+  local text="$1" want="$2" item ip
+  [[ -n "$text" && -n "$want" ]] || return 1
+  while IFS= read -r item; do
+    item="${item#"${item%%[![:space:]]*}"}"
+    item="${item%"${item##*[![:space:]]}"}"
+    [[ -n "$item" ]] || continue
+    case "$item" in
+      "IP Address:"*) ip="${item#IP Address:}" ;;
+      "IP:"*) ip="${item#IP:}" ;;
+      *) continue ;;
+    esac
+    ip="${ip#"${ip%%[![:space:]]*}"}"
+    ip="${ip%"${ip##*[![:space:]]}"}"
+    [[ "$ip" == "$want" ]] && return 0
+  done < <(printf '%s\n' "$text" | tr ',' '\n')
+  return 1
 }
 
 check_pure_ip_from_unit() {
@@ -1206,11 +1311,10 @@ check_cert_status() {
       CERT_NAMING_OK=1
     fi
     if command -v openssl >/dev/null 2>&1; then
-      local ip_re
-      ip_re=$(regex_escape "$IP_ADDR")
-      if openssl x509 -in "$cert_pem" -noout -text 2>/dev/null | grep -E "IP( Address)?:[[:space:]]*${ip_re}([,[:space:]]|$)" >/dev/null 2>&1; then
-        CERT_SAN_MATCH=1
-      elif openssl x509 -in "$cert_pem" -noout -ext subjectAltName 2>/dev/null | grep -E "IP(:| Address:)[[:space:]]*${ip_re}([,[:space:]]|$)" >/dev/null 2>&1; then
+      local san_text=""
+      san_text=$(openssl x509 -in "$cert_pem" -noout -ext subjectAltName 2>/dev/null || true)
+      [[ -n "$san_text" ]] || san_text=$(openssl x509 -in "$cert_pem" -noout -text 2>/dev/null || true)
+      if cert_text_san_has_ip "$san_text" "$IP_ADDR"; then
         CERT_SAN_MATCH=1
       fi
       if openssl x509 -checkend $((30*24*3600)) -in "$cert_pem" -noout >/dev/null 2>&1; then
@@ -1306,9 +1410,13 @@ install_deps() {
 }
 
 # 解析 GOPROXY 列表，跳过 direct/off，供连通性预检使用。
+goproxy_probe_spec() {
+  printf '%s\n' "${GOPROXY_ARG:-${GOPROXY:-https://proxy.golang.org,direct}}"
+}
+
 goproxy_probe_targets() {
-  local spec="${GOPROXY_ARG:-${GOPROXY:-https://proxy.golang.org,direct}}"
-  local part
+  local spec part
+  spec=$(goproxy_probe_spec)
   local IFS=','
   for part in $spec; do
     part="${part#"${part%%[![:space:]]*}"}"
@@ -1318,6 +1426,18 @@ goproxy_probe_targets() {
   done
 }
 
+goproxy_spec_allows_direct() {
+  local spec part
+  spec=$(goproxy_probe_spec)
+  local IFS=','
+  for part in $spec; do
+    part="${part#"${part%%[![:space:]]*}"}"
+    part="${part%"${part##*[![:space:]]}"}"
+    [[ "$part" == "direct" ]] && return 0
+  done
+  return 1
+}
+
 probe_http_url() {
   local url="$1"
   curl --connect-timeout 5 --max-time 5 -I -fsS -o /dev/null "$url" 2>/dev/null \
@@ -1325,6 +1445,7 @@ probe_http_url() {
 }
 
 # 构建前探测模块代理；失败立即提示 --goproxy，不自动切换第三方代理。
+# GOPROXY 含 direct 时，代理全不可达仍交由 Go 直连，避免误杀 ,direct 回退。
 precheck_go_network() {
   local target any=0
   while IFS= read -r target; do
@@ -1337,6 +1458,10 @@ precheck_go_network() {
   done < <(goproxy_probe_targets)
   if [[ "$any" -eq 0 ]]; then
     echo "[信息] GOPROXY 为 direct/off，跳过代理预检。"
+    return 0
+  fi
+  if goproxy_spec_allows_direct; then
+    echo "[警告] 模块代理均不可达，GOPROXY 含 direct，将交由 Go 直连模块源。若直连也失败，请显式指定 --goproxy。" >&2
     return 0
   fi
   echo "[错误] Go 模块代理不可达。国内网络请显式使用 --goproxy https://goproxy.cn,direct；脚本不会自动切换第三方代理或关闭 GOSUMDB。" >&2
@@ -1454,9 +1579,7 @@ install_derper() {
   if [[ -n "${GOPROXY_ARG}" ]]; then envs+=("GOPROXY=${GOPROXY_ARG}"); fi
   if [[ -n "${GOSUMDB_ARG}" ]]; then envs+=("GOSUMDB=${GOSUMDB_ARG}"); fi
   echo "[信息] 安装 derper 版本：${DERPER_VERSION}"
-  local runner=()
-  command -v timeout >/dev/null 2>&1 && runner=(timeout 900)
-  if ! "${runner[@]}" env "${envs[@]}" go install "tailscale.com/cmd/derper@${DERPER_VERSION}" 2>"${_tmpdir}/derper_install.err"; then
+  if ! _timeout_run 900 env "${envs[@]}" go install "tailscale.com/cmd/derper@${DERPER_VERSION}" 2>"${_tmpdir}/derper_install.err"; then
     echo "[错误] go install 失败；请检查模块代理/校验数据库连通性。国内网络可显式使用 --goproxy https://goproxy.cn,direct；脚本保留现有代理设置，不自动切换第三方代理或关闭校验。" >&2
     sed -n '1,160p' "${_tmpdir}/derper_install.err" >&2 || true
     exit 1
@@ -1517,6 +1640,39 @@ derper_supports_socket_flag() {
 refuse_symlink() {
   if [[ -L "$1" ]]; then
     echo "[错误] 拒绝写入：$1 是符号链接（可能存在恶意替换风险），请手动检查后删除。" >&2
+    return 1
+  fi
+}
+
+# 同目录临时文件 + mv 原子替换；拒绝把目标写成符号链接。
+atomic_install_file() {
+  local dest="$1" dir tmp
+  refuse_symlink "$dest" || return 1
+  dir=$(dirname "$dest")
+  tmp=$(mktemp "${dir}/.derper-unit.XXXXXX") || return 1
+  if ! cat >"$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  chmod 644 "$tmp" 2>/dev/null || true
+  if ! mv -f "$tmp" "$dest"; then
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+atomic_copy_file() {
+  local src="$1" dest="$2" dir tmp
+  [[ -f "$src" ]] || return 1
+  refuse_symlink "$dest" || return 1
+  dir=$(dirname "$dest")
+  tmp=$(mktemp "${dir}/.derper-unit.XXXXXX") || return 1
+  if ! cp -p "$src" "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if ! mv -f "$tmp" "$dest"; then
+    rm -f "$tmp"
     return 1
   fi
 }
@@ -1596,7 +1752,7 @@ rollback_cert_update() {
     return 1
   fi
   if [[ -f "$backup/unit" ]]; then
-    cp -p "$backup/unit" "$SERVICE_PATH" || return 1
+    atomic_copy_file "$backup/unit" "$SERVICE_PATH" || return 1
     if command -v systemctl >/dev/null 2>&1; then
       systemctl daemon-reload || return 1
     fi
@@ -1608,8 +1764,11 @@ rollback_cert_update() {
 
 commit_cert_update() {
   local backup="${SERVICE_PATH}.certs-rollback"
-  refuse_symlink "$backup" || return 1
-  rm -rf "$backup"
+  if [[ -e "$backup" || -L "$backup" ]]; then
+    refuse_symlink "$backup" || return 1
+    rm -rf "$backup"
+  fi
+  CERT_TRANSACTION_ACTIVE=0
 }
 
 cert_layout_is_ok() {
@@ -1885,13 +2044,19 @@ prepare_derper_config() {
 # 计算证书 DER 原始字节的 SHA256，用于 ACL 的 CertName（sha256-raw:<hex>）
 sha256_hex() {
   # 从标准输入读取，返回十六进制 sha256 值
+  local out=""
   if command -v sha256sum >/dev/null 2>&1; then
-    sha256sum | awk '{print $1}'
+    out=$(sha256sum | awk '{print $1}')
   elif command -v shasum >/dev/null 2>&1; then
-    shasum -a 256 | awk '{print $1}'
+    out=$(shasum -a 256 | awk '{print $1}')
   else
-    openssl dgst -sha256 | awk '{print $2}'
+    out=$(openssl dgst -sha256 | awk '{print $2}')
   fi
+  # 空输入的 SHA256 是公开常量 e3b0c442…，不能当成证书指纹。
+  if [[ -z "$out" || "$out" == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" ]]; then
+    return 1
+  fi
+  printf '%s\n' "$out"
 }
 
 cert_file_sha256_raw() {
@@ -2131,6 +2296,7 @@ setup_service_user() {
 
 # 启动后强制健康验证：active 状态、TLS/STUN 端口监听、TLS 握手、进程存活。
 # systemctl start/restart 即时返回成功并不代表服务真正可用（可能启动后立即崩溃）。
+# ss/netstat/openssl 缺失时跳过对应核验并警告，避免把“缺诊断工具”误判成启动失败而回滚。
 service_verified_running() {
   command -v systemctl >/dev/null 2>&1 || return 1
   local tries=0
@@ -2139,30 +2305,35 @@ service_verified_running() {
       break
     fi
     sleep 1
-    ((tries++))
+    tries=$((tries + 1))
   done
   systemctl is-active --quiet derper 2>/dev/null || return 1
   # 防止启动后立即崩溃：短暂等待后复核 active 状态
   sleep 2
   systemctl is-active --quiet derper 2>/dev/null || return 1
 
-  # TLS/STUN 端口确实监听
-  check_ports_status
-  [[ "${PORT_TLS_OK:-0}" -eq 1 && "${PORT_STUN_OK:-0}" -eq 1 ]] || return 1
+  if command -v ss >/dev/null 2>&1 || command -v netstat >/dev/null 2>&1; then
+    check_ports_status
+    [[ "${PORT_TLS_OK:-0}" -eq 1 && "${PORT_STUN_OK:-0}" -eq 1 ]] || return 1
+  else
+    echo "[警告] 未找到 ss/netstat，跳过端口监听核验（服务已 active）。" >&2
+  fi
 
-  # TLS 握手成功（优先本机回环，避免 NAT hairpin 误报）
-  command -v openssl >/dev/null 2>&1 || return 1
-  local host pem tls_ok=0
-  while IFS= read -r host; do
-    [[ -n "$host" ]] || continue
-    pem=$(_timeout_run 6 openssl s_client -connect "${host}:${DERP_PORT}" -servername "${IP_ADDR}" -showcerts </dev/null 2>/dev/null \
-          | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p') || true
-    if [[ -n "$pem" ]]; then
-      tls_ok=1
-      break
-    fi
-  done < <(tls_probe_endpoints)
-  [[ "$tls_ok" -eq 1 ]] || return 1
+  if command -v openssl >/dev/null 2>&1; then
+    local host pem tls_ok=0
+    while IFS= read -r host; do
+      [[ -n "$host" ]] || continue
+      pem=$(_timeout_run 6 openssl s_client -connect "${host}:${DERP_PORT}" -servername "${IP_ADDR}" -showcerts </dev/null 2>/dev/null \
+            | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p') || true
+      if [[ -n "$pem" ]]; then
+        tls_ok=1
+        break
+      fi
+    done < <(tls_probe_endpoints)
+    [[ "$tls_ok" -eq 1 ]] || return 1
+  else
+    echo "[警告] 未找到 openssl，跳过 TLS 握手核验（服务已 active）。" >&2
+  fi
 
   # derper 主进程仍在运行（未崩溃退出）
   local main_pid
@@ -2187,7 +2358,7 @@ rollback_previous_unit() {
     return 1
   fi
   echo "[步骤] 正在恢复备份的 systemd 单元：${backup}" >&2
-  if ! cp -a "$backup" "${SERVICE_PATH}" 2>/dev/null; then
+  if ! atomic_copy_file "$backup" "${SERVICE_PATH}"; then
     echo "[错误] 恢复备份单元失败，旧服务可能处于停止状态。" >&2
     return 1
   fi
@@ -2533,6 +2704,7 @@ ${supplementary_groups_line}"
 
   # 写入前备份旧 unit，便于失败回滚
   local unit_backup=""
+  refuse_symlink "${SERVICE_PATH}" || return 1
   if [[ -f "${SERVICE_PATH}" ]]; then
     unit_backup="${SERVICE_PATH}.bak.$(date +%Y%m%d%H%M%S)"
     cp -a "${SERVICE_PATH}" "$unit_backup" 2>/dev/null || unit_backup=""
@@ -2541,7 +2713,7 @@ ${supplementary_groups_line}"
     fi
   fi
 
-  cat >"${SERVICE_PATH}" <<SERVICE
+  atomic_install_file "${SERVICE_PATH}" <<SERVICE
 [Unit]
 Description=Tailscale DERP (derper) with self-signed IP cert
 After=network-online.target tailscaled.service
@@ -2603,11 +2775,11 @@ SERVICE
   fi
 
   if [[ "${service_started}" -ne 1 ]]; then
-    echo "[警告] 服务启动失败，可能是某些安全选项不兼容当前系统" >&2
+    echo "[警告] 服务启动失败或健康验证未通过（active/端口/TLS/进程）。" >&2
     
     # 检查是否是 MemoryDenyWriteExecute 导致的问题（Go 程序常见）
     if [[ "${SECURITY_LEVEL}" == "paranoid" ]]; then
-      echo "[步骤] 尝试禁用 MemoryDenyWriteExecute 选项重试" >&2
+      echo "[信息] paranoid 加固可能与当前系统不兼容，尝试禁用 MemoryDenyWriteExecute 后重试。" >&2
       # 删除加固项，并更新注释标记，避免漂移检测把“已降级”误判为完整 paranoid
       sed -i.bak \
         -e '/^MemoryDenyWriteExecute=/d' \
@@ -2683,13 +2855,25 @@ EOT
 }
 
 apply_tls_connlimit_nft() {
-  nft list table inet derper >/dev/null 2>&1 || nft add table inet derper
-  nft list chain inet derper input >/dev/null 2>&1 \
-    || nft 'add chain inet derper input { type filter hook input priority 0; policy accept; }'
-  nft flush chain inet derper input 2>/dev/null || true
-  nft add rule inet derper input tcp dport "${DERP_PORT}" ct state new \
+  local table="${NFT_CONNLIMIT_TABLE}"
+  nft list table inet "${table}" >/dev/null 2>&1 || nft add table inet "${table}"
+  nft list chain inet "${table}" input >/dev/null 2>&1 \
+    || nft "add chain inet ${table} input { type filter hook input priority 0; policy accept; }"
+  nft flush chain inet "${table}" input 2>/dev/null || true
+  nft add rule inet "${table}" input tcp dport "${DERP_PORT}" ct state new \
     meter derper_tls \{ ip saddr ct count over "${TLS_CONNLIMIT}" \} counter drop \
     comment \"derper-tls-connlimit\"
+  remove_legacy_nft_derper_connlimit_rules
+}
+
+# 旧版误用 inet derper 表：只按 comment 删除本脚本规则，绝不 flush/删除该表。
+remove_legacy_nft_derper_connlimit_rules() {
+  local handle
+  while read -r handle; do
+    [[ -n "$handle" ]] || continue
+    nft delete rule inet derper input handle "$handle" 2>/dev/null || true
+  done < <(nft -a list chain inet derper input 2>/dev/null \
+    | awk '/derper-tls-connlimit/ { for (i=1;i<=NF;i++) if ($i=="handle") { print $(i+1); break } }' || true)
 }
 
 apply_tls_connlimit_iptables() {
@@ -2702,22 +2886,30 @@ apply_tls_connlimit_iptables() {
 }
 
 apply_tls_connlimit() {
-  [[ "${TLS_CONNLIMIT:-0}" =~ ^[0-9]+$ ]] || return 1
-  (( TLS_CONNLIMIT > 0 )) || return 0
-  echo "[步骤] 安装单 IP TLS 连接上限：${TLS_CONNLIMIT}"
-  if command -v nft >/dev/null 2>&1; then
-    apply_tls_connlimit_nft
-  elif command -v iptables >/dev/null 2>&1; then
-    apply_tls_connlimit_iptables
-  else
-    echo "[错误] --tls-connlimit 需要 nft 或 iptables。" >&2
-    return 1
+  decimal_in_closed_range "${TLS_CONNLIMIT:-0}" 0 "${TLS_CONNLIMIT_MAX}" || return 1
+  if _decimal_ge "${TLS_CONNLIMIT:-0}" 1; then
+    echo "[步骤] 安装单 IP TLS 连接上限：${TLS_CONNLIMIT}"
+    if command -v nft >/dev/null 2>&1; then
+      apply_tls_connlimit_nft
+    elif command -v iptables >/dev/null 2>&1; then
+      apply_tls_connlimit_iptables
+    else
+      echo "[错误] --tls-connlimit 需要 nft 或 iptables。" >&2
+      return 1
+    fi
+    return 0
+  fi
+  if [[ "${TLS_CONNLIMIT_EXPLICIT:-0}" -eq 1 ]]; then
+    echo "[步骤] --tls-connlimit 0：移除已安装的 TLS 连接上限规则"
+    remove_tls_connlimit
+    return 0
   fi
 }
 
 remove_tls_connlimit() {
   if command -v nft >/dev/null 2>&1; then
-    nft delete table inet derper 2>/dev/null || true
+    nft delete table inet "${NFT_CONNLIMIT_TABLE}" 2>/dev/null || true
+    remove_legacy_nft_derper_connlimit_rules
   fi
   if command -v iptables >/dev/null 2>&1; then
     iptables -D INPUT -j DERPER-CONNLIMIT 2>/dev/null || true
@@ -2747,15 +2939,32 @@ script_self_path() {
 install_healthcheck_cron() {
   local self ip metrics
   self=$(script_self_path)
+  if [[ ! -f "$self" ]]; then
+    echo "[错误] 无法定位可重复执行的脚本文件（当前路径：${self}）。curl | bash 无法写入可靠 cron，请先把脚本保存到磁盘后再使用 --install-healthcheck-cron。" >&2
+    return 1
+  fi
   ip="${IP_ADDR:-}"
   [[ -n "$ip" ]] || { echo "[错误] 安装健康检查 cron 需要 --ip 或已探测到公网 IP。" >&2; return 1; }
   metrics="${METRICS_TEXTFILE:-${HEALTHCHECK_CRON_METRICS_DEFAULT}}"
   mkdir -p "$(dirname "$HEALTHCHECK_CRON_PATH")"
+  local cron_self cron_ip cron_metrics
+  cron_self=$(printf '%q' "$self")
+  cron_ip=$(printf '%q' "$ip")
+  cron_metrics=$(printf '%q' "$metrics")
+  local cron_port cron_stun cron_level cron_verify
+  cron_port=$(printf '%q' "${DERP_PORT}")
+  cron_stun=$(printf '%q' "${STUN_PORT}")
+  cron_level=$(printf '%q' "${SECURITY_LEVEL}")
+  if [[ "${VERIFY_CLIENTS_MODE}" == "off" ]]; then
+    cron_verify="--no-verify-clients"
+  else
+    cron_verify="--force-verify-clients"
+  fi
   cat >"$HEALTHCHECK_CRON_PATH" <<EOF
 # Managed by deploy_derper_ip_selfsigned.sh. Re-run --install-healthcheck-cron to refresh.
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-*/5 * * * * root ${self} --health-check --ip ${ip} --metrics-textfile ${metrics} >/dev/null 2>&1
+*/5 * * * * root ${cron_self} --health-check --ip ${cron_ip} --derp-port ${cron_port} --stun-port ${cron_stun} --security-level ${cron_level} ${cron_verify} --metrics-textfile ${cron_metrics} >/dev/null 2>&1
 EOF
   chmod 644 "$HEALTHCHECK_CRON_PATH"
   echo "[信息] 已安装健康检查 cron：${HEALTHCHECK_CRON_PATH}（每 5 分钟，--ip ${ip}）"
@@ -2774,6 +2983,13 @@ post_deploy_extras() {
     install_healthcheck_cron || return 1
   fi
   warn_world_writable_socket "$(expected_tailscaled_socket)"
+}
+
+# extras 失败时证书事务已提交，只报告、不回滚已验证的部署。
+run_post_deploy_extras() {
+  post_deploy_extras && return 0
+  echo "[错误] 服务与证书已部署成功，但后续加固失败（--tls-connlimit 或健康检查 cron）。已保留当前部署，不会回滚证书。" >&2
+  return 1
 }
 
 print_firewall_tips() {
@@ -3111,6 +3327,7 @@ health_check_report() {
   fi
 
   infer_ip_from_existing_deployment || true
+  infer_healthcheck_settings_from_unit || true
   validate_settings || true
   check_tailscale_status
   check_derper_status
@@ -3280,6 +3497,7 @@ uninstall_derper() {
     rm -f "${SERVICE_PATH}"
     systemctl daemon-reload 2>/dev/null || true
   fi
+  rm -rf "${SERVICE_PATH}.certs-rollback" 2>/dev/null || true
   echo "[信息] 已卸载 service：${SERVICE_PATH}"
 
   if [[ ${PURGE} -eq 1 ]]; then
@@ -3318,6 +3536,18 @@ uninstall_derper() {
   echo "完成：已卸载 derper 服务。"
 }
 
+wizard_read_choice() {
+  local prompt="$1" allowed="$2" reply=""
+  while true; do
+    read -r -p "$prompt" reply || { echo "[中止] 输入已结束，退出向导。" >&2; return 1; }
+    reply=$(printf '%s' "$reply" | tr 'A-Z' 'a-z')
+    case "$reply" in
+      [$allowed]) printf '%s\n' "$reply"; return 0 ;;
+    esac
+    echo "[错误] 无效选项，请输入 ${allowed} 中的字母。" >&2
+  done
+}
+
 deployment_wizard() {
   # 非交互模式检测
   if [[ "${NON_INTERACTIVE}" -eq 1 ]]; then
@@ -3349,40 +3579,47 @@ EOT
   echo "   a) 个人测试/学习"
   echo "   b) 小团队（<10人）"
   echo "   c) 生产环境"
-  read -r -p "   请选择 (a/b/c): " scenario || { echo "[中止] 输入已结束，退出向导。" >&2; return 1; }
+  scenario=$(wizard_read_choice "   请选择 (a/b/c): " "abc") || return 1
   
   # 问题2：账户偏好
   echo ""
   echo "2. 账户管理偏好？"
   echo "   a) 简单优先（使用当前账户）"
   echo "   b) 安全优先（创建专用账户）"
-  read -r -p "   请选择 (a/b): " account_pref || { echo "[中止] 输入已结束，退出向导。" >&2; return 1; }
+  account_pref=$(wizard_read_choice "   请选择 (a/b): " "ab") || return 1
   
   # 问题3：端口选择
   echo ""
   echo "3. DERP 端口？"
   echo "   a) 443（推荐，防火墙友好）"
   echo "   b) 30399（默认，避免与其他服务冲突）"
-  read -r -p "   请选择 (a/b): " port_choice || { echo "[中止] 输入已结束，退出向导。" >&2; return 1; }
+  port_choice=$(wizard_read_choice "   请选择 (a/b): " "ab") || return 1
   
   # 问题4：客户端验证
   echo ""
   echo "4. 是否启用客户端验证？"
   echo "   a) 是（推荐，更安全）- 需要本地 tailscaled 已登录"
   echo "   b) 否（仅测试环境）"
-  read -r -p "   请选择 (a/b): " verify_choice || { echo "[中止] 输入已结束，退出向导。" >&2; return 1; }
+  verify_choice=$(wizard_read_choice "   请选择 (a/b): " "ab") || return 1
   
   # 问题5：网络环境
   echo ""
   echo "5. 服务器是否位于中国大陆？（用于 Go 代理加速）"
   echo "   a) 是（推荐，配置 goproxy.cn）"
   echo "   b) 否（全球环境）"
-  read -r -p "   请选择 (a/b): " region_choice || { echo "[中止] 输入已结束，退出向导。" >&2; return 1; }
+  region_choice=$(wizard_read_choice "   请选择 (a/b): " "ab") || return 1
   
   # 生成命令（使用模板替换，不用 eval）
   # 注意：每个参数必须是独立的数组元素，以便 exec 正确执行
   local cmd_parts=()
-  cmd_parts+=("sudo" "bash" "$0")
+  if [[ "$(id -u)" -eq 0 ]]; then
+    cmd_parts+=("bash" "$0")
+  elif command -v sudo >/dev/null 2>&1; then
+    cmd_parts+=("sudo" "bash" "$0")
+  else
+    echo "[错误] 需要 root 权限部署，且当前环境没有 sudo。请用 root 重新运行向导。" >&2
+    return 1
+  fi
   cmd_parts+=("--ip" "__IP_PLACEHOLDER__")
   
   # 账户策略
@@ -3528,7 +3765,7 @@ release_tmpdir() {
 # 显式参数优先；未指定时保留已部署身份，首次非交互 root 部署才选专用用户。
 resolve_run_user() {
   local deployed_user=""
-  deployed_user=$(read_derper_unit_content | awk -F= '/^[[:space:]]*User=/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}')
+  deployed_user=$(read_derper_unit_content | awk -F= '/^[[:space:]]*User=/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}' || true)
   DEPLOYED_RUN_USER="$deployed_user"
   [[ "${RUN_USER_EXPLICIT:-0}" -eq 0 ]] || return 0
   if [[ -n "$deployed_user" ]]; then
@@ -3554,9 +3791,13 @@ verify_restored_service() (
 recover_cert_update() {
   rollback_cert_update || return 1
   if [[ "${CERT_ROLLBACK_OCCURRED:-0}" -eq 1 && "${CERT_ROLLBACK_WAS_RUNNING:-0}" -eq 1 ]]; then
+    if [[ ! -f "${SERVICE_PATH}" ]]; then
+      echo "[警告] 已恢复证书，但 derper unit 已不存在，跳过服务重启。" >&2
+      return 0
+    fi
     if ! systemctl restart derper || ! verify_restored_service; then
-      echo "[错误] 旧证书已恢复，但原服务未通过重启验证，请检查 derper。" >&2
-      return 1
+      echo "[警告] 旧证书已恢复，但原服务未通过重启验证，请检查 derper。" >&2
+      return 0
     fi
   fi
 }
@@ -3619,6 +3860,7 @@ main() {
   local check_validate_failed=0
   if [[ "${HEALTH_CHECK}" -eq 1 ]]; then
     infer_ip_from_existing_deployment || true
+    infer_healthcheck_settings_from_unit || true
   else
     detect_public_ip || true
   fi
@@ -3741,7 +3983,8 @@ main() {
     write_systemd_service
     print_firewall_tips
     runtime_checks
-    post_deploy_extras || exit 1
+    commit_cert_update || exit 1
+    run_post_deploy_extras || exit 1
   elif [[ "${REPAIR}" -eq 1 ]]; then
     install_deps
     if [[ "$need_derper_install" -eq 1 ]]; then
@@ -3752,7 +3995,8 @@ main() {
     write_systemd_service
     print_firewall_tips
     runtime_checks
-    post_deploy_extras || exit 1
+    commit_cert_update || exit 1
+    run_post_deploy_extras || exit 1
   else
     # 默认幂等：按需修复
     local changed=0
@@ -3772,16 +4016,16 @@ main() {
     fi
     if [[ $changed -eq 0 ]] && health_is_ok; then
       echo "✅ 已就绪：检测到 derper 正在以纯 IP 模式运行，跳过安装。"
-      post_deploy_extras || exit 1
+      commit_cert_update || exit 1
+      run_post_deploy_extras || exit 1
       exit 0
     fi
     print_firewall_tips
     runtime_checks
-    post_deploy_extras || exit 1
+    commit_cert_update || exit 1
+    run_post_deploy_extras || exit 1
   fi
 
-  commit_cert_update || exit 1
-  CERT_TRANSACTION_ACTIVE=0
   finalize_deployment_report || exit 1
 }
 

@@ -1,5 +1,38 @@
 # Changelog
 
+## [0.2.11] - 2026-09-20
+
+### 🔧 Bug Fixes
+
+1. **Certificate SAN matching is exact; extras failure no longer rolls back a verified deploy**
+   - SAN IPs are compared item-by-item, so `3.4.5.6` no longer matches `13.4.5.6`.
+   - `commit_cert_update` runs immediately after service verification; `--tls-connlimit`/cron failures are reported without reverting certificates.
+   - Uninstall removes `.certs-rollback`; unit files are written atomically and refuse symlinks; missing ss/openssl no longer looks like a start failure.
+
+2. **Range checks no longer use overflowing Bash 64-bit arithmetic**
+   - Ports, certificate days, RegionID, and `--tls-connlimit` are compared as normalized decimal strings, so values like `2^64+443` are no longer accepted as small legal numbers.
+
+3. **Empty-array crash without `timeout`; GOPROXY `direct` precheck was too strict**
+   - Missing `timeout` now uses `_timeout_run`, so Bash 3.2–4.3 with `set -u` no longer crashes on an empty `"${runner[@]}"`.
+   - If GOPROXY includes `direct` and every HTTP proxy is unreachable, the precheck warns and lets Go fall back to direct.
+
+4. **Argument mutexes and cron/connlimit behavior match the implementation**
+   - `--install-healthcheck-cron` conflicts with `--health-check`; explicit `--tls-connlimit` cannot be used in read-only modes; explicit `0` removes installed rules.
+   - Cron pins the full deploy profile and quotes paths with `printf %q`; nftables uses a script-owned table `inet derper_tls_connlimit`.
+
+### 📖 Docs
+
+5. **README/REFERENCE aligned with the script**
+   - Document `--cert-days`/`--derper-version`; formal examples use a public-IP placeholder; dedicated-user samples, cert-directory ownership, broken review links, and `--metrics-textfile` wording are corrected.
+
+### 🧪 Tests
+
+- Main suite `tests/test_deploy_script.sh` (84 cases) plus `tests/test_review_regressions.sh` (14 cases).
+- GitHub Actions `.github/workflows/tests.yml` runs both suites on Ubuntu (Bash 5).
+- Review notes live in repo-root `task-list.md` (CHK-004–CHK-007).
+
+---
+
 ## [0.2.10] - 2026-09-20
 
 ### 🔧 Bug Fixes
@@ -33,7 +66,7 @@
 ### ✨ Features
 
 9. **Optional TLS connection cap `--tls-connlimit N`**
-   - nftables or iptables `connlimit` limits concurrent DERP TLS connections per source IP; `0` disables. `--uninstall` removes the rules.
+   - nftables or iptables `connlimit` limits concurrent DERP TLS connections per source IP. `0` disables the cap. `--uninstall` removes the rules.
 
 10. **One-shot health-check cron `--install-healthcheck-cron`**
     - Writes `/etc/cron.d/derper-healthcheck` (every 5 minutes `--health-check --ip … --metrics-textfile …`). Incompatible with `--uninstall`/`--check`; uninstall deletes the cron file.
@@ -584,4 +617,4 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 **Update Date**: 2026-09-20
 
-**Version**: 0.2.10
+**Version**: 0.2.11

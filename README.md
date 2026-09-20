@@ -1,7 +1,7 @@
 # Tailscale DERP Quick Deploy Script
 
 > **Language / 语言**: [English](#english) | [中文](#中文)  
-> **Version / 版本**: `0.2.10` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
+> **Version / 版本**: `0.2.11` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ---
 
@@ -155,9 +155,10 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # Use current login user
 
 | Parameter | Description | Default | Example |
 |-----------|-------------|---------|---------|
-| `--ip <IPv4>` | Server public IP (must be globally routable) | Auto-detect | `--ip 203.0.113.10` |
+| `--ip <IPv4>` | Server public IP (must be globally routable) | Auto-detect | `--ip <YOUR_PUBLIC_IP>` |
 | `--derp-port <int>` | DERP TLS port | 30399 | `--derp-port 443` |
 | `--stun-port <int>` | STUN UDP port (also written to derpMap `STUNPort`) | 3478 | `--stun-port 3478` |
+| `--cert-days <int>` | Self-signed certificate validity in days (1–365000) | 365 | `--cert-days 365` |
 | `--auto-ufw` | Auto-configure UFW rules | Off | `--auto-ufw` |
 
 > Private/reserved/documentation/multicast addresses are **rejected** in deployment mode; for intranet testing pass `--allow-non-global-ip` explicitly.
@@ -173,12 +174,13 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # Use current login user
 | `--goproxy <URL>` | Go module proxy (no automatic third-party fallback) | Inherit env | `https://goproxy.cn,direct` |
 | `--gosumdb <VALUE>` | Go checksum database | Inherit env | `sum.golang.google.cn` |
 | `--gotoolchain <MODE>` | Toolchain policy | `auto` | `auto` (auto-fetch ≥1.25) |
+| `--derper-version <VER>` | Pin derper module version or git commit | `latest` | `--derper-version v1.80.0` |
 
 ##### Security & Account Management
 
 | Parameter | Description | Default Behavior | Use Case |
 |-----------|-------------|------------------|----------|
-| `--use-current-user` | Use current login user | ✅ Default (first deploy); explicit flag is never overridden | Personal servers, testing |
+| `--use-current-user` | Use current login user (under sudo: `$SUDO_USER`) | ✅ Default (first deploy); explicit flag is never overridden | Personal servers, testing |
 | `--dedicated-user` | Create dedicated `derper` user | Off; default only for first-time non-interactive root with no user flag | **Production strongly recommended** |
 | `--user <username>` | Specify existing user | - | Integration (e.g., `nobody`) |
 | `--allow-non-global-ip` | Allow private/reserved/doc IPs | Off | Intranet testing only |
@@ -225,8 +227,8 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # Use current login user
 |-----------|-------------|--------|----------|
 | `--health-check` | Output health status summary | Text + exit code | cron periodic checks, alerting |
 | `--metrics-textfile <path>` | Export Prometheus metrics (requires `--health-check` or `--install-healthcheck-cron`) | `.prom` file | With node_exporter monitoring |
-| `--install-healthcheck-cron` | Install `/etc/cron.d/derper-healthcheck` (every 5 minutes) | Cron file | Hands-off health + metrics |
-| `--tls-connlimit <N>` | Cap concurrent DERP TLS connections per source IP (`0` = off) | nftables/iptables rule | Soften TLS handshake floods |
+| `--install-healthcheck-cron` | Install `/etc/cron.d/derper-healthcheck` (every 5 minutes) | Cron file | Hands-off health + metrics; not with `--health-check`/`--check` |
+| `--tls-connlimit <N>` | Cap concurrent DERP TLS connections per source IP (explicit `0` removes installed rules; omit to leave them) | nftables/iptables rule | Soften TLS handshake floods; not with `--health-check`/`--check` |
 
 `--uninstall` also removes the health-check cron and `--tls-connlimit` rules. `--relax-socket-perms` restores the original socket mode when the script exits.
 
@@ -260,7 +262,7 @@ derper_process_rss_bytes 3145728     # Process memory usage (bytes)
 
 ```bash
 # 1. Login to server with public IP
-ssh user@203.0.113.10
+ssh user@YOUR_PUBLIC_IP
 
 # 2. Install Tailscale client (if not installed)
 curl -fsSL https://tailscale.com/install.sh | sh
@@ -275,12 +277,12 @@ cd tailscale-derp-quick-deploy
 
 # 5. Pre-check (recommended)
 sudo bash scripts/deploy_derper_ip_selfsigned.sh \
-  --ip 203.0.113.10 \
+  --ip YOUR_PUBLIC_IP \
   --check
 
 # 6. Formal deployment (China network)
 sudo bash scripts/deploy_derper_ip_selfsigned.sh \
-  --ip 203.0.113.10 \
+  --ip YOUR_PUBLIC_IP \
   --derp-port 443 \
   --dedicated-user \
   --security-level standard \
@@ -448,10 +450,10 @@ fi
 
 | Scenario | Recommended Configuration | Expected Results |
 |----------|---------------------------|------------------|
-| **Personal Learning** | `--use-current-user --security-level basic` | 5-min deployment, < 5MB resource usage |
-| **Home Network** | `--derp-port 443 --auto-ufw` | High traversal rate, auto-acceleration for family devices |
-| **Small Teams** | `--dedicated-user --health-check` | Stable operation with monitoring alerts |
-| **Production pilot** | `--security-level paranoid --metrics-textfile` | Stricter systemd hardening + observability (validate compatibility first) |
+| **Personal Learning** | `--ip YOUR_PUBLIC_IP --use-current-user --security-level basic` | 5-min deployment, < 5MB resource usage |
+| **Home Network** | `--ip YOUR_PUBLIC_IP --derp-port 443 --auto-ufw --dedicated-user` | High traversal rate, auto-acceleration for family devices |
+| **Small Teams** | `--ip YOUR_PUBLIC_IP --dedicated-user --install-healthcheck-cron` | Stable operation with periodic health + metrics |
+| **Production pilot** | `--ip YOUR_PUBLIC_IP --dedicated-user --security-level paranoid --install-healthcheck-cron --metrics-textfile /var/lib/node_exporter/textfile_collector/derper.prom` | Stricter systemd hardening + observability (validate compatibility first) |
 
 ---
 
@@ -492,7 +494,7 @@ fi
 
 ### 🎓 Summary
 
-This project compresses the originally manual **20+ steps DERP deployment process** into **a single command** through an intelligent **2100+ line script**, while ensuring:
+This project compresses the originally manual **20+ steps DERP deployment process** into **a single command** through an intelligent **~4100-line script**, while ensuring:
 
 - ✅ **Security**: Tiered systemd hardening + least-privilege execution
 - ✅ **Stability**: Idempotent design + automatic fault recovery
@@ -661,9 +663,10 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # 使用当前登录用户
 
 | 参数 | 说明 | 默认值 | 示例 |
 |------|------|--------|------|
-| `--ip <IPv4>` | 服务器公网 IP（必须全局可路由） | 自动探测 | `--ip 203.0.113.10` |
+| `--ip <IPv4>` | 服务器公网 IP（必须全局可路由） | 自动探测 | `--ip <YOUR_PUBLIC_IP>` |
 | `--derp-port <int>` | DERP TLS 端口 | 30399 | `--derp-port 443` |
 | `--stun-port <int>` | STUN UDP 端口（同时写入 derpMap 的 STUNPort） | 3478 | `--stun-port 3478` |
+| `--cert-days <int>` | 自签证书有效期（天，1–365000） | 365 | `--cert-days 365` |
 | `--auto-ufw` | 自动配置 UFW 规则 | 关闭 | `--auto-ufw` |
 
 > 部署模式会**拒绝**私有/保留/文档/组播等非公网地址；内网测试请显式添加 `--allow-non-global-ip`。
@@ -679,12 +682,13 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # 使用当前登录用户
 | `--goproxy <URL>` | Go 模块代理（不会自动切换第三方代理） | 继承环境 | `https://goproxy.cn,direct` |
 | `--gosumdb <VALUE>` | Go 校验数据库 | 继承环境 | `sum.golang.google.cn` |
 | `--gotoolchain <MODE>` | 工具链策略 | `auto` | `auto`（自动获取 ≥1.25）|
+| `--derper-version <VER>` | 固定 derper 模块版本或 git commit | `latest` | `--derper-version v1.80.0` |
 
 ##### 安全与账户管理
 
 | 参数 | 说明 | 默认行为 | 使用场景 |
 |------|------|----------|----------|
-| `--use-current-user` | 使用当前登录用户 | ✅ 默认（首次部署）；显式指定后不会被覆盖 | 个人服务器、测试环境 |
+| `--use-current-user` | 使用当前登录用户（sudo 下为 `$SUDO_USER`） | ✅ 默认（首次部署）；显式指定后不会被覆盖 | 个人服务器、测试环境 |
 | `--dedicated-user` | 创建专用 `derper` 用户 | 关闭；仅首次非交互 root 且未指定用户时作为默认 | **生产环境强烈推荐** |
 | `--user <username>` | 指定已有用户 | - | 集成到现有环境（如 `nobody`） |
 | `--allow-non-global-ip` | 允许私有/保留/文档等非公网 IP | 关闭 | 仅内网测试 |
@@ -731,8 +735,8 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # 使用当前登录用户
 |------|------|------|----------|
 | `--health-check` | 输出健康状态摘要 | 文本 + 退出码 | cron 定时检查、告警脚本 |
 | `--metrics-textfile <path>` | 导出 Prometheus 指标（必须与 `--health-check` 或 `--install-healthcheck-cron` 一起使用） | `.prom` 文件 | 配合 node_exporter 监控 |
-| `--install-healthcheck-cron` | 安装 `/etc/cron.d/derper-healthcheck`（每 5 分钟） | cron 文件 | 无人值守健康检查与指标 |
-| `--tls-connlimit <N>` | 限制单 IP 并发 DERP TLS 连接（`0` 表示关闭） | nftables/iptables 规则 | 缓解 TLS 握手洪水 |
+| `--install-healthcheck-cron` | 安装 `/etc/cron.d/derper-healthcheck`（每 5 分钟） | cron 文件 | 无人值守健康检查与指标；不能与 `--health-check`/`--check` 同用 |
+| `--tls-connlimit <N>` | 限制单 IP 并发 DERP TLS 连接（显式 `0` 移除已装规则；省略则不改动） | nftables/iptables 规则 | 缓解 TLS 握手洪水；不能与 `--health-check`/`--check` 同用 |
 
 `--uninstall` 会同时删除健康检查 cron 与 `--tls-connlimit` 规则。`--relax-socket-perms` 在脚本退出时恢复 socket 原权限。
 
@@ -766,7 +770,7 @@ derper_process_rss_bytes 3145728     # 进程内存占用（字节）
 
 ```bash
 # 1. 登录服务器，确保有公网 IP
-ssh user@203.0.113.10
+ssh user@YOUR_PUBLIC_IP
 
 # 2. 安装 Tailscale 客户端（如未安装）
 curl -fsSL https://tailscale.com/install.sh | sh
@@ -781,12 +785,12 @@ cd tailscale-derp-quick-deploy
 
 # 5. 预检查（推荐）
 sudo bash scripts/deploy_derper_ip_selfsigned.sh \
-  --ip 203.0.113.10 \
+  --ip YOUR_PUBLIC_IP \
   --check
 
 # 6. 正式部署（国内网络）
 sudo bash scripts/deploy_derper_ip_selfsigned.sh \
-  --ip 203.0.113.10 \
+  --ip YOUR_PUBLIC_IP \
   --derp-port 443 \
   --dedicated-user \
   --security-level standard \
@@ -954,10 +958,10 @@ fi
 
 | 场景 | 推荐配置 | 预期效果 |
 |------|----------|----------|
-| **个人学习** | `--use-current-user --security-level basic` | 5分钟部署，资源占用 < 5MB |
-| **家庭网络** | `--derp-port 443 --auto-ufw` | 穿透率高，家人设备自动加速 |
-| **小团队** | `--dedicated-user --health-check` | 稳定运行，配合监控告警 |
-| **加固试点** | `--security-level paranoid --metrics-textfile` | 更严 systemd 加固 + 可观测（需先验证兼容性） |
+| **个人学习** | `--ip YOUR_PUBLIC_IP --use-current-user --security-level basic` | 5分钟部署，资源占用 < 5MB |
+| **家庭网络** | `--ip YOUR_PUBLIC_IP --derp-port 443 --auto-ufw --dedicated-user` | 穿透率高，家人设备自动加速 |
+| **小团队** | `--ip YOUR_PUBLIC_IP --dedicated-user --install-healthcheck-cron` | 稳定运行，周期健康检查与指标 |
+| **加固试点** | `--ip YOUR_PUBLIC_IP --dedicated-user --security-level paranoid --install-healthcheck-cron --metrics-textfile /var/lib/node_exporter/textfile_collector/derper.prom` | 更严 systemd 加固 + 可观测（需先验证兼容性） |
 
 ---
 
@@ -998,7 +1002,7 @@ fi
 
 ### 🎓 总结
 
-这个项目通过一个 **2100+ 行的智能脚本**，将原本需要手动执行 20+ 步骤的 DERP 部署流程，压缩为**一条命令**，同时保证：
+这个项目通过一个 **约 4100 行的智能脚本**，将原本需要手动执行 20+ 步骤的 DERP 部署流程，压缩为**一条命令**，同时保证：
 
 - ✅ **安全性**：分级 systemd 加固 + 最小权限运行
 - ✅ **稳定性**：幂等设计 + 自动故障恢复
@@ -1014,7 +1018,7 @@ fi
 - **详细技术文档**：
   - [更新日志（中文）](docs/CHANGELOG_CN.md) | [Changelog (English)](docs/CHANGELOG_EN.md)
   - [技术参考（中文）](docs/REFERENCE_CN.md) | [Technical Reference (English)](docs/REFERENCE_EN.md)
-  - [2026-09-20 部署问题核查](docs/BUGFIX_REVIEW_20260920.md)
+  - 审查记录见仓库根目录 `task-list.md`（CHK-004～CHK-007）
 
 ---
 
