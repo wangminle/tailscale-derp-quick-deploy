@@ -1,5 +1,27 @@
 # Changelog
 
+## [0.2.12] - 2026-09-20
+
+### 🔧 Bug Fixes
+
+1. **Command substitution no longer blocks for the full timeout on hosts without `timeout(1)`**
+   - The `_timeout_run` fallback killer subshell now redirects stdout/stderr, so an orphaned `sleep` can no longer hold the `$( )` pipe write end; previously every module query on a timeout-less host stalled 60s and the install path left a 15-minute `sleep 900` orphan.
+
+### 📖 Docs
+
+2. **`--cert-days` range documented; changelog history link fixed**
+   - usage and both REFERENCE docs state the `--cert-days` range 1–365000; usage examples use a public-IP placeholder.
+   - The stale review link in the 0.2.10 changelog history now points at `task-list.md` (CHK-004–CHK-009).
+
+### 🧪 Tests
+
+- Main suite gains 2 cases: command substitution must not wait the full timeout without timeout(1), and main must commit certificates before post-deploy extras; `resolve_run_user` runs as a plain statement under an ERR trap, so reverting the fix turns tests red.
+- Main suite `tests/test_deploy_script.sh` (86 cases) plus `tests/test_review_regressions.sh` (14 cases); the harness prints `not ok` with the function name on failure.
+- GitHub Actions `.github/workflows/tests.yml` runs both suites on Ubuntu (Bash 5).
+- Review notes live in repo-root `task-list.md` (CHK-004–CHK-009).
+
+---
+
 ## [0.2.11] - 2026-09-20
 
 ### 🔧 Bug Fixes
@@ -75,7 +97,7 @@
 
 - Main suite `tests/test_deploy_script.sh` (64 cases) plus `tests/test_review_regressions.sh` (13 cases).
 - GitHub Actions `.github/workflows/tests.yml` runs both suites on Ubuntu (Bash 5).
-- Review notes: `docs/BUGFIX_REVIEW_20260920.md`.
+- Review notes live in repo-root `task-list.md` (CHK-004–CHK-009); planning drafts stay in local `plans/` (not versioned).
 
 ---
 
@@ -617,4 +639,4 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 **Update Date**: 2026-09-20
 
-**Version**: 0.2.11
+**Version**: 0.2.12

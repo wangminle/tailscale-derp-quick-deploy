@@ -1420,6 +1420,9 @@ test_tls_connlimit_nft_uses_script_owned_table() {
 test_readme_documents_missing_flags_and_runnable_examples() {
   grep -q -- '--cert-days' "$ROOT_DIR/README.md" || fail "README must document --cert-days"
   grep -q -- '--derper-version' "$ROOT_DIR/README.md" || fail "README must document --derper-version"
+  if bash "$SCRIPT" --help | grep -q -- '--ip 203.0.113.10'; then
+    fail "help examples must not use TEST-NET-3 as a deploy IP"
+  fi
   if awk '/Complete Example: Zero to Production/,/^#### Output Example/' "$ROOT_DIR/README.md" | grep -q -- '--ip 203.0.113.10'; then
     fail "EN formal deploy example must not use TEST-NET-3 as --ip"
   fi
@@ -1433,9 +1436,13 @@ test_readme_documents_missing_flags_and_runnable_examples() {
   if awk '/典型应用场景对比/,/^### ⚠️/' "$ROOT_DIR/README.md" | grep -q -- '`--dedicated-user --health-check`'; then
     fail "CN scenario table must not treat --health-check as a deploy combo"
   fi
-  if grep -q 'docs/BUGFIX_REVIEW_20260920.md' "$ROOT_DIR/README.md"; then
-    fail "README must not link to missing docs/BUGFIX_REVIEW_20260920.md"
+  if grep -q 'docs/BUGFIX_REVIEW_20260920.md' "$ROOT_DIR/README.md" \
+       "$ROOT_DIR/docs/CHANGELOG_CN.md" "$ROOT_DIR/docs/CHANGELOG_EN.md"; then
+    fail "docs must not link to missing docs/BUGFIX_REVIEW_20260920.md"
   fi
+  grep -q '1–365000' "$ROOT_DIR/docs/REFERENCE_CN.md" || fail "REFERENCE_CN must document --cert-days range"
+  grep -q '1–365000' "$ROOT_DIR/docs/REFERENCE_EN.md" || fail "REFERENCE_EN must document --cert-days range"
+  bash "$SCRIPT" --help | grep -q '1–365000' || fail "usage must document --cert-days range"
   ok "README documents flags and uses runnable public-IP examples"
 }
 
@@ -1491,13 +1498,24 @@ test_install_healthcheck_cron_rejects_missing_script() {
 test_resolve_run_user_survives_unreadable_unit() {
   (
     DERPER_TEST_MODE=1 source "$SCRIPT"
+    set -euo pipefail
+    trap 'fail "unreadable unit aborted under set -e (status=$?)"' ERR
+    local_tmp=$(mktemp -d)
+    trap 'rm -rf "$local_tmp"' EXIT
+    SERVICE_PATH="${local_tmp}/derper.service"
+    printf '[Service]\nUser=derper\n' >"$SERVICE_PATH"
     RUN_USER_EXPLICIT=0
     RUN_USER=root
     NON_INTERACTIVE=0
     unset SUDO_USER
     id() { echo 1; }
+    # 普通语句 + ERR trap：条件上下文会关掉 errexit，删掉 || true 仍假绿。
+    cat() { return 1; }
+    read_derper_unit_content >/dev/null
+    unset -f cat
     read_derper_unit_content() { return 1; }
-    resolve_run_user || fail "unreadable unit must not abort resolve_run_user"
+    resolve_run_user
+    [[ "$RUN_USER" == root ]] || fail "unreadable unit must not abort resolve_run_user"
   )
   ok "resolve_run_user survives unreadable unit content"
 }
@@ -1560,6 +1578,49 @@ test_service_verified_skips_missing_probe_tools() {
     service_verified_running || fail "active service must verify when ss/openssl are missing"
   )
   ok "service verification skips missing ss/openssl instead of failing"
+}
+
+test_timeout_run_fallback_does_not_block_command_substitution() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    command() {
+      if [[ "$1" == -v && "$2" == timeout ]]; then return 1; fi
+      builtin command "$@"
+    }
+    local start end elapsed out
+    if command -v python3 >/dev/null 2>&1; then
+      start=$(python3 -c 'import time; print(int(time.time()*1000))')
+    else
+      start=$(($(date +%s) * 1000))
+    fi
+    out=$(_timeout_run 4 echo ok) || fail "fast command should succeed without timeout(1)"
+    [[ "$out" == ok ]] || fail "command substitution should capture output, got: ${out}"
+    if command -v python3 >/dev/null 2>&1; then
+      end=$(python3 -c 'import time; print(int(time.time()*1000))')
+    else
+      end=$(($(date +%s) * 1000))
+    fi
+    elapsed=$((end - start))
+    [[ "$elapsed" -lt 2000 ]] || fail "fast command in \$() must not wait full timeout, elapsed=${elapsed}ms"
+  )
+  ok "_timeout_run fallback does not block command substitution for the full timeout"
+}
+
+test_main_commits_certs_before_post_deploy_extras() {
+  awk '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*$/ { next }
+    /run_post_deploy_extras[[:space:]]*\(/ { next }
+    /run_post_deploy_extras/ {
+      if (prev !~ /commit_cert_update/) {
+        print "run_post_deploy_extras without preceding commit_cert_update at line " NR > "/dev/stderr"
+        bad = 1
+      }
+    }
+    { prev = $0 }
+    END { exit bad + 0 }
+  ' "$SCRIPT" || fail "every run_post_deploy_extras call must immediately follow commit_cert_update"
+  ok "main commits certs before post-deploy extras"
 }
 
 test_wizard_read_choice_rejects_invalid() {
@@ -1653,4 +1714,6 @@ test_resolve_run_user_survives_unreadable_unit
 test_commit_cert_update_clears_active_transaction
 test_run_post_deploy_extras_keeps_verified_deploy
 test_service_verified_skips_missing_probe_tools
+test_timeout_run_fallback_does_not_block_command_substitution
+test_main_commits_certs_before_post_deploy_extras
 test_wizard_read_choice_rejects_invalid

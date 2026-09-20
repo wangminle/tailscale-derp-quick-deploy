@@ -1,5 +1,27 @@
 # 更新日志
 
+## [0.2.12] - 2026-09-20
+
+### 🔧 Bug 修复
+
+1. **无 `timeout(1)` 主机上命令替换被孤儿 `sleep` 卡满整个超时**
+   - `_timeout_run` 后备路径的 killer 子 shell 重定向 stdout/stderr，孤儿 `sleep` 不再持有 `$( )` 管道写端；此前无 timeout 主机每次模块查询必卡 60 秒，install 路径还会遗留 15 分钟的 `sleep 900` 孤儿。
+
+### 📖 文档
+
+2. **usage/REFERENCE 补 `--cert-days` 范围；CHANGELOG 历史条目断链校正**
+   - usage 与 REFERENCE 中英的 `--cert-days` 标注范围 1–365000；usage 示例改公网 IP 占位符。
+   - CHANGELOG 0.2.10 历史条目的失效审查链接改为指向 `task-list.md`（CHK-004～CHK-009）。
+
+### 🧪 测试
+
+- 主套件新增 2 项：无 timeout 时命令替换不被卡满超时、main 必须先 commit 证书再执行 extras；`resolve_run_user` 断言改为普通语句 + ERR trap，回退修复即变红。
+- 主套件 `tests/test_deploy_script.sh` 86 项；`tests/test_review_regressions.sh` 14 项，harness 失败时输出 `not ok` 加函数名。
+- GitHub Actions `.github/workflows/tests.yml` 在 Ubuntu（Bash 5）上跑两套测试。
+- 审查记录见仓库根目录 `task-list.md`（CHK-004～CHK-009）。
+
+---
+
 ## [0.2.11] - 2026-09-20
 
 ### 🔧 Bug 修复
@@ -75,7 +97,7 @@
 
 - 主套件 `tests/test_deploy_script.sh` 64 项；`tests/test_review_regressions.sh` 13 项。
 - GitHub Actions `.github/workflows/tests.yml` 在 Ubuntu（Bash 5）上跑两套测试。
-- 逐项核查记录：`docs/BUGFIX_REVIEW_20260920.md`。
+- 审查记录见仓库根目录 `task-list.md`（CHK-004～CHK-009）；规划讨论稿在本地 `plans/`（不纳入版本库）。
 
 ---
 
@@ -617,4 +639,4 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 **更新日期**：2026-09-20
 
-**版本**：0.2.11
+**版本**：0.2.12

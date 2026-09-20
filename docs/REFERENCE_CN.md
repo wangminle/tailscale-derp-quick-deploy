@@ -3,7 +3,7 @@
 > 本文是中文的详细技术参考。主仓库首页 `README.md` 为精简版中文快速上手；英文详细参考见同目录的 `REFERENCE_EN.md`。
 
 > **脚本文件**：`deploy_derper_ip_selfsigned.sh`  
-> **当前版本**：0.2.11（2026-09-20）  
+> **当前版本**：0.2.12（2026-09-20）  
 > **查看版本**：`bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
@@ -253,7 +253,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 --ip <IPv4>               服务器公网 IP（推荐显式传入；缺省自动探测）
 --derp-port <int>         DERP TLS 端口，默认 30399/TCP
 --stun-port <int>         STUN 端口，默认 3478/UDP
---cert-days <int>         自签证书有效期（天），默认 365
+--cert-days <int>         自签证书有效期（天），默认 365，范围 1–365000
 --auto-ufw                若检测到 UFW，自动放行端口
 
 --goproxy <URL>           Go 模块代理，例：https://goproxy.cn,direct

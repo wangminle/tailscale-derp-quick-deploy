@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # 脚本自身版本（与 docs/CHANGELOG_*.md、仓库根目录 VERSION 保持同步）
-SCRIPT_VERSION="0.2.11"
+SCRIPT_VERSION="0.2.12"
 SCRIPT_VERSION_DATE="2026-09-20"
 
 # 默认端口
@@ -130,7 +130,7 @@ usage() {
                           内网/保留/文档地址默认拒绝，测试需加 --allow-non-global-ip。
   --derp-port             DERP TLS 端口，默认 30399/TCP。
   --stun-port             STUN 端口，默认 3478/UDP（同时写入 derpMap 的 STUNPort）。
-  --cert-days             自签临时证书有效期（天），默认 365。
+  --cert-days             自签临时证书有效期（天），默认 365，范围 1–365000。
   --auto-ufw              若检测到 UFW，自动放行端口规则。
   --goproxy URL           设置 GOPROXY，例如 https://goproxy.cn,direct（默认继承环境）。
   --gosumdb VALUE         设置 GOSUMDB，例如 sum.golang.google.cn（默认继承环境）。
@@ -175,11 +175,11 @@ usage() {
                           防火墙规则和用户/组账户需手动确认，不会自动删除。
 
 示例：
-  sudo bash $0 --ip 203.0.113.10 --derp-port 30399 --auto-ufw \
+  sudo bash $0 --ip <你的公网IP> --derp-port 30399 --auto-ufw \
     --goproxy https://goproxy.cn,direct --gosumdb sum.golang.google.cn
 
    # 仅健康检查 + 导出 Prometheus 文本（可配合 cron）
-   sudo bash $0 --ip 203.0.113.10 --health-check --metrics-textfile /var/lib/node_exporter/textfile_collector/derper.prom
+   sudo bash $0 --ip <你的公网IP> --health-check --metrics-textfile /var/lib/node_exporter/textfile_collector/derper.prom
 
    # 一键卸载服务并清理安装目录
    sudo bash $0 --uninstall --purge
@@ -981,7 +981,10 @@ infer_healthcheck_settings_from_unit() {
   fi
 }
 
-# 兼容 timeout：优先使用系统 timeout，缺失时用后台进程模拟
+# 兼容 timeout：优先使用系统 timeout，缺失时用后台进程模拟。
+# killer 必须重定向 stdout/stderr：否则在 $( ) 中调用时，命令提前结束后
+# kill killer 只杀掉子 shell，其子进程 sleep 被孤儿化并继续持有管道写端，
+# 调用方会阻塞满整个超时（无 timeout 主机每次模块查询必卡 60 秒）。
 _timeout_run() {
   local secs="$1"; shift
   if command -v timeout >/dev/null 2>&1; then
@@ -989,7 +992,7 @@ _timeout_run() {
   else
     "$@" &
     local pid=$!
-    ( sleep "$secs" && kill "$pid" 2>/dev/null ) &
+    ( sleep "$secs" && kill "$pid" 2>/dev/null ) >/dev/null 2>&1 &
     local killer=$!
     wait "$pid" 2>/dev/null
     local rc=$?

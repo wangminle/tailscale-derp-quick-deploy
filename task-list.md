@@ -43,6 +43,8 @@
 | BUG-029 | 修复 | service_verified_running 的 ((tries++)) 在 bash≥4 + set -e 下首值 0 返回 1，是哑弹：当前调用点恰在条件上下文未爆，未来以普通语句调用即无声中止 | 2026-09-20 11:27 | 2026-09-20 12:23 | 已修复 | scripts/deploy_derper_ip_selfsigned.sh:2240；改 ((++tries)) 或 tries=$((tries+1))。；((tries++)) 改为 tries=$((tries + 1))，避免 bash≥4 + set -e 在 tries=0 时中止。 |
 | BUG-030 | 修复 | resolve_run_user 的 deployed_user=$(read_derper_unit_content \| awk …) 无 \|\| true：unit 存在但不可读（chmod 600/非 root --check）时 pipefail + set -e 静默退出，无任何脚本自身报错 | 2026-09-20 11:27 | 2026-09-20 12:23 | 已修复 | scripts/deploy_derper_ip_selfsigned.sh:3663；同文件 check_derper_status、infer_ip_from_existing_deployment 均已写 \|\| true，此处漏。；read_derper_unit_content 的 cat 加 \|\| true；resolve_run_user 管道补 \|\| true，与 check_derper_status/infer_ip 一致。 |
 | BUG-031 | 修复 | 测试状态泄漏掩盖断言：test_healthcheck_cron_conflicts_with_uninstall 设 INSTALL_HEALTHCHECK_CRON=1 不复位，后续 test_tls_connlimit_conflicts_with_readonly_modes 被 cron 互斥规则先拒绝，删掉 tls 校验测试仍绿 | 2026-09-20 11:27 | 2026-09-20 12:23 | 已修复 | tests/test_deploy_script.sh:1139-1146 等；另有多处 mock 函数（command/curl/ss/nft 等）以全局形式泄漏，靠执行顺序侥幸不炸；建议统一子 shell 包裹或 teardown unset -f。；互斥/mock 测试改子 shell；tls 冲突断言必须命中 tls-connlimit 文案，避免被 cron 互斥误绿。 |
+| BUG-032 | 修复 | _timeout_run 后备路径（无 timeout(1) 环境，正是 BUG-017 声称支持的场景）killer 子 shell 被杀后 sleep 被孤儿化，继续持有命令替换管道写 FD：$( ) 调用方阻塞满整个超时时长——本机复现 0.5 秒命令在 $( ) 中卡满 4 秒；resolve_derper_module_version 在 $( ) 中调用，无 timeout 主机每次部署/修复必卡 60 秒，install_derper 路径遗留 sleep 900 孤儿 15 分钟 | 2026-09-20 13:35 | 2026-09-20 14:36 | 已修复 | scripts/deploy_derper_ip_selfsigned.sh:992。最小修复：killer 子 shell 输出重定向 ( sleep "$secs" && kill "$pid" ) >/dev/null 2>&1 &，sleep 不再持有管道；或子 shell 内 trap TERM 时连 sleep 一起杀。BUG-017 修复把更多调用点改走该函数，使此缺陷从死代码变成必走路径。；killer 子 shell 已重定向 stdout/stderr。回归测试：无 timeout 时命令替换内 4 秒预算的 echo 实测 37ms（回退重定向前 4138ms 变红）。 |
+| BUG-033 | 修复 | 变异测试证明两处修复无测试钉住：回退 BUG-025 的 main() commit/extras 顺序、删掉 BUG-030 的 \|\| true，两套测试仍全绿 | 2026-09-20 13:35 | 2026-09-20 14:36 | 已修复 | test_run_post_deploy_extras_keeps_verified_deploy 只测单元消息不测 main 顺序，建议加 main 级集成测试；test_resolve_run_user_survives_unreadable_unit 在条件上下文调用，errexit 被禁用导致假绿，建议子 shell 普通语句 + ERR trap。另：test_review_regressions.sh 循环 harness 失败时无 not ok 输出（低）。；已加 test_main_commits_certs_before_post_deploy_extras（awk 钉住 extras 调用前必须 commit）；test_resolve_run_user 改为普通语句+ERR trap，变异删除 pipeline 或 cat 的 \|\| true 均变红。审查套件 harness 失败时输出 not ok 加函数名。 |
 
 ## 调整事项
 
@@ -56,6 +58,7 @@
 | ADJ-006 | 调整 | 从版本库取消跟踪已提交的 plans/ 文件 | 2026-09-20 10:20 | 2026-09-20 10:20 | 已完成 | git rm --cached 取消跟踪 5 个文件，本地保留；.gitignore 增加 plans/。已并入未推送的 V0.2.10-Build0179，不另开 commit。 |
 | ADJ-007 | 调整 | 从 git 历史彻底清除 plans/ 并 force-with-lease 推送 main | 2026-09-20 10:25 | 2026-09-20 10:25 | 已完成 | git filter-repo 移除 plans/ 路径；过期 reflog 并 gc prune 清除 41af117 等悬空提交；git push --force-with-lease origin main。本地文件保留。docs/DEFECT_ANALYSIS 旧路径不在本次清除范围。 |
 | ADJ-008 | 调整 | 版本号 0.2.10 → 0.2.11 | 2026-09-20 12:27 | 2026-09-20 12:27 | 已完成 | SCRIPT_VERSION / VERSION / README / REFERENCE / CHANGELOG 统一为 0.2.11（2026-09-20）。收录 [[BUG-017]]~[[BUG-031]]、[[DOC-004]] [[DOC-005]] [[TST-004]]~[[TST-006]]。 |
+| ADJ-009 | 调整 | 版本号 0.2.11 → 0.2.12 | 2026-09-20 14:52 | 2026-09-20 14:52 | 已完成 | SCRIPT_VERSION / VERSION / README / REFERENCE / CHANGELOG 统一为 0.2.12（2026-09-20）。收录 [[BUG-032]] [[BUG-033]]、[[DOC-006]]、[[TST-007]]、[[CHK-008]] [[CHK-009]]。CHANGELOG 0.2.11 小节恢复为已提交内容（84 项、CHK-004～007），0.2.11 之后的新修复移入新增 0.2.12 小节。 |
 
 ## 检查事项
 
@@ -68,6 +71,8 @@
 | CHK-005 | 检查 | 核验外部审查提出的 3 项 0.2.10 遗留问题并修复 | 2026-09-20 10:53 | 2026-09-20 11:10 | 已完成 | 三项均成立，见 [[BUG-017]] [[BUG-018]] [[BUG-019]]。审查所称 HEAD 41af117 已过时，当前为改写历史后的 0.2.10 提交。 |
 | CHK-006 | 检查 | 核验双审查器提出的 4 项 0.2.10 缺陷：3 项脚本 + 1 项 README | 2026-09-20 11:11 | 2026-09-20 11:40 | 已完成 | 检查时均未修复。随后落地 [[BUG-020]] [[BUG-021]] [[BUG-022]] 与 [[DOC-004]]。 |
 | CHK-007 | 检查 | 全仓复审：5 路并行审查脚本（3969 行）、两套测试与四份文档 | 2026-09-20 11:27 | 2026-09-20 11:27 | 已完成 | 基线全绿（主套件 76 项 + 审查回归 13 项）。确认 8 项脚本/测试待修复（[[BUG-024]]~[[BUG-031]]，最高优先级为 SAN 子串误判、extras 失败回滚已验证部署、uninstall 遗留事务备份）与 3 项文档中级失实（[[DOC-005]]）；另记录约 15 项低级健壮性瑕疵（usage 文案偏严、wizard 硬编码 sudo、cron 自身路径未校验、大写 commit 不识别、空输入哈希 e3b0c442 等），随对应条目修复时一并处理。 |
+| CHK-008 | 检查 | 精审 V0.2.11（3d00643）全部 15 项修复 BUG-017~031 | 2026-09-20 12:44 | 2026-09-20 12:44 | 已完成 | 结论：未发现新的 P1/P2。验证矩阵 macOS Bash 3.2、debian:12 Bash 5.2、Bash 5.2+systemctl shim 均为 84+14 全绿。apply_tls_connlimit 默认路径无 else 的 if 返回 0，不构成 bug。三条备忘（非阻塞）：live_cert_sha256_raw 在 sha256_hex 失败后 return 0（下游空指纹仍安全失败）；--derp-port 0443 校验通过但原文写入 unit（0.2.10 前既有）；GA 个别测试未 stub systemctl is-active 产生 stderr 噪音。待办仍仅 OPS-001~006。 |
+| CHK-009 | 检查 | 对 CHK-008 结论的交叉复核：逐条核验 0.2.11 修复 + 三路并行复审 diff（e7aa336..3d00643） | 2026-09-20 13:35 | 2026-09-20 13:35 | 已完成 | 11 项修复逐条核验属实（含变异测试 20/22 被测试钉住）。但发现 CHK-008 漏掉 1 项 P2：_timeout_run 后备路径孤儿 sleep 阻塞 $( ) 调用方满超时时长（本机复现，见 [[BUG-032]]）；另 2 处修复无测试钉住（[[BUG-033]]）；2 项低级文档残留（[[DOC-006]]）。 |
 
 ## 测试数据
 
@@ -79,6 +84,7 @@
 | TST-004 | 检查 | 主套件新增 7 项覆盖 timeout 缺失、参数互斥、connlimit 0、cron 引号与 GOPROXY direct | 2026-09-20 10:53 | 2026-09-20 11:10 | 已完成 | tests/test_deploy_script.sh 64 → 71；审查回归 13 项仍全过。本机 Bash 3.2 两套均 exit 0。 |
 | TST-005 | 检查 | 主套件新增溢出、cron 完整参数、unit 推断、nft 专属表与 README 示例回归 | 2026-09-20 11:11 | 2026-09-20 11:40 | 已完成 | tests/test_deploy_script.sh 71 → 76；审查回归 13 项仍全过。bash -n 与 git diff --check 通过。 |
 | TST-006 | 检查 | 主套件新增 SAN 子串/原子 unit/空指纹/cron 路径/用户解析/extras 提交/缺工具跳过/向导选项校验；审查回归新增 restart 失败降级警告 | 2026-09-20 12:23 | 2026-09-20 12:23 | 已完成 | tests/test_deploy_script.sh 76 → 84；test_review_regressions.sh 13 → 14。互斥测试改子 shell，tls 冲突必须命中 tls-connlimit 文案。bash -n 与 git diff --check 通过。 |
+| TST-007 | 检查 | 主套件新增 timeout 后备不阻塞、main commit/extras 顺序；加固 resolve_run_user 与 CHANGELOG/REFERENCE 文档断言 | 2026-09-20 14:36 | 2026-09-20 14:36 | 已完成 | tests/test_deploy_script.sh 84 → 86；test_review_regressions.sh 仍 14 项但 harness 失败会打印 not ok。变异：回退 killer 重定向、对调 commit/extras、删除两处 \|\| true 均使对应测试变红。 |
 
 ## 文档维护
 
@@ -89,6 +95,7 @@
 | DOC-003 | 文档 | 同步 --tls-connlimit 0 / cron 互斥 / GOPROXY direct 回退说明 | 2026-09-20 10:53 | 2026-09-20 11:10 | 已完成 | README 中英参数表、REFERENCE_CN/EN、CHANGELOG_CN/EN 0.2.10 条目已更新。 |
 | DOC-004 | 文档 | README 中英补 --cert-days/--derper-version，正式示例改公网 IP 占位符，场景表改为可执行组合 | 2026-09-20 11:11 | 2026-09-20 11:40 | 已完成 | TEST-NET-3 203.0.113.10 不再作为正式 --ip 示例；ACL 输出样例仍可用文档地址。CHANGELOG_CN/EN 已记 11–14。 |
 | DOC-005 | 文档 | 文档三处中级失实：REFERENCE_EN “Dedicated derper user” 示例误用 --use-current-user（标题与内容对调）；REFERENCE_CN:431/EN:399 证书目录所有权写成 derper:derper（实际 root:组只读）；README:1021 与 CHANGELOG_CN/EN:59 链接指向不存在的 docs/BUGFIX_REVIEW_20260920.md（实际在 plans/） | 2026-09-20 11:27 | 2026-09-20 12:23 | 已完成 | 顺带修正低级项：README “2100+ 行”实际约 3900 行；--use-current-user“等价于 --user $USER”说法不准（sudo 下实为 SUDO_USER）；usage 与 REFERENCE 中 --metrics-textfile “必须与 --health-check 一起使用”偏严（实现允许配 --install-healthcheck-cron）。；REFERENCE_EN 专用用户示例改为 --dedicated-user；证书目录改为 root:服务组 750/密钥 640；断链改为指向 task-list.md。顺带：README 约 4100 行、SUDO_USER 文案、metrics-textfile 允许配 cron、wizard 无 sudo 的 root 容器、选择题校验、cron 校验脚本路径、大写 commit、空指纹 e3b0c442 拒绝。 |
+| DOC-006 | 文档 | DOC-005 残留两处低级文档问题：CHANGELOG_CN/EN 0.2.10 历史条目（现 :78）仍引用未入库的 docs/BUGFIX_REVIEW_20260920.md（文件在 plans/ 且已被 git 历史清除）；REFERENCE_CN:256/EN:221 的 --cert-days 未标注有效范围 1–365000（README 已标注） | 2026-09-20 13:35 | 2026-09-20 14:36 | 已完成 | 历史条目属行内代码而非可点链接，严重度低；建议改为指向 task-list.md（CHK-004～CHK-009）或加注文件位于未入库 plans/。；CHANGELOG 0.2.10 历史条目改为指向 task-list.md（CHK-004～CHK-009）；REFERENCE 中英与 usage 的 --cert-days 补 1–365000；test_readme 同时钉住 CHANGELOG 断链与范围文案。 |
 
 ## 功能开发
 

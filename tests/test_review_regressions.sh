@@ -187,12 +187,16 @@ test_legacy_symlink_migration() {
   [[ "$(cat "$INSTALL_DIR/certs/$IP_ADDR.key")" == oldkey ]] || fail '迁移私钥内容改变'
 }
 for test_name in test_legacy_symlink_migration test_cleanup_restarts_previously_running_service test_new_root_default test_real_certificate_write_failure test_interrupted_rollback test_rotation_decline_preserves_certificate test_module_query_preserves_network_settings test_explicit_user test_existing_user test_commit_versions test_certificate_resume test_rotation_requires_ack test_certificate_rollback test_recover_restart_failure_is_warning; do
-  (
+  if (
     DERPER_TEST_MODE=1 source "$SCRIPT"
     case_tmp=$(mktemp -d)
     SERVICE_PATH="$case_tmp/derper.service"
     trap 'rm -rf "$case_tmp"' EXIT
     "$test_name"
-  )
-  echo "ok - $test_name"
+  ); then
+    echo "ok - $test_name"
+  else
+    echo "not ok - $test_name" >&2
+    exit 1
+  fi
 done

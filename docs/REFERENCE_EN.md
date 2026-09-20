@@ -3,7 +3,7 @@
 > This is the detailed English reference. For the simplified Chinese quickstart now used as the main README, go to `../README.md`. For the detailed Chinese reference, see `REFERENCE_CN.md` in this folder.
 
 > **Script File**: `deploy_derper_ip_selfsigned.sh`  
-> **Current Version**: 0.2.11 (2026-09-20)  
+> **Current Version**: 0.2.12 (2026-09-20)  
 > **Show version**: `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
@@ -218,7 +218,7 @@ Common paths:
 --ip <IPv4>               Server public IP (recommended explicit; defaults to auto-detect)
 --derp-port <int>         DERP TLS port, default 30399/TCP
 --stun-port <int>         STUN port, default 3478/UDP
---cert-days <int>         Self-signed cert validity (days), default 365
+--cert-days <int>         Self-signed cert validity (days), default 365, range 1–365000
 --auto-ufw                If UFW detected, auto-open ports
 
 --goproxy <URL>           Go module proxy, e.g.: https://goproxy.cn,direct
