@@ -3,7 +3,7 @@
 > 本文是中文的详细技术参考。主仓库首页 `README.md` 为精简版中文快速上手；英文详细参考见同目录的 `REFERENCE_EN.md`。
 
 > **脚本文件**：`deploy_derper_ip_selfsigned.sh`  
-> **当前版本**：0.2.9（2026-08-14）  
+> **当前版本**：0.2.10（2026-09-20）  
 > **查看版本**：`bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
@@ -71,7 +71,7 @@ derper -c ./derper.json -hostname 127.0.0.1 -certmode manual -certdir ./certs \
 - **默认启用 `-verify-clients`**：脚本会在安装前检查本机 `tailscaled` 是否运行且已登录
   - ✅ 若未就绪，脚本会中止并提示登录方法
   - ⚠️ 若确需跳过校验，可使用 `--no-verify-clients`（**仅限测试环境**）
-  - 🔒 **版本对齐（v0.2.8）**：`-verify-clients` 要求 derper 与 tailscaled 由同一 Git revision 构建。未显式指定 `--derper-version` 时，脚本优先把目标对齐到 `tailscale version` 输出的 `tailscale commit`（真正同源）；取不到 commit 时退化为版本标签并给出警告。**若已安装 derper 与目标不一致，会实际重新安装二进制**（无需额外 `--force`）。可用 `--derper-version` 覆盖。
+  - 🔒 **版本对齐（v0.2.8 / v0.2.10）**：`-verify-clients` 要求 derper 与 tailscaled 由同一 Git revision 构建。未显式指定 `--derper-version` 时，脚本优先把目标对齐到 `tailscale version` 输出的 `tailscale commit`（真正同源）；取不到 commit 时退化为版本标签并给出警告。对齐时比较已安装伪版本的末尾 12 位 revision，或用 `go list -m` 把 commit 解析为规范标签，避免每次 `--repair` 都重编译。**若已安装 derper 与目标不一致，会实际重新安装二进制**（无需额外 `--force`）。可用 `--derper-version` 覆盖。
   - 📝 检测逻辑：
     - 若检测到 `tailscale` CLI，通过 `tailscale ip` 判断是否已分配 Tailnet IP
     - 若未检测到 CLI，则仅依据 `tailscaled` 运行状态判断
@@ -257,6 +257,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 --auto-ufw                若检测到 UFW，自动放行端口
 
 --goproxy <URL>           Go 模块代理，例：https://goproxy.cn,direct
+                          构建前会做 5 秒连通性预检；失败请显式传入，脚本不自动切换
 --gosumdb <VALUE>         Go 校验数据库，例：sum.golang.google.cn
 --gotoolchain <MODE>      go 工具链策略，默认 auto（可自动拉取 ≥1.25）
 
@@ -268,12 +269,24 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 --user <username>         指定运行 derper 的用户（默认：当前登录用户）
                           可指定现有用户（如 nobody、www-data 等）
 --use-current-user        使用当前登录用户运行 derper（等价于 --user $USER）
+                          显式指定后不会被非交互 root 默认覆盖
+--dedicated-user          强制创建专用 derper 系统账户（生产推荐）
+--security-level LEVEL    安全加固级别：basic|standard|paranoid（默认 standard）
+--accept-cert-rotation    确认已有证书换指纹及 ACL 更新窗口（--yes 不代替此确认）
+--relax-socket-perms      临时放宽 tailscaled socket 到 0666（不推荐，仅紧急情况；脚本退出时恢复）
+--tls-connlimit N         单 IP 并发 DERP TLS 连接上限（nft/iptables connlimit；0 关闭）
+--install-healthcheck-cron  写入 /etc/cron.d/derper-healthcheck（每 5 分钟 --health-check）
+--yes, --non-interactive  非交互模式；不能代替证书指纹轮换确认
+--derper-version VER      指定 derper 版本（默认 latest），也接受 Git commit
 -V, --version             打印脚本版本并退出
 -h, --help                显示帮助并退出
 --check / --dry-run       仅进行状态与参数检查，不执行安装/写服务/放行等
+                          （同时打印目标运行用户与已部署 User=）
 --repair                  仅修复/重写配置（systemd/证书等），默认不重装 derper
-                          （已部署二进制与对齐目标版本不一致时会重装）
+                          （已部署二进制与对齐目标版本不一致时会重装；
+                          未指定用户时继承已部署 unit 的 User=）
 --force                   强制全量重装（重装 derper、重签证书、重写服务）
+                          替换已有证书时，非交互必须加 --accept-cert-rotation
 --allow-non-global-ip     允许私有/保留/文档等非公网 IP（仅内网测试；
                           正式部署默认拒绝非全局可路由地址）
 
@@ -281,7 +294,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 --health-check            仅输出健康检查摘要（不更改系统，可用于 cron/监控；配置漂移/证书异常会返回非 0）
 --metrics-textfile <P>    将健康检查导出为 Prometheus 文本指标到路径 P
                           （必须与 --health-check 一起使用；结合 node_exporter 使用）
---uninstall               停止并卸载 derper 的 systemd 服务（保留二进制与证书）
+--uninstall               停止并卸载 derper 的 systemd 服务（保留二进制与证书；同时删除健康检查 cron 与 --tls-connlimit 规则）
 --purge                   搭配 --uninstall：额外删除安装目录（/opt/derper）
 --purge-all               搭配 --uninstall：在 --purge 基础上同时删除二进制、/etc/derper/derper.env 和脚本创建的 tailscaled socket drop-in；防火墙规则和用户/组账户需手动确认
 ```
@@ -300,10 +313,11 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
   - 输出 tailscale/derper/端口/证书/配置 等状态与建议动作。
 - 修复模式（不中断可用的依赖）：
   - `sudo bash scripts/deploy_derper_ip_selfsigned.sh --ip <你的公网IP> --repair`
-  - 行为：必要时重签证书、重写 systemd 单元并 enable+restart。
+  - 行为：必要时重签证书、重写 systemd 单元并 enable+restart。未指定 `--user`/`--use-current-user`/`--dedicated-user` 时继承已部署 `User=`。
+  - 替换已有证书会先预览新指纹 ACL；交互输入 `rotate`，非交互必须加 `--accept-cert-rotation`。
 - 强制重装：
   - `sudo bash scripts/deploy_derper_ip_selfsigned.sh --ip <你的公网IP> --force`
-  - 行为：重新安装 derper、重签证书、重写并重启服务。
+  - 行为：重新安装 derper、重签证书、重写并重启服务。非交互重签同样需要 `--accept-cert-rotation`。
 - 版本门槛（可选）：
   - 通过环境变量 `REQUIRED_TS_VER` 指定 tailscale 最低版本（默认 1.66.3），检查在 `--check/--dry-run` 输出中可见。
 
@@ -354,7 +368,7 @@ openssl x509 -in /opt/derper/certs/<你的公网IP>.crt -outform DER | sha256sum
 openssl x509 -in /opt/derper/certs/fullchain.pem -outform DER | sha256sum | awk '{print $1}'
 ```
 
-> 自动重签会改变 `CertName`。请先更新 ACL 再重启服务，或接受短暂中断后粘贴新指纹。幂等修复在仅命名迁移时会尽量保留原证书，避免无谓指纹变化。
+> 自动重签会改变 `CertName`。脚本会在替换前打印待启用的新 ACL，但不会替你更新 Tailscale 后台。请安排变更窗口：先更新 ACL 再重启服务，或接受短暂中断后粘贴新指纹。非交互重签必须加 `--accept-cert-rotation`（`--yes` 不代替）。幂等修复在仅命名迁移时会尽量保留原证书，避免无谓指纹变化。
 ---
 
 ## 安全最佳实践
@@ -384,7 +398,7 @@ openssl x509 -in /opt/derper/certs/fullchain.pem -outform DER | sha256sum | awk 
 - **端口 < 1024（如 443）**：脚本自动通过 systemd 授予 `CAP_NET_BIND_SERVICE` 能力，无论选择哪个用户
 - **跨发行版兼容**：自动检测 `nologin` 路径（RHEL/CentOS 使用 `/sbin/nologin`，Debian/Ubuntu 使用 `/usr/sbin/nologin`，兜底使用 `/bin/false`）
 - **健壮的用户创建**：创建前后强校验用户/组是否存在，失败时给出明确错误信息
-- **非交互 root 默认**：当以 root 且非交互运行（无 `SUDO_USER`）时，为安全起见脚本默认等同 `--dedicated-user`，除非你显式传入 `--use-current-user`/`--user`。
+- **非交互 root 默认**：当以 root 且非交互运行（无 `SUDO_USER`）且**未**显式传入 `--user`/`--use-current-user`/`--dedicated-user` 时，首次部署默认等同 `--dedicated-user`。已有部署会继承 unit 里的 `User=`，避免 `--repair` 静默改属主。
 
 ### systemd 安全加固
 

@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.2.10] - 2026-09-20
+
+### 🔧 Bug Fixes
+
+1. **Self-signed cert generation crashed under Bash 5 + `set -u`**
+   - `cnf_tmp` was only assigned in the openssl `-addext` fallback. On modern openssl the success path hit `rm -f "$cnf_tmp"` with an unbound variable. `key_tmp`/`cert_tmp`/`cnf_tmp` are now initialized. macOS Bash 3.2 cannot reproduce this.
+
+2. **Certificate replacement left a half-written layout with no rollback**
+   - After `mv` replaced key/cert, a later failure of links, permissions, or config left new certs with old aliases. Updates now use an on-disk transaction; `--repair` resumes an interrupted rollback. Valid certs still get permission/alias repair instead of returning early.
+
+3. **verify-clients commit alignment recompiled derper on every repair**
+   - Installed module versions are often a canonical tag (`v1.102.4`) or a 12-character pseudo-version, so a 40-character commit never substring-matched. The script now compares the trailing revision and resolves the commit with `go list -m`.
+
+4. **Explicit `--use-current-user` was overwritten by the non-interactive root default**
+   - When no user flag is given, the deployed unit `User=` is inherited. Only a first-time, unspecified, non-interactive root deploy defaults to the dedicated account. `--check` prints both target and deployed user.
+
+### ⚠️ Behavior Changes
+
+5. **Certificate fingerprint rotation requires an explicit acknowledgement**
+   - Replacing an existing cert previews the new ACL. Interactive mode types `rotate`; non-interactive mode requires `--accept-cert-rotation`. `--yes` does not stand in for that acknowledgement. The flag accepts the cutover window; it does not update ACL for you.
+
+6. **Socket permission repair no longer restarts `tailscaled` as a probe**
+   - Persistent socket unit / ACL come first; `--relax-socket-perms` remains an explicit emergency switch. A 0666 file mode is not proof that LocalAPI is unauthenticated.
+
+7. **Bounded timeouts and a proxy precheck on restricted networks**
+   - curl now has connect/total timeouts and retries; when `timeout` exists, module queries are capped at 60s and builds at 900s. Before a build the script probes GOPROXY (and `go.dev/dl` when a toolchain download is needed) for 5 seconds and fails fast with a `--goproxy` hint. It does not auto-switch a third-party proxy or disable GOSUMDB.
+
+8. **`--relax-socket-perms` restores the original socket mode on exit**
+   - The original mode is recorded before chmod 666 and restored on EXIT. Health checks and the deploy report warn if the socket is still 0666.
+
+### ✨ Features
+
+9. **Optional TLS connection cap `--tls-connlimit N`**
+   - nftables or iptables `connlimit` limits concurrent DERP TLS connections per source IP; `0` disables. `--uninstall` removes the rules.
+
+10. **One-shot health-check cron `--install-healthcheck-cron`**
+    - Writes `/etc/cron.d/derper-healthcheck` (every 5 minutes `--health-check --ip … --metrics-textfile …`). Incompatible with `--uninstall`/`--check`; uninstall deletes the cron file.
+
+### 🧪 Tests
+
+- Main suite `tests/test_deploy_script.sh` (64 cases) plus `tests/test_review_regressions.sh` (13 cases).
+- GitHub Actions `.github/workflows/tests.yml` runs both suites on Ubuntu (Bash 5).
+- Review notes: `docs/BUGFIX_REVIEW_20260920.md`.
+
+---
+
 ## [0.2.9] - 2026-08-14
 
 ### 🔧 Bug Fixes
@@ -536,6 +582,6 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 **Contributors**: Thanks to architects for professional advice
 
-**Update Date**: 2026-08-14
+**Update Date**: 2026-09-20
 
-**Version**: 0.2.9
+**Version**: 0.2.10

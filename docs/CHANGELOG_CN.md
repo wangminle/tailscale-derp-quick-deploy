@@ -1,5 +1,51 @@
 # 更新日志
 
+## [0.2.10] - 2026-09-20
+
+### 🔧 Bug 修复
+
+1. **自签证书生成在 Bash 5 + `set -u` 下崩溃**
+   - `cnf_tmp` 仅在 openssl `-addext` 失败的降级分支赋值；现代 openssl 成功后走到 `rm -f "$cnf_tmp"` 会因未绑定变量退出。已初始化 `key_tmp`/`cert_tmp`/`cnf_tmp`。macOS Bash 3.2 测不出此缺陷。
+
+2. **证书替换半成品无法回滚**
+   - `mv` 换掉密钥/证书后若链接、权限或配置失败，会留下新证书配旧兼容路径。现用磁盘事务备份，失败或进程被杀后 `--repair` 可恢复；有效证书不再提前返回，仍校准权限与别名。
+
+3. **verify-clients 按 commit 对齐时每次都重编译**
+   - 已安装模块版本常是规范标签（如 `v1.102.4`）或 12 位伪版本，不能用 40 位 commit 做子串匹配。现比对伪版本末尾 revision，并用 `go list -m` 把 commit 解析为规范版本。
+
+4. **显式 `--use-current-user` 被非交互 root 默认覆盖**
+   - 未指定用户时继承已部署 unit 的 `User=`；仅首次、未显式指定的非交互 root 部署才默认专用账户。`--check` 同时展示目标用户与已部署用户。
+
+### ⚠️ 行为变化
+
+5. **证书指纹轮换必须显式确认**
+   - 替换已有证书前预览新 ACL。交互模式输入 `rotate`；非交互必须加 `--accept-cert-rotation`。`--yes` 不再代替该确认。该选项表示接受切换窗口，不表示脚本已替用户更新 ACL。
+
+6. **socket 权限不再试探性重启 `tailscaled`**
+   - 优先持久 socket unit / ACL；`--relax-socket-perms` 仍是显式应急开关。文件模式 0666 本身不能证明 LocalAPI 无鉴权。
+
+7. **受限网络增加超时边界与代理预检**
+   - curl 增加连接/总超时与重试；有 `timeout` 时模块查询限 60 秒、构建限 900 秒。构建前用 5 秒探测 GOPROXY（及需要时的 `go.dev/dl`），失败立即提示 `--goproxy`，不自动切换第三方代理，也不关闭 GOSUMDB。
+
+8. **`--relax-socket-perms` 退出时恢复原权限**
+   - chmod 666 前记录原 mode，脚本 EXIT 时恢复；健康检查与部署报告在 socket 仍为 0666 时告警。
+
+### ✨ 功能
+
+9. **可选 TLS 连接上限 `--tls-connlimit N`**
+   - 用 nftables 或 iptables `connlimit` 限制单 IP 并发 DERP TLS 连接；`0` 表示关闭。`--uninstall` 删除对应规则。
+
+10. **一键健康检查 cron `--install-healthcheck-cron`**
+    - 写入 `/etc/cron.d/derper-healthcheck`（每 5 分钟 `--health-check --ip … --metrics-textfile …`）。不能与 `--uninstall`/`--check` 同用；卸载时删除该 cron。
+
+### 🧪 测试
+
+- 主套件 `tests/test_deploy_script.sh` 64 项；`tests/test_review_regressions.sh` 13 项。
+- GitHub Actions `.github/workflows/tests.yml` 在 Ubuntu（Bash 5）上跑两套测试。
+- 逐项核查记录：`docs/BUGFIX_REVIEW_20260920.md`。
+
+---
+
 ## [0.2.9] - 2026-08-14
 
 ### 🔧 Bug 修复
@@ -536,6 +582,6 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 **贡献者**：感谢架构师的专业建议
 
-**更新日期**：2026-08-14
+**更新日期**：2026-09-20
 
-**版本**：0.2.9
+**版本**：0.2.10

@@ -1,7 +1,7 @@
 # Tailscale DERP Quick Deploy Script
 
 > **Language / 语言**: [English](#english) | [中文](#中文)  
-> **Version / 版本**: `0.2.9` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
+> **Version / 版本**: `0.2.10` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ---
 
@@ -33,9 +33,9 @@ This project provides a **fully automated Tailscale DERP relay service deploymen
 
 #### 1. Intelligent Deployment
 
-- ✅ **Idempotent Design**: Safe to run multiple times, automatically detects existing configurations
+- ✅ **Idempotent Design**: Safe to run multiple times, automatically detects existing configurations. Unspecified run user is inherited from the deployed unit.
 - ✅ **Parameter Auto-Adaptation**: Auto-detects new/old derper parameter differences (`-a` vs `-https-port`)
-- ✅ **Smart Repair**: `--repair` mode rewrites config/certs and restarts the service (no derper/Go reinstall, unless the installed binary drifts from the aligned target version)
+- ✅ **Smart Repair**: `--repair` rewrites config/certs and restarts the service (no derper/Go reinstall, unless the installed binary drifts from the aligned target version). Replacing an existing certificate requires an explicit rotation acknowledgement.
 
 #### 2. Security Hardening
 
@@ -170,7 +170,7 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # Use current login user
 
 | Parameter | Description | Default | Recommended (China) |
 |-----------|-------------|---------|---------------------|
-| `--goproxy <URL>` | Go module proxy | Inherit env | `https://goproxy.cn,direct` |
+| `--goproxy <URL>` | Go module proxy (no automatic third-party fallback) | Inherit env | `https://goproxy.cn,direct` |
 | `--gosumdb <VALUE>` | Go checksum database | Inherit env | `sum.golang.google.cn` |
 | `--gotoolchain <MODE>` | Toolchain policy | `auto` | `auto` (auto-fetch ≥1.25) |
 
@@ -178,8 +178,8 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # Use current login user
 
 | Parameter | Description | Default Behavior | Use Case |
 |-----------|-------------|------------------|----------|
-| `--use-current-user` | Use current login user | ✅ Default | Personal servers, testing |
-| `--dedicated-user` | Create dedicated `derper` user | Off | **Production strongly recommended** |
+| `--use-current-user` | Use current login user | ✅ Default (first deploy); explicit flag is never overridden | Personal servers, testing |
+| `--dedicated-user` | Create dedicated `derper` user | Off; default only for first-time non-interactive root with no user flag | **Production strongly recommended** |
 | `--user <username>` | Specify existing user | - | Integration (e.g., `nobody`) |
 | `--allow-non-global-ip` | Allow private/reserved/doc IPs | Off | Intranet testing only |
 | `--security-level <level>` | Security hardening level | `standard` | `basic`/`standard`/`paranoid` |
@@ -211,16 +211,24 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # Use current login user
 
 | Parameter | Description | System Impact | When to Use |
 |-----------|-------------|---------------|-------------|
-| `--check` / `--dry-run` | Check only, no system changes | ❌ None | Diagnose issues, verify parameters |
-| `--repair` | Fix configuration (certs/service); reinstalls derper only if the binary drifts from the aligned version | 🔧 Service restart | Certificate expiry, config drift |
+| `--check` / `--dry-run` | Check only, no system changes. Prints both target and deployed run user. | ❌ None | Diagnose issues, verify parameters |
+| `--repair` | Fix configuration (certs/service); reinstalls derper only if the binary drifts from the aligned version. Inherits deployed `User=` unless a user flag is given. | 🔧 Service restart | Certificate expiry, config drift |
 | `--force` | Force complete reinstall | 🔄 Full rebuild | Version upgrade, complete reset |
+| `--yes` / `--non-interactive` | Skip ordinary prompts | Does **not** confirm certificate fingerprint rotation | CI / automation |
+| `--accept-cert-rotation` | Accept fingerprint change and the ACL cutover window | Required with `--yes`/`--force` when an existing cert would be replaced | Planned cert rotation |
+
+`--accept-cert-rotation` means you accept a possible interruption between updating ACL and restarting DERP. It does **not** update Tailscale ACL for you. Interactive re-sign prompts for `rotate` instead.
 
 ##### Operations & Monitoring
 
 | Parameter | Description | Output | Use Case |
 |-----------|-------------|--------|----------|
 | `--health-check` | Output health status summary | Text + exit code | cron periodic checks, alerting |
-| `--metrics-textfile <path>` | Export Prometheus metrics (requires `--health-check`) | `.prom` file | With node_exporter monitoring |
+| `--metrics-textfile <path>` | Export Prometheus metrics (requires `--health-check` or `--install-healthcheck-cron`) | `.prom` file | With node_exporter monitoring |
+| `--install-healthcheck-cron` | Install `/etc/cron.d/derper-healthcheck` (every 5 minutes) | Cron file | Hands-off health + metrics |
+| `--tls-connlimit <N>` | Cap concurrent DERP TLS connections per source IP (`0` = off) | nftables/iptables rule | Soften TLS handshake floods |
+
+`--uninstall` also removes the health-check cron and `--tls-connlimit` rules. `--relax-socket-perms` restores the original socket mode when the script exits.
 
 **Prometheus Metrics Example:**
 
@@ -240,7 +248,7 @@ derper_process_rss_bytes 3145728     # Process memory usage (bytes)
 
 | Parameter | Description | Deleted Content | Retained Content |
 |-----------|-------------|-----------------|------------------|
-| `--uninstall` | Stop and remove service | systemd unit | Binary, certificates |
+| `--uninstall` | Stop and remove service | systemd unit, health-check cron, `--tls-connlimit` rules | Binary, certificates |
 | `--uninstall --purge` | + Remove installation directory | + `/opt/derper` | Binary |
 | `--uninstall --purge-all` | + Remove binary and script-created config | + `/usr/local/bin/derper`, `/etc/derper/derper.env`, DERP tailscaled socket drop-in | Firewall rules, user/group accounts |
 
@@ -531,9 +539,9 @@ Whether you're an **individual user quickly setting up a testing environment** o
 
 #### 1. 智能化部署
 
-- ✅ **幂等设计**：多次运行安全，自动识别已有配置
+- ✅ **幂等设计**：可多次安全运行，自动检测已有配置。未指定运行用户时继承已部署 unit 的 `User=`。
 - ✅ **参数自适应**：自动检测新旧版本 derper 参数差异（`-a` vs `-https-port`）
-- ✅ **智能修复**：`--repair` 仅重写配置/证书并重启服务，不重装 derper/Go（已部署二进制与目标版本不一致时除外）
+- ✅ **智能修复**：`--repair` 仅重写配置/证书并重启服务，不重装 derper/Go（已部署二进制与目标版本不一致时除外）。替换已有证书需要显式轮换确认。
 
 #### 2. 安全加固
 
@@ -668,7 +676,7 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # 使用当前登录用户
 
 | 参数 | 说明 | 默认值 | 推荐值（国内） |
 |------|------|--------|----------------|
-| `--goproxy <URL>` | Go 模块代理 | 继承环境 | `https://goproxy.cn,direct` |
+| `--goproxy <URL>` | Go 模块代理（不会自动切换第三方代理） | 继承环境 | `https://goproxy.cn,direct` |
 | `--gosumdb <VALUE>` | Go 校验数据库 | 继承环境 | `sum.golang.google.cn` |
 | `--gotoolchain <MODE>` | 工具链策略 | `auto` | `auto`（自动获取 ≥1.25）|
 
@@ -676,8 +684,8 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # 使用当前登录用户
 
 | 参数 | 说明 | 默认行为 | 使用场景 |
 |------|------|----------|----------|
-| `--use-current-user` | 使用当前登录用户 | ✅ 默认 | 个人服务器、测试环境 |
-| `--dedicated-user` | 创建专用 `derper` 用户 | 关闭 | **生产环境强烈推荐** |
+| `--use-current-user` | 使用当前登录用户 | ✅ 默认（首次部署）；显式指定后不会被覆盖 | 个人服务器、测试环境 |
+| `--dedicated-user` | 创建专用 `derper` 用户 | 关闭；仅首次非交互 root 且未指定用户时作为默认 | **生产环境强烈推荐** |
 | `--user <username>` | 指定已有用户 | - | 集成到现有环境（如 `nobody`） |
 | `--allow-non-global-ip` | 允许私有/保留/文档等非公网 IP | 关闭 | 仅内网测试 |
 | `--security-level <level>` | 安全加固级别 | `standard` | `basic`/`standard`/`paranoid` |
@@ -709,16 +717,24 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # 使用当前登录用户
 
 | 参数 | 说明 | 系统影响 | 使用时机 |
 |------|------|----------|----------|
-| `--check` / `--dry-run` | 仅检查，不修改系统 | ❌ 无 | 诊断问题、验证参数 |
-| `--repair` | 修复配置（证书/服务）；仅当已部署二进制与对齐目标版本不一致时才重装 derper | 🔧 重启服务 | 证书过期、配置漂移 |
+| `--check` / `--dry-run` | 仅检查，不修改系统。同时打印目标运行用户与已部署用户。 | ❌ 无 | 诊断问题、验证参数 |
+| `--repair` | 修复配置（证书/服务）；仅当已部署二进制与对齐目标版本不一致时才重装 derper。未指定用户时继承已部署 `User=`。 | 🔧 重启服务 | 证书过期、配置漂移 |
 | `--force` | 强制全量重装 | 🔄 完全重建 | 版本升级、彻底重置 |
+| `--yes` / `--non-interactive` | 跳过普通交互确认 | **不能**代替证书指纹轮换确认 | CI / 自动化 |
+| `--accept-cert-rotation` | 确认接受指纹切换及 ACL 更新窗口 | 非交互下替换已有证书时必须附加 | 计划内证书轮换 |
+
+`--accept-cert-rotation` 表示你接受 ACL 更新与服务重启之间可能中断，**并不表示脚本已替你更新 Tailscale ACL**。交互模式重签时改为输入 `rotate`。
 
 ##### 运维与监控
 
 | 参数 | 说明 | 输出 | 适用场景 |
 |------|------|------|----------|
 | `--health-check` | 输出健康状态摘要 | 文本 + 退出码 | cron 定时检查、告警脚本 |
-| `--metrics-textfile <path>` | 导出 Prometheus 指标（必须与 `--health-check` 一起使用） | `.prom` 文件 | 配合 node_exporter 监控 |
+| `--metrics-textfile <path>` | 导出 Prometheus 指标（必须与 `--health-check` 或 `--install-healthcheck-cron` 一起使用） | `.prom` 文件 | 配合 node_exporter 监控 |
+| `--install-healthcheck-cron` | 安装 `/etc/cron.d/derper-healthcheck`（每 5 分钟） | cron 文件 | 无人值守健康检查与指标 |
+| `--tls-connlimit <N>` | 限制单 IP 并发 DERP TLS 连接（`0` 表示关闭） | nftables/iptables 规则 | 缓解 TLS 握手洪水 |
+
+`--uninstall` 会同时删除健康检查 cron 与 `--tls-connlimit` 规则。`--relax-socket-perms` 在脚本退出时恢复 socket 原权限。
 
 **Prometheus 指标示例：**
 
@@ -738,7 +754,7 @@ derper_process_rss_bytes 3145728     # 进程内存占用（字节）
 
 | 参数 | 说明 | 删除内容 | 保留内容 |
 |------|------|----------|----------|
-| `--uninstall` | 停止并删除服务 | systemd 单元 | 二进制、证书 |
+| `--uninstall` | 停止并删除服务 | systemd 单元、健康检查 cron、`--tls-connlimit` 规则 | 二进制、证书 |
 | `--uninstall --purge` | + 删除安装目录 | + `/opt/derper` | 二进制 |
 | `--uninstall --purge-all` | + 删除二进制和脚本生成配置 | + `/usr/local/bin/derper`、`/etc/derper/derper.env`、DERP 创建的 tailscaled socket drop-in | 防火墙规则、用户/组账户 |
 
@@ -998,6 +1014,7 @@ fi
 - **详细技术文档**：
   - [更新日志（中文）](docs/CHANGELOG_CN.md) | [Changelog (English)](docs/CHANGELOG_EN.md)
   - [技术参考（中文）](docs/REFERENCE_CN.md) | [Technical Reference (English)](docs/REFERENCE_EN.md)
+  - [2026-09-20 部署问题核查](docs/BUGFIX_REVIEW_20260920.md)
 
 ---
 

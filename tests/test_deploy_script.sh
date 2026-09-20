@@ -138,6 +138,7 @@ test_unsupported_custom_stun_port_is_rejected() {
     DERPER_TEST_MODE=1 source "$SCRIPT"
     local_tmp=$(mktemp -d)
     trap 'rm -rf "$local_tmp"' EXIT
+    SERVICE_PATH="$local_tmp/derper.service"
     INSTALL_DIR="$local_tmp"
     STUN_PORT="40000"
     derper_supports_stun_port() { return 1; }
@@ -153,6 +154,7 @@ test_empty_derper_config_is_migrated_for_auto_key_generation() {
     DERPER_TEST_MODE=1 source "$SCRIPT"
     local_tmp=$(mktemp -d)
     trap 'rm -rf "$local_tmp"' EXIT
+    SERVICE_PATH="$local_tmp/derper.service"
     INSTALL_DIR="$local_tmp"
     printf '{}\n' >"${INSTALL_DIR}/derper.json"
     prepare_derper_config >/dev/null
@@ -243,6 +245,7 @@ test_cert_san_matches_literal_ip_only() {
     DERPER_TEST_MODE=1 source "$SCRIPT"
     local_tmp=$(mktemp -d)
     trap 'rm -rf "$local_tmp"' EXIT
+    SERVICE_PATH="$local_tmp/derper.service"
     INSTALL_DIR="$local_tmp"
     IP_ADDR="203.0.113.10"
     mkdir -p "${INSTALL_DIR}/certs"
@@ -401,24 +404,72 @@ test_ts_commit_parses_real_tailscale_output() {
 }
 
 test_manual_cert_uses_upstream_filenames() {
-  (
-    DERPER_TEST_MODE=1 source "$SCRIPT"
-    command -v openssl >/dev/null 2>&1 || { echo "ok - certificate naming skipped (no openssl)"; return 0; }
-    local_tmp=$(mktemp -d)
-    trap 'rm -rf "$local_tmp"' EXIT
-    INSTALL_DIR="$local_tmp"
-    IP_ADDR="203.0.113.10"
-    CERT_DAYS="30"
-    generate_derper_config() { :; }
-    generate_selfsigned_cert >/dev/null
-    [[ -f "${INSTALL_DIR}/certs/203.0.113.10.crt" ]] || fail "missing upstream <ip>.crt"
-    [[ -f "${INSTALL_DIR}/certs/203.0.113.10.key" ]] || fail "missing upstream <ip>.key"
-    [[ -L "${INSTALL_DIR}/certs/fullchain.pem" ]] || fail "fullchain.pem should be a compatibility symlink"
-    check_cert_status
-    [[ $CERT_PRESENT -eq 1 && $CERT_NAMING_OK -eq 1 && $CERT_SAN_MATCH -eq 1 ]] ||
-      fail "generated upstream-named certificate should pass cert status checks"
-  )
-  ok "self-signed cert uses derper manual filenames"
+  local cert_mode
+  for cert_mode in addext config; do
+    (
+      DERPER_TEST_MODE=1 source "$SCRIPT"
+      chown() { :; }
+      command -v openssl >/dev/null 2>&1 || { echo "ok - certificate naming skipped (no openssl)"; return 0; }
+      local_tmp=$(mktemp -d)
+      trap 'rm -rf "$local_tmp"' EXIT
+      SERVICE_PATH="$local_tmp/derper.service"
+      INSTALL_DIR="$local_tmp"
+      IP_ADDR="203.0.113.10"
+      CERT_DAYS="30"
+      openssl() {
+        if [[ "$cert_mode" == config && " $* " == *' -addext '* ]]; then
+          return 1
+        fi
+        command openssl "$@"
+      }
+      generate_derper_config() { :; }
+      generate_selfsigned_cert >/dev/null
+      [[ -f "${INSTALL_DIR}/certs/203.0.113.10.crt" ]] || fail "missing upstream <ip>.crt"
+      [[ -f "${INSTALL_DIR}/certs/203.0.113.10.key" ]] || fail "missing upstream <ip>.key"
+      [[ -L "${INSTALL_DIR}/certs/fullchain.pem" ]] || fail "fullchain.pem should be a compatibility symlink"
+      check_cert_status
+      [[ $CERT_PRESENT -eq 1 && $CERT_NAMING_OK -eq 1 && $CERT_SAN_MATCH -eq 1 ]] ||
+        fail "generated upstream-named certificate should pass cert status checks"
+      [[ -z "$(find "${INSTALL_DIR}/certs" -name '.derper-*' -print)" ]] ||
+        fail "certificate generation should remove temporary files"
+    )
+    ok "self-signed cert uses derper manual filenames ($cert_mode)"
+  done
+}
+
+test_cert_fallback_temp_failure_is_handled() {
+  local kind output rc
+  for kind in key cert cnf; do
+    rc=0
+    output=$(
+      exec 2>&1
+      DERPER_TEST_MODE=1 source "$SCRIPT"
+      chown() { :; }
+      local_tmp=$(mktemp -d)
+      trap 'rm -rf "$local_tmp"' EXIT
+      SERVICE_PATH="$local_tmp/derper.service"
+      INSTALL_DIR="$local_tmp"
+      IP_ADDR="203.0.113.10"
+      CERT_DAYS="30"
+      harden_cert_dir() { :; }
+      openssl() { touch "${local_tmp}/fallback"; return 1; }
+      mktemp() {
+        if [[ -f "${local_tmp}/fallback" && "$1" == *".derper-${kind}."* ]]; then
+          return 1
+        fi
+        command mktemp "$@"
+      }
+      result=0
+      generate_selfsigned_cert || result=$?
+      [[ -z "$(find "${INSTALL_DIR}/certs" -name '.derper-*' -print)" ]] ||
+        fail "failed certificate generation should remove temporary files"
+      exit "$result"
+    ) || rc=$?
+    [[ "$rc" -eq 1 && "$output" == *'创建临时文件'* ]] ||
+      fail "fallback $kind temp failure should return the intended diagnostic: $output"
+    [[ "$output" != *'unbound variable'* ]] || fail "cleanup must not access unset variables"
+    ok "certificate fallback handles $kind temporary file failure"
+  done
 }
 
 test_derper_binary_needs_reinstall_on_version_mismatch() {
@@ -448,7 +499,7 @@ test_derper_binary_needs_reinstall_on_version_mismatch() {
 
     # 按 Git commit 对齐时，已安装伪版本包含该 commit 即视为同源
     DERPER_VERSION="abcdef1234567890abcdef12"
-    get_installed_derper_version() { echo "1.80.0-0.20250814000000-abcdef1234567890abcdef12"; }
+    get_installed_derper_version() { echo "1.80.0-0.20250814000000-abcdef123456"; }
     if derper_binary_needs_install; then
       fail "installed pseudo-version containing the target commit should be considered aligned"
     fi
@@ -641,6 +692,7 @@ test_cert_generation_refuses_symlinked_paths() {
     DERPER_TEST_MODE=1 source "$SCRIPT"
     local_tmp=$(mktemp -d)
     trap 'rm -rf "$local_tmp"' EXIT
+    SERVICE_PATH="$local_tmp/derper.service"
     INSTALL_DIR="$local_tmp"
     IP_ADDR="203.0.113.10"
     CERT_DAYS="30"
@@ -771,6 +823,7 @@ test_ensure_compatible_certs_migrates_legacy_names() {
     DERPER_TEST_MODE=1 source "$SCRIPT"
     local_tmp=$(mktemp -d)
     trap 'rm -rf "$local_tmp"' EXIT
+    SERVICE_PATH="$local_tmp/derper.service"
     INSTALL_DIR="$local_tmp"
     IP_ADDR="203.0.113.10"
     mkdir -p "${INSTALL_DIR}/certs"
@@ -865,6 +918,244 @@ test_health_check_skips_external_ip_probe_when_ip_set() {
   ok "health-check does not re-probe public IP when already set"
 }
 
+test_goproxy_probe_targets_skip_direct() {
+  DERPER_TEST_MODE=1 source "$SCRIPT"
+  GOPROXY_ARG="https://goproxy.cn,direct"
+  local out
+  out=$(goproxy_probe_targets)
+  [[ "$out" == "https://goproxy.cn" ]] || fail "expected goproxy.cn only, got: $out"
+  GOPROXY_ARG=""
+  unset GOPROXY
+  out=$(goproxy_probe_targets)
+  [[ "$out" == "https://proxy.golang.org" ]] || fail "default proxy should be proxy.golang.org, got: $out"
+  ok "goproxy probe targets skip direct and default to proxy.golang.org"
+}
+
+test_precheck_go_network_fails_fast_with_hint() {
+  DERPER_TEST_MODE=1 source "$SCRIPT"
+  GOPROXY_ARG="https://example.invalid"
+  curl() { return 7; }
+  local err
+  err=$(precheck_go_network 2>&1) && fail "unreachable proxy must fail"
+  echo "$err" | grep -q -- '--goproxy' || fail "failure must hint --goproxy, got: $err"
+  ok "module proxy precheck fails fast and hints --goproxy"
+}
+
+test_precheck_go_network_succeeds_when_reachable() {
+  DERPER_TEST_MODE=1 source "$SCRIPT"
+  GOPROXY_ARG="https://goproxy.cn,direct"
+  curl() { return 0; }
+  precheck_go_network || fail "reachable proxy must pass"
+  ok "module proxy precheck passes when curl succeeds"
+}
+
+test_get_installed_derper_version_without_strings() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local_tmp=$(mktemp -d)
+    trap 'rm -rf "$local_tmp"' EXIT
+    BIN_PATH="${local_tmp}/derper"
+    printf 'not a real binary\ngo1.22.6\ntailscale.com v1.80.0\n' >"$BIN_PATH"
+    chmod +x "$BIN_PATH"
+    go() { return 1; }
+    strings() { return 127; }
+    local ver
+    ver=$(get_installed_derper_version || true)
+    [[ "$ver" == "1.80.0" ]] || fail "grep fallback must find module version without strings, got: ${ver}"
+  )
+  ok "installed derper version parser works without strings"
+}
+
+test_relax_socket_perms_restored_on_cleanup() {
+  DERPER_TEST_MODE=1 source "$SCRIPT"
+  local_tmp=$(mktemp -d)
+  trap "rm -rf '$local_tmp'" RETURN
+  local sock="${local_tmp}/tailscaled.sock"
+  local py=""
+  if command -v python3 >/dev/null 2>&1; then
+    py=python3
+  elif command -v python >/dev/null 2>&1; then
+    py=python
+  else
+    ok "socket restore test skipped (no python)"
+    return 0
+  fi
+  if ! "$py" -c "import socket,os;p=r'''${sock}''';
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);
+os.path.exists(p) and os.unlink(p);s.bind(p);os.chmod(p,0o660);s.close()" 2>/dev/null; then
+    ok "socket restore test skipped (unix socket unavailable)"
+    return 0
+  fi
+  [[ -S "$sock" ]] || { ok "socket restore test skipped (socket missing)"; return 0; }
+  RELAX_SOCKET_PERMS=1
+  relax_socket_world_writable "$sock" || fail "relax should succeed"
+  local now
+  now=$(stat -c '%a' "$sock" 2>/dev/null || stat -f '%OLp' "$sock")
+  [[ "$now" == "666" ]] || fail "socket should be 666 after relax, got $now"
+  restore_relaxed_socket_perms || fail "restore should succeed"
+  now=$(stat -c '%a' "$sock" 2>/dev/null || stat -f '%OLp' "$sock")
+  [[ "$now" == "660" ]] || fail "socket should restore to 660, got $now"
+  ok "relaxed socket mode is restored"
+}
+
+test_cleanup_restores_relaxed_socket() {
+  DERPER_TEST_MODE=1 source "$SCRIPT"
+  local_tmp=$(mktemp -d)
+  trap "rm -rf '$local_tmp'" RETURN
+  local sock="${local_tmp}/tailscaled.sock"
+  if ! command -v python3 >/dev/null 2>&1; then
+    ok "cleanup socket restore skipped (no python)"
+    return 0
+  fi
+  python3 -c "import socket,os;p=r'''${sock}''';
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);
+os.path.exists(p) and os.unlink(p);s.bind(p);os.chmod(p,0o640);s.close()" 2>/dev/null || {
+    ok "cleanup socket restore skipped (unix socket unavailable)"
+    return 0
+  }
+  RELAX_SOCKET_PERMS=1
+  relax_socket_world_writable "$sock"
+  cleanup_deployment 0
+  local now
+  now=$(stat -c '%a' "$sock" 2>/dev/null || stat -f '%OLp' "$sock")
+  [[ "$now" == "640" ]] || fail "cleanup must restore original socket mode, got $now"
+  ok "cleanup restores relaxed socket permissions"
+}
+
+test_world_writable_socket_is_warned() {
+  DERPER_TEST_MODE=1 source "$SCRIPT"
+  local_tmp=$(mktemp -d)
+  trap "rm -rf '$local_tmp'" RETURN
+  local sock="${local_tmp}/tailscaled.sock"
+  if ! command -v python3 >/dev/null 2>&1; then
+    ok "socket warning skipped (no python)"
+    return 0
+  fi
+  python3 -c "import socket,os;p=r'''${sock}''';
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);
+os.path.exists(p) and os.unlink(p);s.bind(p);os.chmod(p,0o666);s.close()" 2>/dev/null || {
+    ok "socket warning skipped (unix socket unavailable)"
+    return 0
+  }
+  local out
+  out=$(warn_world_writable_socket "$sock" 2>&1)
+  echo "$out" | grep -q '0666' || fail "health warning must mention 0666, got: $out"
+  ok "world-writable tailscaled socket is warned"
+}
+
+test_tls_connlimit_zero_is_noop() {
+  DERPER_TEST_MODE=1 source "$SCRIPT"
+  TLS_CONNLIMIT=0
+  nft() { fail "nft must not run when connlimit is 0"; }
+  iptables() { fail "iptables must not run when connlimit is 0"; }
+  apply_tls_connlimit || fail "zero connlimit should succeed as no-op"
+  ok "tls connlimit 0 does not touch firewall"
+}
+
+test_tls_connlimit_iptables_rule() {
+  DERPER_TEST_MODE=1 source "$SCRIPT"
+  TLS_CONNLIMIT=32
+  DERP_PORT=30399
+  local cmds=""
+  command() {
+    if [[ "$1" == -v && "$2" == nft ]]; then return 1; fi
+    if [[ "$1" == -v && "$2" == iptables ]]; then return 0; fi
+    builtin command "$@"
+  }
+  iptables() {
+    cmds+="$*"$'\n'
+    return 0
+  }
+  apply_tls_connlimit || fail "iptables connlimit should apply"
+  echo "$cmds" | grep -q 'connlimit-above 32' || fail "missing connlimit-above, commands: $cmds"
+  echo "$cmds" | grep -q -- '--dport 30399' || fail "missing dport, commands: $cmds"
+  ok "tls connlimit installs iptables connlimit rule"
+}
+
+test_tls_connlimit_removed_on_uninstall() {
+  DERPER_TEST_MODE=1 source "$SCRIPT"
+  local cmds=""
+  command() {
+    if [[ "$1" == -v && "$2" == nft ]]; then return 1; fi
+    if [[ "$1" == -v && "$2" == iptables ]]; then return 0; fi
+    builtin command "$@"
+  }
+  iptables() {
+    cmds+="$*"$'\n'
+    return 0
+  }
+  remove_tls_connlimit || fail "remove should succeed"
+  echo "$cmds" | grep -q 'DERPER-CONNLIMIT' || fail "remove must target DERPER-CONNLIMIT, got: $cmds"
+  ok "tls connlimit chain is removed"
+}
+
+test_install_healthcheck_cron_writes_job() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local_tmp=$(mktemp -d)
+    trap 'rm -rf "$local_tmp"' EXIT
+    HEALTHCHECK_CRON_PATH="${local_tmp}/derper-healthcheck"
+    IP_ADDR="203.0.113.10"
+    METRICS_TEXTFILE="${local_tmp}/derper.prom"
+    SCRIPT_SELF="${local_tmp}/deploy_derper_ip_selfsigned.sh"
+    printf '#!/bin/bash\n' >"$SCRIPT_SELF"
+    install_healthcheck_cron || fail "cron install should succeed"
+    [[ -f "$HEALTHCHECK_CRON_PATH" ]] || fail "cron file missing"
+    grep -q -- '--health-check' "$HEALTHCHECK_CRON_PATH" || fail "cron must call --health-check"
+    grep -q -- '--ip 203.0.113.10' "$HEALTHCHECK_CRON_PATH" || fail "cron must pin --ip"
+    grep -q -- '--metrics-textfile' "$HEALTHCHECK_CRON_PATH" || fail "cron must write metrics textfile"
+  )
+  ok "healthcheck cron file is installed"
+}
+
+test_uninstall_removes_healthcheck_cron() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local_tmp=$(mktemp -d)
+    trap 'rm -rf "$local_tmp"' EXIT
+    HEALTHCHECK_CRON_PATH="${local_tmp}/derper-healthcheck"
+    printf 'job\n' >"$HEALTHCHECK_CRON_PATH"
+    SERVICE_PATH="${local_tmp}/derper.service"
+    INSTALL_DIR="${local_tmp}/install"
+    BIN_PATH="${local_tmp}/derper"
+    UNINSTALL=1
+    command() {
+      if [[ "$1" == -v && ( "$2" == systemctl || "$2" == nft || "$2" == iptables ) ]]; then return 1; fi
+      builtin command "$@"
+    }
+    nft() { return 0; }
+    iptables() { return 0; }
+    require_root() { :; }
+    uninstall_derper >/dev/null 2>&1
+    [[ ! -e "$HEALTHCHECK_CRON_PATH" ]] || fail "cron file should be removed on uninstall"
+  )
+  ok "uninstall removes healthcheck cron"
+}
+
+test_healthcheck_cron_conflicts_with_uninstall() {
+  DERPER_TEST_MODE=1 source "$SCRIPT"
+  INSTALL_HEALTHCHECK_CRON=1 UNINSTALL=1 PURGE=0 FORCE=0 REPAIR=0 DRY_RUN=0 HEALTH_CHECK=0 METRICS_TEXTFILE=""
+  validate_arg_combos && fail "--install-healthcheck-cron with --uninstall must be rejected"
+  UNINSTALL=0
+  parse_args --install-healthcheck-cron
+  [[ "$INSTALL_HEALTHCHECK_CRON" -eq 1 ]] || fail "parse_args should set INSTALL_HEALTHCHECK_CRON"
+  validate_arg_combos || fail "install-healthcheck-cron alone should be valid"
+  ok "healthcheck cron argument combinations are validated"
+}
+
+test_tls_connlimit_parse_and_reject() {
+  DERPER_TEST_MODE=1 source "$SCRIPT"
+  parse_args --tls-connlimit 16
+  [[ "$TLS_CONNLIMIT" == "16" ]] || fail "parse_args should set TLS_CONNLIMIT, got $TLS_CONNLIMIT"
+  TLS_CONNLIMIT="nope"
+  IP_ADDR="8.8.8.8"
+  RUN_USER="$(id -un)"
+  if validate_settings >/dev/null 2>&1; then
+    fail "non-numeric tls-connlimit must be rejected"
+  fi
+  ok "tls-connlimit is parsed and validated"
+}
+
 test_no_crlf_and_syntax
 test_source_does_not_run_main
 test_source_survives_unset_user
@@ -881,6 +1172,7 @@ test_verify_clients_passes_socket_flag
 test_verify_clients_aligns_derper_version
 test_ts_commit_parses_real_tailscale_output
 test_manual_cert_uses_upstream_filenames
+test_cert_fallback_temp_failure_is_handled
 test_derper_binary_needs_reinstall_on_version_mismatch
 test_paranoid_degraded_unit_is_accepted
 test_start_limit_lives_in_unit_section
@@ -911,3 +1203,17 @@ test_wizard_handles_eof_cleanly
 test_cert_san_matches_literal_ip_only
 test_live_certificate_mismatch_fails_health_check
 test_metrics_writer_avoids_predictable_tmp_path
+test_goproxy_probe_targets_skip_direct
+test_precheck_go_network_fails_fast_with_hint
+test_precheck_go_network_succeeds_when_reachable
+test_get_installed_derper_version_without_strings
+test_relax_socket_perms_restored_on_cleanup
+test_cleanup_restores_relaxed_socket
+test_world_writable_socket_is_warned
+test_tls_connlimit_zero_is_noop
+test_tls_connlimit_iptables_rule
+test_tls_connlimit_removed_on_uninstall
+test_install_healthcheck_cron_writes_job
+test_uninstall_removes_healthcheck_cron
+test_healthcheck_cron_conflicts_with_uninstall
+test_tls_connlimit_parse_and_reject

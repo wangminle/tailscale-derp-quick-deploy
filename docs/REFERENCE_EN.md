@@ -3,7 +3,7 @@
 > This is the detailed English reference. For the simplified Chinese quickstart now used as the main README, go to `../README.md`. For the detailed Chinese reference, see `REFERENCE_CN.md` in this folder.
 
 > **Script File**: `deploy_derper_ip_selfsigned.sh`  
-> **Current Version**: 0.2.9 (2026-08-14)  
+> **Current Version**: 0.2.10 (2026-09-20)  
 > **Show version**: `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
@@ -63,7 +63,7 @@ Note: This mode is only for local functional verification and cannot serve as a 
 - **`-verify-clients` enabled by default**: Script checks if local `tailscaled` is running and logged in before installation
   - ✅ If not ready, script will abort and show login instructions
   - ⚠️ To skip verification, use `--no-verify-clients` (**testing only**)
-  - 🔒 **Version alignment (v0.2.8)**: `-verify-clients` requires derper and tailscaled to be built from the same git revision. When `--derper-version` is not specified, the script first aligns the *target* to the `tailscale commit` reported by `tailscale version` (true same-source); it falls back to a semver tag with a warning when the commit is unavailable. **If an installed derper binary does not match that target, it is reinstalled** (no extra `--force` required). Override with `--derper-version`.
+  - 🔒 **Version alignment (v0.2.8 / v0.2.10)**: `-verify-clients` requires derper and tailscaled to be built from the same git revision. When `--derper-version` is not specified, the script first aligns the *target* to the `tailscale commit` reported by `tailscale version` (true same-source); it falls back to a semver tag with a warning when the commit is unavailable. Matching uses the trailing 12-character pseudo-version revision, or `go list -m` to resolve a commit to its canonical tag, so `--repair` does not rebuild on every run. **If an installed derper binary does not match that target, it is reinstalled** (no extra `--force` required). Override with `--derper-version`.
   - 📝 Detection logic:
     - If `tailscale` CLI detected, checks via `tailscale ip` whether Tailnet IP is assigned
     - If CLI not detected, only checks `tailscaled` running status
@@ -222,6 +222,7 @@ Common paths:
 --auto-ufw                If UFW detected, auto-open ports
 
 --goproxy <URL>           Go module proxy, e.g.: https://goproxy.cn,direct
+                          Probed for 5s before a build; on failure pass it explicitly (no auto-switch)
 --gosumdb <VALUE>         Go checksum database, e.g.: sum.golang.google.cn
 --gotoolchain <MODE>      go toolchain policy, default auto (can auto-fetch ≥1.25)
 
@@ -233,12 +234,24 @@ Common paths:
 --user <username>         Specify which user runs derper (default: current login user)
                           Can specify existing users (e.g., nobody, www-data)
 --use-current-user        Use current login user to run derper (equivalent to --user $USER; default)
+                          An explicit flag is never overridden by the non-interactive root default
+--dedicated-user          Force a dedicated derper system account (recommended for production)
+--security-level LEVEL    Hardening level: basic|standard|paranoid (default standard)
+--accept-cert-rotation    Acknowledge fingerprint change and ACL cutover (--yes does not replace this)
+--relax-socket-perms      Temporarily chmod tailscaled socket to 0666 (emergency only; restored on exit)
+--tls-connlimit N         Cap concurrent DERP TLS connections per source IP (nft/iptables connlimit; 0=off)
+--install-healthcheck-cron  Write /etc/cron.d/derper-healthcheck (every 5 minutes --health-check)
+--yes, --non-interactive  Non-interactive mode; does not confirm certificate rotation
+--derper-version VER      Pin derper version (default latest); also accepts a Git commit
 -V, --version             Print script version and exit
 -h, --help                Show help and exit
 --check / --dry-run       Only perform status and parameter checks, no install/write service/open ports
+                          (prints both target and deployed User=)
 --repair                  Only fix/rewrite config (systemd/certificates etc.); by default no derper reinstall
-                          (reinstalls when the installed binary drifts from the aligned target version)
+                          (reinstalls when the installed binary drifts from the aligned target version;
+                          inherits deployed User= unless a user flag is given)
 --force                   Force full reinstall (reinstall derper, re-sign certs, rewrite service)
+                          Replacing an existing cert in non-interactive mode requires --accept-cert-rotation
 --allow-non-global-ip     Allow private/reserved/documentation IPs (intranet testing only;
                           deployment mode rejects non-globally-routable addresses by default)
 
@@ -246,7 +259,7 @@ Common paths:
 --health-check            Only output health check summary (no system changes, for cron/monitoring; config drift/certificate problems return non-zero)
 --metrics-textfile <P>    Export health check as Prometheus text metrics to path P
                           (requires --health-check; use with node_exporter)
---uninstall               Stop and uninstall derper systemd service (keep binary and certificates)
+--uninstall               Stop and uninstall derper systemd service (keep binary and certificates; also removes health-check cron and --tls-connlimit rules)
 --purge                   With --uninstall: additionally delete installation directory (/opt/derper)
 --purge-all               With --uninstall: on top of --purge, also delete binary, /etc/derper/derper.env, and the script-created tailscaled socket drop-in; firewall rules and user/group accounts require manual confirmation
 ```
@@ -265,10 +278,11 @@ Common paths:
   - Outputs tailscale/derper/ports/certificates/config status and suggested actions.
 - Repair mode (don't interrupt available dependencies):
   - `sudo bash scripts/deploy_derper_ip_selfsigned.sh --ip <your-public-ip> --repair`
-  - Behavior: Re-sign certificates if needed, rewrite systemd unit and enable+restart.
+  - Behavior: Re-sign certificates if needed, rewrite systemd unit and enable+restart. Inherits deployed `User=` unless `--user`/`--use-current-user`/`--dedicated-user` is given.
+  - Replacing an existing cert previews the new fingerprint ACL; type `rotate` interactively, or pass `--accept-cert-rotation` when non-interactive.
 - Force reinstall:
   - `sudo bash scripts/deploy_derper_ip_selfsigned.sh --ip <your-public-ip> --force`
-  - Behavior: Reinstall derper, re-sign certificates, rewrite and restart service.
+  - Behavior: Reinstall derper, re-sign certificates, rewrite and restart service. Non-interactive re-sign also requires `--accept-cert-rotation`.
 - Version threshold (optional):
   - Specify tailscale minimum version via environment variable `REQUIRED_TS_VER` (default 1.66.3), visible in `--check/--dry-run` output.
 
@@ -319,7 +333,7 @@ openssl x509 -in /opt/derper/certs/<your-public-ip>.crt -outform DER | sha256sum
 openssl x509 -in /opt/derper/certs/fullchain.pem -outform DER | sha256sum | awk '{print $1}'
 ```
 
-> Auto re-signing changes `CertName`. Update the ACL before restarting, or accept a brief outage and paste the new fingerprint. Idempotent repair migrates legacy filenames in place when possible to avoid unnecessary fingerprint churn.
+> Auto re-signing changes `CertName`. The script prints the pending ACL before switching, but it does not update the Tailscale admin console for you. Plan a change window: update ACL before restarting, or accept a brief outage and paste the new fingerprint. Non-interactive re-sign requires `--accept-cert-rotation` (`--yes` is not enough). Idempotent repair migrates legacy filenames in place when possible to avoid unnecessary fingerprint churn.
 
 ---
 
@@ -352,7 +366,7 @@ The script implements several security hardening measures by default:
 - **Port < 1024 (e.g., 443)**: Script automatically grants `CAP_NET_BIND_SERVICE` via systemd, regardless of which user you choose
 - **Cross-distro compatibility**: Automatically detects `nologin` path (`/sbin/nologin` for RHEL/CentOS, `/usr/sbin/nologin` for Debian/Ubuntu, falls back to `/bin/false`)
 - **Robust user creation**: Validates user/group existence before and after creation, with clear error messages on failure
-- **Non-interactive root default**: When running non-interactively as root (no `SUDO_USER`), the script defaults to `--dedicated-user` for safety unless you explicitly pass `--use-current-user`/`--user`.
+- **Non-interactive root default**: When running non-interactively as root (no `SUDO_USER`) **and** no `--user`/`--use-current-user`/`--dedicated-user` is given, a first-time deploy defaults to `--dedicated-user`. An existing unit's `User=` is inherited so `--repair` does not silently change ownership.
 
 ### systemd Security Hardening
 

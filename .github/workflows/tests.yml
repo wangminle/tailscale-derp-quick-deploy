@@ -1,0 +1,20 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  bash5:
+    name: Bash 5 regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Confirm Bash 5
+        run: |
+          bash --version | head -1
+          bash -c '[[ ${BASH_VERSINFO[0]} -ge 5 ]]'
+      - name: Main suite
+        run: bash tests/test_deploy_script.sh
+      - name: Review regressions
+        run: bash tests/test_review_regressions.sh
