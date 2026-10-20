@@ -3,12 +3,13 @@
 # ========================================
 
 # ============ 项目特定目录 ============
-# 规划讨论文档（不纳入版本控制）
+# 正式需求、设计与开发计划（不纳入版本控制；旧 plan/ 规则保留兼容）
 plan/
 plans/
 
-# 部署记录和执行日志（不纳入版本控制）
+# 审查/检查/调研报告、执行结果和历史快照（不纳入版本控制；旧 records/ 规则保留兼容）
 records/
+checkpoints/
 
 # 测试部署生成的临时文件
 test-deploy/
@@ -59,7 +60,7 @@ $RECYCLE.BIN/
 # VS Code（完全忽略，不上传到 GitHub）
 .vscode/
 
-# Claude Code 本地配置
+# Claude Code 本地配置（完全忽略，不上传到 GitHub）
 .claude/
 
 # JetBrains IDEs

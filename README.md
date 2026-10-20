@@ -1,7 +1,7 @@
 # Tailscale DERP Quick Deploy Script
 
 > **Language / 语言**: [English](#english) | [中文](#中文)  
-> **Version / 版本**: `0.2.12` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
+> **Version / 版本**: `0.2.13` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ---
 
@@ -508,8 +508,15 @@ Whether you're an **individual user quickly setting up a testing environment** o
 ### 📚 Further Reading
 
 - **Detailed Technical Documentation**:
-  - [Changelog (English)](docs/CHANGELOG_EN.md) | [更新日志（中文）](docs/CHANGELOG_CN.md)
+  - [Changelog (English)](CHANGELOG_EN.md) | [更新日志（中文）](CHANGELOG_CN.md)
   - [Technical Reference (English)](docs/REFERENCE_EN.md) | [技术参考（中文）](docs/REFERENCE_CN.md)
+
+### Documentation Layout
+
+- `docs/`: product usage guides for installation, configuration, operations, and troubleshooting.
+- `plans/`: formal requirements, designs, and development plans (local, not versioned).
+- `checkpoints/`: review, inspection, research, and evaluation reports; execution results, deployment records, and historical snapshots (local, not versioned).
+- Repository root: bilingual `CHANGELOG_CN.md` / `CHANGELOG_EN.md` and the task ledger `task-list.md`.
 
 ---
 
@@ -1016,9 +1023,16 @@ fi
 ### 📚 进一步阅读
 
 - **详细技术文档**：
-  - [更新日志（中文）](docs/CHANGELOG_CN.md) | [Changelog (English)](docs/CHANGELOG_EN.md)
+  - [更新日志（中文）](CHANGELOG_CN.md) | [Changelog (English)](CHANGELOG_EN.md)
   - [技术参考（中文）](docs/REFERENCE_CN.md) | [Technical Reference (English)](docs/REFERENCE_EN.md)
   - 审查记录见仓库根目录 `task-list.md`（CHK-004～CHK-007）
+
+### 文档目录约定
+
+- `docs/`：产品使用文档，包括安装、配置、参数、日常运维和排障指南。
+- `plans/`：正式需求、设计和开发实施计划；保留本地，不纳入版本控制。
+- `checkpoints/`：review、检查、调研和评估报告，以及执行结果、部署记录与历史快照；保留本地，不纳入版本控制。
+- 仓库根目录：中英文版本更新日志 `CHANGELOG_CN.md` / `CHANGELOG_EN.md`，以及实际任务台账 `task-list.md`。
 
 ---
 

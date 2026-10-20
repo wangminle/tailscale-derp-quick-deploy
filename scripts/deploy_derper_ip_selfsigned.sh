@@ -8,9 +8,9 @@
 
 set -euo pipefail
 
-# 脚本自身版本（与 docs/CHANGELOG_*.md、仓库根目录 VERSION 保持同步）
-SCRIPT_VERSION="0.2.12"
-SCRIPT_VERSION_DATE="2026-09-20"
+# 脚本自身版本（与仓库根目录 CHANGELOG_*.md、VERSION 保持同步）
+SCRIPT_VERSION="0.2.13"
+SCRIPT_VERSION_DATE="2026-10-20"
 
 # 默认端口
 DERP_PORT="30399"        # DERP TLS 端口

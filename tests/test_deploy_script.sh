@@ -1436,8 +1436,10 @@ test_readme_documents_missing_flags_and_runnable_examples() {
   if awk '/典型应用场景对比/,/^### ⚠️/' "$ROOT_DIR/README.md" | grep -q -- '`--dedicated-user --health-check`'; then
     fail "CN scenario table must not treat --health-check as a deploy combo"
   fi
+  [[ -f "$ROOT_DIR/CHANGELOG_CN.md" ]] || fail "Chinese changelog must exist at repository root"
+  [[ -f "$ROOT_DIR/CHANGELOG_EN.md" ]] || fail "English changelog must exist at repository root"
   if grep -q 'docs/BUGFIX_REVIEW_20260920.md' "$ROOT_DIR/README.md" \
-       "$ROOT_DIR/docs/CHANGELOG_CN.md" "$ROOT_DIR/docs/CHANGELOG_EN.md"; then
+       "$ROOT_DIR/CHANGELOG_CN.md" "$ROOT_DIR/CHANGELOG_EN.md"; then
     fail "docs must not link to missing docs/BUGFIX_REVIEW_20260920.md"
   fi
   grep -q '1–365000' "$ROOT_DIR/docs/REFERENCE_CN.md" || fail "REFERENCE_CN must document --cert-days range"

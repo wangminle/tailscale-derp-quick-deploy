@@ -1,5 +1,24 @@
 # Changelog
 
+## [0.2.13] - 2026-10-20
+
+### 📖 Docs & Repository Structure
+
+1. **Bilingual changelogs moved to the repository root**
+   - `docs/CHANGELOG_CN.md` / `docs/CHANGELOG_EN.md` are now root-level `CHANGELOG_CN.md` / `CHANGELOG_EN.md`; README links (CN/EN), the deployment-script header comment, and test assertions updated accordingly.
+   - README (CN/EN) gains a "Documentation Layout" section and CLAUDE.md documents the same convention: `docs/` holds product guides, `plans/` requirements and designs, `checkpoints/` review/research/execution records (the latter two not version-controlled); changelogs and the task ledger live at the repository root.
+
+2. **`.gitignore` aligned with the directory layout**
+   - Adds the `checkpoints/` rule (legacy `records/` kept for local history); `.claude/` stays fully ignored as local session configuration.
+
+### 🧪 Tests
+
+- The main suite asserts both changelogs exist at the repository root and that docs no longer link to the old `docs/CHANGELOG_*` paths or missing review files.
+
+This release contains no deployment-script functional changes; BUG-034–BUG-041 remain open. Review and planning records from 2026-10-20: root `task-list.md` (CHK-011–CHK-015, ADJ-010–ADJ-013).
+
+---
+
 ## [0.2.12] - 2026-09-20
 
 ### 🔧 Bug Fixes
@@ -637,6 +656,6 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 **Contributors**: Thanks to architects for professional advice
 
-**Update Date**: 2026-09-20
+**Update Date**: 2026-10-20
 
-**Version**: 0.2.12
+**Version**: 0.2.13
