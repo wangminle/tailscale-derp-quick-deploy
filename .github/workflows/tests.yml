@@ -18,3 +18,5 @@ jobs:
         run: bash tests/test_deploy_script.sh
       - name: Review regressions
         run: bash tests/test_review_regressions.sh
+      - name: S2 failure-path regressions
+        run: bash tests/test_s2_fixes.sh

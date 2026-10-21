@@ -1110,7 +1110,464 @@ test_bug042_existing_timer_update_failure_restores_old_units() {
   [[ "$(head -n 1 "$HEALTHCHECK_PROGRAM_DIR/deploy_derper_ip_selfsigned.sh")" == "old-stable-program" ]] || fail "稳定副本程序必须恢复旧版本"
 }
 
-for test_name in test_bug051_failure_before_activation_needs_no_stop test_bug050_failed_timer_update_restores_stopped_state test_bug051_incomplete_files_do_not_restart_timer test_bug047_backup_copy_failure_keeps_original_units test_bug048_sendq_is_not_main_pid test_bug049_cron_delete_failure_rolls_back_timer test_bug049_timer_delete_failure_rolls_back_cron test_bug050_timer_rollback_restores_previous_runtime_state test_bug051_restore_failure_keeps_snapshot test_bug038_verify_clients_dependency_is_not_healthy test_bug038_localapi_403_is_unhealthy test_bug039_mismatched_key_blocks_restart test_doc007_008_wording test_doc008_unsearchable_cert_dir_is_unknown test_bug034_generated_task_survives_unexecutable_source test_bug034_timer_replaces_cron_once test_metrics_failure_keeps_old_sample test_bug035_nft_rule_failure_keeps_old_rules test_bug035_iptables_append_failure_keeps_old_rules test_bug035_iptables_restore_failure_is_incomplete test_bug035_snapshot_read_failure_preserves_rules test_bug040_port_conflicts_follow_protocol test_bug040_ownership_matches_protocol_and_pid test_bug043_044_port_ownership_pid_and_netstat test_bug041_contradictory_modes_stop_before_side_effects test_numeric_args_are_canonical_after_validation test_health_check_exit_codes_keep_old_callers_safe test_legacy_symlink_migration test_cleanup_restarts_previously_running_service test_new_root_default test_real_certificate_write_failure test_interrupted_rollback test_rotation_decline_preserves_certificate test_module_query_preserves_network_settings test_explicit_user test_existing_user test_commit_versions test_certificate_resume test_rotation_requires_ack test_certificate_rollback test_recover_restart_failure_is_warning test_bug042_timer_installation_failure_retains_cron test_bug042_existing_timer_update_failure_restores_old_units test_bug045_timer_execstart_uses_proper_systemd_quoting test_bug046_all_firewall_deletions_fail_propagates_error test_bug046_mixed_backend_remove_failure_propagates_error; do
+test_b1_incomplete_marker_blocks_and_is_not_executed() {
+  DEPLOY_STATE_DIR="$case_tmp/deploy-state"
+  local canary="$case_tmp/pwned"
+  mkdir -p "$DEPLOY_STATE_DIR"
+  printf 'phase=switch\nrecovery=%s/recovery\n$(touch %s)\n' "$DEPLOY_STATE_DIR" "$canary" >"$DEPLOY_STATE_DIR/incomplete"
+  local rc=0 out=""
+  out=$(ordinary_change_allowed 2>&1) || rc=$?
+  [[ "$rc" -ne 0 ]] || fail "未完成标记必须阻断普通覆盖：${out}"
+  [[ "$out" == *recover-interrupted* ]] || fail "必须要求显式恢复，不能自动继续：${out}"
+  [[ ! -e "$canary" ]] || fail "恢复记录不得被 source/eval 执行"
+  RECOVER_INTERRUPTED=0 CHECK_ONLY=0 HEALTH_CHECK=0
+  if ordinary_change_allowed >/dev/null 2>&1; then
+    fail "危险标记不能被当成可继续的变更"
+  fi
+}
+
+test_b1_lock_failure_blocks_second_change() {
+  DEPLOY_STATE_DIR="$case_tmp/deploy-state"
+  local calls=0
+  flock() {
+    calls=$((calls + 1))
+    [[ "$calls" -eq 1 ]]
+  }
+  acquire_deploy_lock || fail "第一次变更必须取得锁"
+  if acquire_deploy_lock; then
+    fail "锁被占用时第二次升级/回退/迁移/轮换/卸载必须失败"
+  fi
+}
+
+test_b1_second_process_cannot_take_lock() {
+  if ! command -v flock >/dev/null 2>&1; then
+    skip "second-process flock skipped (no flock)"
+    return 0
+  fi
+  DEPLOY_STATE_DIR="$case_tmp/deploy-state"
+  acquire_deploy_lock || fail "父进程必须先取得真实 flock"
+  local rc
+  rc=$(DEPLOY_STATE_DIR="$DEPLOY_STATE_DIR" bash -c '
+    DERPER_TEST_MODE=1
+    source "$1"
+    DEPLOY_STATE_DIR="$2"
+    if acquire_deploy_lock; then
+      echo took
+    else
+      echo blocked
+    fi
+  ' _ "$SCRIPT" "$DEPLOY_STATE_DIR")
+  [[ "$rc" == "blocked" ]] || fail "另一个进程在锁被占用时不得取得变更锁：${rc}"
+}
+
+test_b1_unverified_staging_keeps_only_backup() {
+  DEPLOY_STATE_DIR="$case_tmp/deploy-state"
+  mkdir -p "$DEPLOY_STATE_DIR/recovery" "$DEPLOY_STATE_DIR/recovery.staging"
+  printf 'backup-good\n' >"$DEPLOY_STATE_DIR/recovery/binary"
+  chmod 755 "$DEPLOY_STATE_DIR/recovery/binary"
+  local sum
+  sum=$(sha256_hex <"$DEPLOY_STATE_DIR/recovery/binary")
+  printf 'binary_sha256=%s\nrun_intent=inactive\n' "$sum" >"$DEPLOY_STATE_DIR/recovery/manifest"
+  printf 'partial\n' >"$DEPLOY_STATE_DIR/recovery.staging/binary"
+  printf 'binary_sha256=deadbeef\nrun_intent=inactive\n' >"$DEPLOY_STATE_DIR/recovery.staging/manifest"
+  local rc=0
+  promote_recovery_staging >/dev/null 2>&1 || rc=$?
+  [[ "$rc" -ne 0 ]] || fail "未校验的暂存不得替换恢复集"
+  [[ "$(cat "$DEPLOY_STATE_DIR/recovery/binary")" == "backup-good" ]] || fail "唯一有效备份必须保持原内容"
+}
+
+test_b2_bad_candidate_and_disk_failure_keep_live_binary() {
+  DEPLOY_STATE_DIR="$case_tmp/deploy-state"
+  BIN_PATH="$case_tmp/bin/derper"
+  SERVICE_PATH="$case_tmp/derper.service"
+  INSTALL_DIR="$case_tmp/install"
+  VERIFY_CLIENTS_MODE=off
+  mkdir -p "$(dirname "$BIN_PATH")" "$INSTALL_DIR"
+  printf '#!/bin/sh\necho old\n' >"$BIN_PATH"
+  chmod 755 "$BIN_PATH"
+  printf 'old-unit\n' >"$SERVICE_PATH"
+  local candidate="$case_tmp/candidate"
+  printf '#!/bin/sh\nexit 42\n' >"$candidate"
+  chmod 755 "$candidate"
+  local rc=0 out=""
+  out=$(publish_derper_candidate "$candidate" 2>&1) || rc=$?
+  [[ "$rc" -ne 0 ]] || fail "坏候选不得发布成功：${out}"
+  [[ "$out" != *安装到* ]] || fail "坏候选不得报告已安装：${out}"
+  [[ "$(head -n 1 "$BIN_PATH")" == "#!/bin/sh" && "$(sed -n '2p' "$BIN_PATH")" == "echo old" ]] || fail "坏候选不得覆盖正式二进制"
+  rm -rf "$DEPLOY_STATE_DIR"
+  printf '#!/bin/sh\necho -a\nexit 0\n' >"$candidate"
+  cp() { return 1; }
+  rc=0
+  out=$(publish_derper_candidate "$candidate" 2>&1) || rc=$?
+  [[ "$rc" -ne 0 ]] || fail "磁盘写入失败不得返回成功：${out}"
+  [[ "$(sed -n '2p' "$BIN_PATH")" == "echo old" ]] || fail "写入失败后正式二进制必须仍是旧版本"
+  unset -f cp
+}
+
+test_b2_stopped_intent_is_not_started() {
+  DEPLOY_STATE_DIR="$case_tmp/deploy-state"
+  BIN_PATH="$case_tmp/bin/derper"
+  SERVICE_PATH="$case_tmp/derper.service"
+  INSTALL_DIR="$case_tmp/install"
+  mkdir -p "$(dirname "$BIN_PATH")" "$INSTALL_DIR/state" "$DEPLOY_STATE_DIR/recovery"
+  printf '#!/bin/sh\necho new\n' >"$BIN_PATH"
+  chmod 755 "$BIN_PATH"
+  printf '#!/bin/sh\necho old\n' >"$DEPLOY_STATE_DIR/recovery/binary"
+  chmod 755 "$DEPLOY_STATE_DIR/recovery/binary"
+  printf 'old-unit\n' >"$DEPLOY_STATE_DIR/recovery/unit"
+  printf 'old-unit\n' >"$SERVICE_PATH"
+  local sum
+  sum=$(sha256_hex <"$DEPLOY_STATE_DIR/recovery/binary")
+  printf 'binary_sha256=%s\nrun_intent=inactive\n' "$sum" >"$DEPLOY_STATE_DIR/recovery/manifest"
+  printf 'phase=switch\nrecovery=%s/recovery\n' "$DEPLOY_STATE_DIR" >"$DEPLOY_STATE_DIR/incomplete"
+  local calls="$case_tmp/systemctl-calls"
+  : >"$calls"
+  systemctl() {
+    printf '%s\n' "$*" >>"$calls"
+    [[ "$1" == is-active ]] && return 1
+    return 0
+  }
+  verify_restored_service() { echo started >"$case_tmp/verified"; return 0; }
+  local rc=0
+  rollback_deploy_change >/dev/null 2>&1 || rc=$?
+  [[ "$rc" -eq 0 ]] || fail "停止中的服务应能恢复文件，rc=${rc}"
+  [[ "$(sed -n '2p' "$BIN_PATH")" == "echo old" ]] || fail "回退必须恢复旧二进制"
+  if grep -q '^start ' "$calls"; then
+    fail "原停止服务必须保持停止：$(cat "$calls")"
+  fi
+  [[ ! -e "$case_tmp/verified" ]] || fail "原停止服务不得进入启动验证"
+}
+
+test_b2_daemon_drift_stays_manual() {
+  DEPLOY_STATE_DIR="$case_tmp/deploy-state"
+  BIN_PATH="$case_tmp/bin/derper"
+  SERVICE_PATH="$case_tmp/derper.service"
+  INSTALL_DIR="$case_tmp/install"
+  VERIFY_CLIENTS_MODE=on
+  mkdir -p "$(dirname "$BIN_PATH")" "$INSTALL_DIR"
+  printf '#!/bin/sh\necho -a\necho old\n' >"$BIN_PATH"
+  chmod 755 "$BIN_PATH"
+  local candidate="$case_tmp/candidate"
+  printf '#!/bin/sh\necho -a\necho new\n' >"$candidate"
+  chmod 755 "$candidate"
+  tailscaled_daemon_revision() { printf 'aaa111\n'; }
+  derper_artifact_revision() { printf 'bbb222\n'; }
+  local canary="$case_tmp/tailscale-mutated"
+  tailscale() { echo mutated >"$canary"; }
+  tailscaled() { echo mutated >"$canary"; }
+  local rc=0 out=""
+  out=$(publish_derper_candidate "$candidate" 2>&1) || rc=$?
+  [[ "$rc" -ne 0 ]] || fail "daemon 漂移必须拒绝切换：${out}"
+  [[ "$out" == *人工* ]] || fail "daemon 漂移必须转人工：${out}"
+  [[ "$(sed -n '3p' "$BIN_PATH")" == "echo old" ]] || fail "拒绝切换时正式二进制必须不变"
+  [[ ! -e "$canary" ]] || fail "不得顺带升级或降级 tailscaled"
+}
+
+test_b2_first_install_failure_has_no_fake_previous() {
+  DEPLOY_STATE_DIR="$case_tmp/deploy-state"
+  BIN_PATH="$case_tmp/bin/derper"
+  SERVICE_PATH="$case_tmp/derper.service"
+  INSTALL_DIR="$case_tmp/install"
+  VERIFY_CLIENTS_MODE=off
+  mkdir -p "$INSTALL_DIR"
+  local candidate="$case_tmp/candidate"
+  printf '#!/bin/sh\necho -a\n' >"$candidate"
+  chmod 755 "$candidate"
+  cp() { return 1; }
+  local rc=0 out=""
+  out=$(publish_derper_candidate "$candidate" 2>&1) || rc=$?
+  unset -f cp
+  [[ "$rc" -ne 0 ]] || fail "首次安装写入失败必须返回非零：${out}"
+  [[ "$out" == *首次安装* ]] || fail "首次安装必须明确没有上一版本：${out}"
+  [[ ! -e "$BIN_PATH" ]] || fail "首次安装失败不得留下正式二进制"
+  [[ ! -e "$DEPLOY_STATE_DIR/recovery/binary" ]] || fail "首次安装失败不得伪造上一版本备份"
+}
+
+test_b2_rollback_restores_config_and_state() {
+  DEPLOY_STATE_DIR="$case_tmp/deploy-state"
+  BIN_PATH="$case_tmp/bin/derper"
+  SERVICE_PATH="$case_tmp/derper.service"
+  INSTALL_DIR="$case_tmp/install"
+  NODE_STATE_DIR="$case_tmp/node-state"
+  mkdir -p "$(dirname "$BIN_PATH")" "$NODE_STATE_DIR" "$DEPLOY_STATE_DIR/recovery/state"
+  printf '#!/bin/sh\necho new\n' >"$BIN_PATH"
+  chmod 755 "$BIN_PATH"
+  printf '#!/bin/sh\necho old\n' >"$DEPLOY_STATE_DIR/recovery/binary"
+  chmod 755 "$DEPLOY_STATE_DIR/recovery/binary"
+  printf 'old-unit\n' >"$DEPLOY_STATE_DIR/recovery/unit"
+  printf 'old-config\n' >"$DEPLOY_STATE_DIR/recovery/config"
+  printf 'old-state\n' >"$DEPLOY_STATE_DIR/recovery/state/node.key"
+  printf 'new-unit\n' >"$SERVICE_PATH"
+  printf 'new-config\n' >"$NODE_STATE_DIR/derper.json"
+  printf 'new-state\n' >"$NODE_STATE_DIR/node.key"
+  local sum
+  sum=$(sha256_hex <"$DEPLOY_STATE_DIR/recovery/binary")
+  printf 'binary_sha256=%s\nrun_intent=inactive\n' "$sum" >"$DEPLOY_STATE_DIR/recovery/manifest"
+  printf 'phase=switch\nrecovery=%s/recovery\n' "$DEPLOY_STATE_DIR" >"$DEPLOY_STATE_DIR/incomplete"
+  systemctl() { [[ "$1" == is-active ]] && return 1; return 0; }
+  local rc=0
+  rollback_deploy_change >/dev/null 2>&1 || rc=$?
+  [[ "$rc" -eq 0 ]] || fail "配置和状态可恢复时回退必须成功，rc=${rc}"
+  [[ "$(cat "$NODE_STATE_DIR/derper.json")" == "old-config" ]] || fail "回退必须写回旧节点配置"
+  [[ "$(cat "$NODE_STATE_DIR/node.key")" == "old-state" ]] || fail "回退必须写回旧节点状态"
+  [[ "$(cat "$DEPLOY_STATE_DIR/recovery/config")" == "old-config" ]] || fail "回退成功后仍要保留恢复集里的配置"
+}
+
+test_b2_reverify_failure_keeps_recovery() {
+  DEPLOY_STATE_DIR="$case_tmp/deploy-state"
+  BIN_PATH="$case_tmp/bin/derper"
+  SERVICE_PATH="$case_tmp/derper.service"
+  INSTALL_DIR="$case_tmp/install"
+  mkdir -p "$(dirname "$BIN_PATH")" "$DEPLOY_STATE_DIR/recovery"
+  printf '#!/bin/sh\necho new\n' >"$BIN_PATH"
+  chmod 755 "$BIN_PATH"
+  printf '#!/bin/sh\necho old\n' >"$DEPLOY_STATE_DIR/recovery/binary"
+  chmod 755 "$DEPLOY_STATE_DIR/recovery/binary"
+  local sum
+  sum=$(sha256_hex <"$DEPLOY_STATE_DIR/recovery/binary")
+  printf 'binary_sha256=%s\nrun_intent=active\n' "$sum" >"$DEPLOY_STATE_DIR/recovery/manifest"
+  printf 'phase=switch\nrecovery=%s/recovery\n' "$DEPLOY_STATE_DIR" >"$DEPLOY_STATE_DIR/incomplete"
+  systemctl() { return 0; }
+  verify_restored_service() { return 1; }
+  local rc=0 out=""
+  out=$(rollback_deploy_change 2>&1) || rc=$?
+  [[ "$rc" -ne 0 ]] || fail "复验失败必须返回非零：${out}"
+  [[ -f "$DEPLOY_STATE_DIR/recovery/binary" ]] || fail "复验失败必须留下恢复集"
+  [[ -f "$DEPLOY_STATE_DIR/incomplete" ]] || fail "复验失败不得清掉未完成标记"
+  [[ "$(sed -n '2p' "$DEPLOY_STATE_DIR/recovery/binary")" == "echo old" ]] || fail "恢复集中的旧二进制不得被覆盖"
+}
+
+test_b2_build_timeout_keeps_live_binary() {
+  DEPLOY_STATE_DIR="$case_tmp/deploy-state"
+  BIN_PATH="$case_tmp/bin/derper"
+  _tmpdir="$case_tmp"
+  VERIFY_CLIENTS_MODE=off
+  DERPER_VERSION=v1.2.3
+  GOPROXY_ARG=""
+  GOSUMDB_ARG=""
+  GOTOOLCHAIN_ARG=local
+  mkdir -p "$(dirname "$BIN_PATH")"
+  printf '#!/bin/sh\necho old\n' >"$BIN_PATH"
+  chmod 755 "$BIN_PATH"
+  precheck_go_network() { return 0; }
+  ensure_go() { return 0; }
+  _timeout_run() { return 1; }
+  # install_derper 用 exit，必须放进子进程，否则当前测试进程会直接结束。
+  local rc
+  rc=$( ( install_derper >/dev/null 2>&1 ); echo $? )
+  [[ "$rc" -ne 0 ]] || fail "构建超时必须失败"
+  [[ "$(sed -n '2p' "$BIN_PATH")" == "echo old" ]] || fail "构建超时不得替换正式二进制"
+}
+
+test_b3_migration_failure_restores_running_service() {
+  DEPLOY_STATE_DIR="$case_tmp/deploy-state"
+  INSTALL_DIR="$case_tmp/install"
+  NODE_STATE_DIR="$INSTALL_DIR/state"
+  SERVICE_PATH="$case_tmp/derper.service"
+  RUN_USER=derper
+  mkdir -p "$INSTALL_DIR/certs" "$DEPLOY_STATE_DIR"
+  printf 'cert-bytes\n' >"$INSTALL_DIR/certs/node.crt"
+  printf 'old-identity\n' >"$INSTALL_DIR/derper.json"
+  printf 'unit\n' >"$SERVICE_PATH"
+  local calls="$case_tmp/svc-calls"
+  : >"$calls"
+  systemctl() { printf '%s\n' "$*" >>"$calls"; return 0; }
+  verify_restored_service() { echo verified >>"$calls"; return 0; }
+  chown() { return 0; }
+  id() { echo derper; }
+  cp() {
+    local dest="${*: -1}"
+    if [[ "$dest" == "$NODE_STATE_DIR/"* ]]; then
+      return 1
+    fi
+    command cp "$@"
+  }
+  local rc=0 out=""
+  out=$(migrate_node_state 2>&1) || rc=$?
+  [[ "$rc" -ne 0 ]] || fail "迁移复制失败必须返回非零：${out}"
+  [[ "$(cat "$INSTALL_DIR/derper.json")" == "old-identity" ]] || fail "迁移失败必须保留原节点身份"
+  [[ "$(cat "$INSTALL_DIR/certs/node.crt")" == "cert-bytes" ]] || fail "迁移失败不得改变证书字节"
+  grep -q '^stop derper' "$calls" || fail "迁移前必须先停止正在运行的服务：$(cat "$calls")"
+  grep -q '^start derper' "$calls" || fail "迁移失败后必须按原运行意图重新启动：$(cat "$calls")"
+  grep -q '^verified$' "$calls" || fail "迁移失败恢复后必须复验"
+}
+
+test_bug054_restore_does_not_follow_state_symlink() {
+  NODE_STATE_DIR="$case_tmp/state"
+  mkdir -p "$NODE_STATE_DIR" "$case_tmp/recovery"
+  printf 'ORIGINAL-ROOT-FILE\n' >"$case_tmp/victim"
+  printf 'OLD-NODE-CONFIG\n' >"$case_tmp/recovery/config"
+  ln -s "$case_tmp/victim" "$NODE_STATE_DIR/derper.json"
+  local rc=0
+  restore_saved_payload "$case_tmp/recovery" >/dev/null 2>&1 || rc=$?
+  [[ "$(cat "$case_tmp/victim")" == "ORIGINAL-ROOT-FILE" ]] || fail "恢复不得沿符号链接改写目标文件"
+  [[ ! -L "$NODE_STATE_DIR/derper.json" ]] || fail "恢复后的配置不能仍是符号链接"
+  [[ "$(cat "$NODE_STATE_DIR/derper.json")" == "OLD-NODE-CONFIG" ]] || fail "恢复应把旧配置装成普通文件，rc=${rc}"
+}
+
+test_bug054_restore_refuses_symlink_state_directory() {
+  mkdir -p "$case_tmp/real-state" "$case_tmp/recovery"
+  printf 'SECRET\n' >"$case_tmp/real-state/derper.json"
+  ln -s "$case_tmp/real-state" "$case_tmp/linked-state"
+  NODE_STATE_DIR="$case_tmp/linked-state"
+  printf 'OLD-NODE-CONFIG\n' >"$case_tmp/recovery/config"
+  if restore_saved_payload "$case_tmp/recovery" >/dev/null 2>&1; then
+    fail "状态目录本身是符号链接时必须拒绝恢复"
+  fi
+  [[ "$(cat "$case_tmp/real-state/derper.json")" == "SECRET" ]] || fail "不得穿过状态目录符号链接删除或改写原文件"
+}
+
+test_bug055_same_origin_candidate_passes_daemon_gate() {
+  VERIFY_CLIENTS_MODE=on
+  local candidate="$case_tmp/candidate"
+  printf '#!/bin/sh\n# tailscale.com v1.104.1\necho -- -a\n' >"$candidate"
+  chmod 755 "$candidate"
+  tailscaled() { printf '1.104.1\n  tailscale commit: abcdef0123456789abcdef0123456789abcdef01\n'; }
+  resolve_derper_module_version() { printf 'v1.104.1\n'; }
+  candidate_matches_running_daemon "$candidate" || fail "模块版本与 daemon commit 解析到同一发布时必须放行"
+  resolve_derper_module_version() { printf 'v1.104.2\n'; }
+  if candidate_matches_running_daemon "$candidate"; then
+    fail "解析出版本不同的 commit 仍必须拒绝"
+  fi
+}
+
+test_bug056_rollback_reloads_process_and_keeps_marker_on_stop_failure() {
+  DEPLOY_STATE_DIR="$case_tmp/deploy-state"
+  BIN_PATH="$case_tmp/bin/derper"
+  SERVICE_PATH="$case_tmp/derper.service"
+  INSTALL_DIR="$case_tmp/install"
+  NODE_STATE_DIR="$case_tmp/state"
+  mkdir -p "$DEPLOY_STATE_DIR/recovery" "$(dirname "$BIN_PATH")" "$NODE_STATE_DIR"
+  printf 'old-executable\n' >"$DEPLOY_STATE_DIR/recovery/binary"
+  printf 'new-executable\n' >"$BIN_PATH"
+  printf 'old-unit\n' >"$DEPLOY_STATE_DIR/recovery/unit"
+  printf 'new-unit\n' >"$SERVICE_PATH"
+  printf 'binary_sha256=%s\nrun_intent=active\n' "$(file_sha256 "$DEPLOY_STATE_DIR/recovery/binary")" >"$DEPLOY_STATE_DIR/recovery/manifest"
+  printf 'phase=switch\nrecovery=%s/recovery\n' "$DEPLOY_STATE_DIR" >"$DEPLOY_STATE_DIR/incomplete"
+  local runtime=active runtime_executable=new-executable
+  systemctl() {
+    case "$1" in
+      start) [[ "$runtime" == active ]] || { runtime=active; runtime_executable=$(cat "$BIN_PATH"); } ;;
+      stop) runtime=inactive ;;
+      restart) runtime=active; runtime_executable=$(cat "$BIN_PATH") ;;
+      is-active) [[ "$runtime" == active ]] ;;
+      *) return 0 ;;
+    esac
+  }
+  verify_restored_service() { [[ "$runtime" == active && "$runtime_executable" == "$(cat "$BIN_PATH")" ]]; }
+  local rc=0
+  rollback_deploy_change >/dev/null 2>&1 || rc=$?
+  [[ "$rc" -eq 0 ]] || fail "旧二进制已重新加载时回退应成功，rc=${rc}"
+  [[ "$(cat "$BIN_PATH")" == "old-executable" ]] || fail "磁盘必须是旧二进制"
+  [[ "$runtime_executable" == "old-executable" ]] || fail "正在运行的进程必须换成旧二进制，实际 ${runtime_executable}"
+  [[ ! -e "$DEPLOY_STATE_DIR/incomplete" ]] || fail "确认换回旧进程后才可以清除标记"
+
+  printf 'phase=switch\nrecovery=%s/recovery\n' "$DEPLOY_STATE_DIR" >"$DEPLOY_STATE_DIR/incomplete"
+  printf 'binary_sha256=%s\nrun_intent=inactive\n' "$(file_sha256 "$DEPLOY_STATE_DIR/recovery/binary")" >"$DEPLOY_STATE_DIR/recovery/manifest"
+  systemctl() { [[ "$1" == stop ]] && return 1; return 0; }
+  rc=0
+  rollback_deploy_change >/dev/null 2>&1 || rc=$?
+  [[ "$rc" -ne 0 ]] || fail "停止失败必须返回非零"
+  [[ -e "$DEPLOY_STATE_DIR/incomplete" ]] || fail "停止失败不得清除未完成标记"
+}
+
+test_bug057_migration_failure_keeps_recovery_marker() {
+  DEPLOY_STATE_DIR="$case_tmp/migration-deploy"
+  INSTALL_DIR="$case_tmp/migration-install"
+  NODE_STATE_DIR="$case_tmp/migration-state"
+  SERVICE_PATH="$case_tmp/legacy.service"
+  RUN_USER=derper
+  mkdir -p "$INSTALL_DIR/certs" "$DEPLOY_STATE_DIR"
+  printf 'old-node-key\n' >"$INSTALL_DIR/derper.json"
+  printf 'cert\n' >"$INSTALL_DIR/certs/node.crt"
+  printf 'legacy-unit\n' >"$SERVICE_PATH"
+  local runtime=active saw_marker=no
+  chown() { return 0; }
+  harden_cert_dir() { return 0; }
+  id() { echo derper; }
+  systemctl() {
+    case "$1" in
+      is-active) [[ "$runtime" == active ]] ;;
+      stop)
+        [[ -e "$DEPLOY_STATE_DIR/incomplete" ]] && saw_marker=yes
+        runtime=inactive
+        ;;
+      start) runtime=active ;;
+      *) return 0 ;;
+    esac
+  }
+  file_sha256() {
+    [[ "$1" == "$INSTALL_DIR/derper.json" ]] && return 1
+    sha256_hex <"$1"
+  }
+  verify_restored_service() { return 1; }
+  local rc=0
+  migrate_node_state >/dev/null 2>&1 || rc=$?
+  [[ "$rc" -ne 0 ]] || fail "迁移摘要失败必须返回非零"
+  [[ "$saw_marker" == yes ]] || fail "停服前必须已经写下未完成标记"
+  [[ -e "$DEPLOY_STATE_DIR/incomplete" ]] || fail "未能恢复运行时必须保留未完成标记"
+  [[ -d "$DEPLOY_STATE_DIR/recovery" ]] || fail "纯迁移也必须留下恢复集"
+}
+
+test_bug058_migrated_config_is_owned_by_run_user() {
+  INSTALL_DIR="$case_tmp/install"
+  NODE_STATE_DIR="$case_tmp/state"
+  SERVICE_PATH="$case_tmp/missing.service"
+  RUN_USER=derper
+  mkdir -p "$INSTALL_DIR/certs"
+  printf 'node-identity\n' >"$INSTALL_DIR/derper.json"
+  printf 'cert-bytes\n' >"$INSTALL_DIR/certs/node.crt"
+  local chown_log="$case_tmp/chown-log"
+  : >"$chown_log"
+  chown() { printf '%s\n' "$*" >>"$chown_log"; return 0; }
+  id() { echo derper; }
+  migrate_node_state >/dev/null || fail "属主可变更时迁移必须成功"
+  local config
+  config=$(derper_config_path)
+  grep -F "$config" "$chown_log" >/dev/null || fail "迁移后的节点配置必须 chown 给运行用户：$(cat "$chown_log")"
+  chown() {
+    [[ "${*: -1}" == "$config" ]] && return 1
+    return 0
+  }
+  rm -f "$config"
+  if migrate_node_state >/dev/null 2>&1; then
+    fail "配置无法交给运行用户时不得报告迁移成功"
+  fi
+}
+
+test_b3_layout_blocks_cert_rename_and_keeps_identity() {
+  INSTALL_DIR="$case_tmp/install"
+  NODE_STATE_DIR=""
+  RUN_USER="derper"
+  mkdir -p "$INSTALL_DIR/certs"
+  printf 'cert-bytes\n' >"$INSTALL_DIR/certs/node.crt"
+  printf '{"PrivateKey":"node-identity-1"}\n' >"$INSTALL_DIR/derper.json"
+  ln -s "$INSTALL_DIR/certs" "$case_tmp/certs-link"
+  local chown_log="$case_tmp/chown-log"
+  : >"$chown_log"
+  chown() { printf '%s\n' "$*" >>"$chown_log"; return 0; }
+  id() { echo derper; }
+  if ! mode_grants_write_to 755 0 0 65534 65534; then
+    :
+  else
+    fail "root:0755 父目录不得允许其他用户写入"
+  fi
+  layout_install_tree || fail "安装树布局必须成功"
+  if grep -q -- '-R' "$chown_log"; then
+    fail "不得把整个安装树 chown -R 给服务用户：$(cat "$chown_log")"
+  fi
+  local state
+  state=$(derper_node_state_dir)
+  [[ "$(cat "$state/derper.json")" == '{"PrivateKey":"node-identity-1"}' ]] || fail "迁移后节点身份必须保持原字节"
+  [[ "$(cat "$INSTALL_DIR/certs/node.crt")" == "cert-bytes" ]] || fail "迁移不得改动证书字节"
+  rm -rf "$INSTALL_DIR/certs"
+  ln -s "$case_tmp/certs-link" "$INSTALL_DIR/certs"
+  if layout_install_tree >/dev/null 2>&1; then
+    fail "恶意证书目录符号链接必须拒绝"
+  fi
+}
+
+for test_name in test_b1_incomplete_marker_blocks_and_is_not_executed test_b1_lock_failure_blocks_second_change test_b1_second_process_cannot_take_lock test_b1_unverified_staging_keeps_only_backup test_b2_bad_candidate_and_disk_failure_keep_live_binary test_b2_stopped_intent_is_not_started test_b2_daemon_drift_stays_manual test_b2_first_install_failure_has_no_fake_previous test_b2_rollback_restores_config_and_state test_b2_reverify_failure_keeps_recovery test_b2_build_timeout_keeps_live_binary test_b3_migration_failure_restores_running_service test_bug054_restore_does_not_follow_state_symlink test_bug054_restore_refuses_symlink_state_directory test_bug055_same_origin_candidate_passes_daemon_gate test_bug056_rollback_reloads_process_and_keeps_marker_on_stop_failure test_bug057_migration_failure_keeps_recovery_marker test_bug058_migrated_config_is_owned_by_run_user test_b3_layout_blocks_cert_rename_and_keeps_identity test_bug051_failure_before_activation_needs_no_stop test_bug050_failed_timer_update_restores_stopped_state test_bug051_incomplete_files_do_not_restart_timer test_bug047_backup_copy_failure_keeps_original_units test_bug048_sendq_is_not_main_pid test_bug049_cron_delete_failure_rolls_back_timer test_bug049_timer_delete_failure_rolls_back_cron test_bug050_timer_rollback_restores_previous_runtime_state test_bug051_restore_failure_keeps_snapshot test_bug038_verify_clients_dependency_is_not_healthy test_bug038_localapi_403_is_unhealthy test_bug039_mismatched_key_blocks_restart test_doc007_008_wording test_doc008_unsearchable_cert_dir_is_unknown test_bug034_generated_task_survives_unexecutable_source test_bug034_timer_replaces_cron_once test_metrics_failure_keeps_old_sample test_bug035_nft_rule_failure_keeps_old_rules test_bug035_iptables_append_failure_keeps_old_rules test_bug035_iptables_restore_failure_is_incomplete test_bug035_snapshot_read_failure_preserves_rules test_bug040_port_conflicts_follow_protocol test_bug040_ownership_matches_protocol_and_pid test_bug043_044_port_ownership_pid_and_netstat test_bug041_contradictory_modes_stop_before_side_effects test_numeric_args_are_canonical_after_validation test_health_check_exit_codes_keep_old_callers_safe test_legacy_symlink_migration test_cleanup_restarts_previously_running_service test_new_root_default test_real_certificate_write_failure test_interrupted_rollback test_rotation_decline_preserves_certificate test_module_query_preserves_network_settings test_explicit_user test_existing_user test_commit_versions test_certificate_resume test_rotation_requires_ack test_certificate_rollback test_recover_restart_failure_is_warning test_bug042_timer_installation_failure_retains_cron test_bug042_existing_timer_update_failure_restores_old_units test_bug045_timer_execstart_uses_proper_systemd_quoting test_bug046_all_firewall_deletions_fail_propagates_error test_bug046_mixed_backend_remove_failure_propagates_error; do
   if (
     DERPER_TEST_MODE=1 source "$SCRIPT"
     case_tmp=$(mktemp -d)

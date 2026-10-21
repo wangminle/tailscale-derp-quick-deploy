@@ -3,7 +3,7 @@
 > This is the detailed English reference. For the simplified Chinese quickstart now used as the main README, go to `../README.md`. For the detailed Chinese reference, see `REFERENCE_CN.md` in this folder.
 
 > **Script File**: `deploy_derper_ip_selfsigned.sh`  
-> **Current Version**: 0.2.14 (2026-10-21)\
+> **Current Version**: 0.2.15 (2026-10-21)\
 > **Show version**: `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
@@ -63,7 +63,7 @@ Note: This mode is only for local functional verification and cannot serve as a 
 - **`-verify-clients` enabled by default**: Script checks if local `tailscaled` is running and logged in before installation
   - ✅ If not ready, script will abort and show login instructions
   - ⚠️ To skip verification, use `--no-verify-clients` (**testing only**)
-  - 🔒 **Version alignment (v0.2.8 / v0.2.10)**: `-verify-clients` requires derper and tailscaled to be built from the same git revision. When `--derper-version` is not specified, the script first aligns the *target* to the `tailscale commit` reported by `tailscale version` (true same-source); it falls back to a semver tag with a warning when the commit is unavailable. Matching uses the trailing 12-character pseudo-version revision, or `go list -m` to resolve a commit to its canonical tag, so `--repair` does not rebuild on every run. **If an installed derper binary does not match that target, it is reinstalled** (no extra `--force` required). Override with `--derper-version`.
+  - 🔒 **Version alignment (v0.2.8 / v0.2.10)**: `-verify-clients` requires derper and tailscaled to be built from the same git revision. When `--derper-version` is not specified, the script first aligns the *target* to the `tailscale commit` reported by `tailscale version` (true same-source); it falls back to a semver tag with a warning when the commit is unavailable. Matching uses the trailing 12-character pseudo-version revision, or `go list -m` to resolve a commit to its canonical tag, so `--repair` does not rebuild on every run. **If an installed derper binary does not match that target, it is reinstalled** (no extra `--force` required). Override with `--derper-version`. Before replacing the live binary, the candidate module version is compared with the running tailscaled daemon commit by the same rule; a mismatch or an unresolved identity does not switch derper and does not upgrade or downgrade tailscaled.
   - 📝 Detection logic:
     - If `tailscale` CLI detected, checks via `tailscale ip` whether Tailnet IP is assigned
     - If CLI not detected, only checks `tailscaled` running status
@@ -197,7 +197,7 @@ Pre-check outputs several key items, their meanings and solutions (in order of a
   - Missing items (like curl/openssl/git/go): Formal installation will fill on-demand; for offline/restricted networks, install via package manager first.
 - Service manager
   - systemd not detected: Cannot write service. Can run manually in foreground (example):
-    `derper -c /opt/derper/derper.json -hostname <your-public-ip> -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun -stun-port 3478 -verify-clients -socket /run/tailscale/tailscaled.sock`
+    `derper -c /var/lib/derper/derper.json -hostname <your-public-ip> -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun -stun-port 3478 -verify-clients -socket /run/tailscale/tailscaled.sock`
     Note: For older versions that do not support `-a`, use `-https-port 30399`. If `-stun-port` is unsupported, only the default STUN port 3478 can be used; the script rejects custom STUN ports that cannot take effect.
 - Non-systemd environments will show manual run examples, installation process will abort.
 - Suggestions (summary of recommended actions)
@@ -264,13 +264,16 @@ Common paths:
 --health-check            Only output health check summary (no system changes, for cron/monitoring)
                           Exit codes: 0 healthy, 1 confirmed fault; 2 is reserved for unknown and is never reported as healthy. Any non-zero means not healthy
                           If --metrics-textfile cannot be written, the summary is still printed but the exit code is 1 and the old metrics file is left unchanged
-                          Cannot be combined with --check/--dry-run/--repair/--force/--uninstall
+                          Cannot be combined with --check/--dry-run/--repair/--force/--uninstall/--recover-interrupted
 --metrics-textfile <P>    Export health check as Prometheus text metrics to path P
                           (requires --health-check or --install-healthcheck-cron; use with node_exporter)
 --uninstall               Stop and uninstall derper systemd service (keep binary and certificates; also removes the health-check timer/cron and --tls-connlimit rules;
                           the health-check stable copy under /usr/local/lib/derper-deploy is kept and can be removed manually)
 --purge                   With --uninstall: additionally delete installation directory (/opt/derper)
---purge-all               With --uninstall: on top of --purge, also delete binary, /etc/derper/derper.env, and the script-created tailscaled socket drop-in; firewall rules and user/group accounts require manual confirmation
+--purge-all               With --uninstall: on top of --purge, also delete binary, /etc/derper/derper.env, the health-check stable program/status, and the script-created tailscaled socket drop-in; firewall rules and user/group accounts require manual confirmation
+--recover-interrupted     Explicitly recover an unfinished upgrade/migration. Interrupted steps are never continued automatically.
+                          While an incomplete marker exists, ordinary install/repair/rotation/uninstall are blocked; the recovery
+                          set and marker live under /var/lib/derper-deploy (root-owned). Not with install, repair, check, or uninstall.
 ```
 
 > Compatibility: Script prioritizes new `-a :<PORT>` for listening; falls back to old parameter `-https-port <PORT>` if unsupported. If the installed derper does not support `-stun-port`, the script only permits the default port 3478; any other STUN port causes an explicit error and abort.
@@ -661,7 +664,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall --purge
 sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall --purge-all
 ```
 
-Note: Uninstall doesn't affect Tailscale itself (tailscaled, clients etc.). To remove together, use distro's normal method. The health-check stable copy directory (default `/usr/local/lib/derper-deploy/`) is not removed by any uninstall level; `rm -rf` it manually once it is no longer needed.
+Note: Uninstall doesn't affect Tailscale itself (tailscaled, clients etc.). To remove together, use the distro's normal method. Ordinary uninstall and `--purge` keep the health-check stable copy. `--purge-all` removes the stable program and status (default directory `/usr/local/lib/derper-deploy/`, including the cron fallback directory) and removes empty directories. Unrelated user files remain; a symlink program directory or failed deletion returns non-zero.
 
 ---
 

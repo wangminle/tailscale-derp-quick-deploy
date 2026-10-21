@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # 脚本自身版本（与仓库根目录 CHANGELOG_*.md、VERSION 保持同步）
-SCRIPT_VERSION="0.2.14"
+SCRIPT_VERSION="0.2.15"
 SCRIPT_VERSION_DATE="2026-10-21"
 
 # 默认端口
@@ -19,8 +19,12 @@ STUN_PORT="3478"         # STUN 端口（UDP）
 STUN_PORT_EXPLICIT=0
 CERT_DAYS="365"          # 自签证书有效期（天）
 CERT_DAYS_MAX="365000"   # 约 1000 年，避免超大数字在 Bash 算术中溢出
-INSTALL_DIR="/opt/derper" # 安装/证书目录
+INSTALL_DIR="/opt/derper" # 安装/证书目录，root 管理
 BIN_PATH="/usr/local/bin/derper"
+# 节点私钥在 StateDirectory；安装树父目录不交给服务用户写。
+NODE_STATE_DIR="${NODE_STATE_DIR:-}"
+DEPLOY_STATE_DIR="${DEPLOY_STATE_DIR:-/var/lib/derper-deploy}"
+RECOVER_INTERRUPTED=0
 SERVICE_PATH="/etc/systemd/system/derper.service"
 
 # 版本门槛（可通过环境变量覆盖）
@@ -120,6 +124,7 @@ usage() {
                [--check | --dry-run] [--repair] [--force]
                [--health-check [--metrics-textfile 路径]]
                [--uninstall [--purge | --purge-all]]
+               [--recover-interrupted]
                [-V | --version] [-h | --help]
 
 参数说明：
@@ -175,9 +180,11 @@ usage() {
                           建议结合 node_exporter 的 textfile collector 使用。
   --uninstall             停止并卸载 derper systemd 服务（保留二进制与证书）。
                           不能与 --health-check/--check/--dry-run/--repair/--force 同时使用。
+  --recover-interrupted   显式恢复未完成的升级/迁移。不会自动继续中断的步骤。
+                          不能与安装、修复、检查或卸载同时使用。
   --purge                 必须与 --uninstall 一起使用：额外删除 ${INSTALL_DIR}（证书等）。
   --purge-all             必须与 --uninstall 一起使用：在 --purge 基础上，同时删除 ${BIN_PATH}、
-                          /etc/derper/derper.env 和脚本创建的 tailscaled socket drop-in。
+                          /etc/derper/derper.env、健康检查稳定副本/状态和脚本创建的 tailscaled socket drop-in。
                           防火墙规则和用户/组账户需手动确认，不会自动删除。
 
 示例：
@@ -455,6 +462,9 @@ parse_args() {
       --uninstall)
         UNINSTALL=1
         shift 1;;
+      --recover-interrupted)
+        RECOVER_INTERRUPTED=1
+        shift 1;;
       --purge)
         PURGE=1
         shift 1;;
@@ -522,8 +532,14 @@ validate_arg_combos() {
   fi
   # 部署是“未选择其他主模式”。只读检查与破坏性操作不能静默互相覆盖。
   if [[ "${HEALTH_CHECK}" -eq 1 ]]; then
+    if [[ "${UNINSTALL}" -eq 1 || "${REPAIR}" -eq 1 || "${FORCE}" -eq 1 || "${DRY_RUN}" -eq 1 || "${CHECK_ONLY}" -eq 1 || "${RECOVER_INTERRUPTED}" -eq 1 ]]; then
+      echo "[错误] --health-check 不能与 --check/--dry-run/--repair/--force/--uninstall/--recover-interrupted 一起使用；这些主模式互斥。" >&2
+      err=1
+    fi
+  fi
+  if [[ "${RECOVER_INTERRUPTED}" -eq 1 ]]; then
     if [[ "${UNINSTALL}" -eq 1 || "${REPAIR}" -eq 1 || "${FORCE}" -eq 1 || "${DRY_RUN}" -eq 1 || "${CHECK_ONLY}" -eq 1 ]]; then
-      echo "[错误] --health-check 不能与 --check/--dry-run/--repair/--force/--uninstall 一起使用；这些主模式互斥。" >&2
+      echo "[错误] --recover-interrupted 只负责显式恢复未完成变更，不能与安装、修复、检查或卸载同时使用。" >&2
       err=1
     fi
   fi
@@ -1213,7 +1229,7 @@ unit_matches_desired_config() {
   local ip_re certdir_re config_re run_user_re
   ip_re=$(regex_escape "$IP_ADDR")
   certdir_re=$(regex_escape "${INSTALL_DIR}/certs")
-  config_re=$(regex_escape "${INSTALL_DIR}/derper.json")
+  config_re=$(regex_escape "$(derper_config_path)")
   run_user_re=$(regex_escape "$RUN_USER")
 
   echo "$content" | grep -qE -- "-hostname[[:space:]]+${ip_re}([[:space:]]|$)" || return 1
@@ -1675,12 +1691,773 @@ ensure_go() {
   echo "[信息] Go 安装完成：$(go version 2>/dev/null || echo 失败)"
 }
 
+deploy_state_root() {
+  printf '%s\n' "${DEPLOY_STATE_DIR:-/var/lib/derper-deploy}"
+}
+
+derper_node_state_dir() {
+  if [[ -n "${NODE_STATE_DIR:-}" ]]; then
+    printf '%s\n' "$NODE_STATE_DIR"
+  else
+    printf '%s/state\n' "$INSTALL_DIR"
+  fi
+}
+
+derper_config_path() {
+  printf '%s/derper.json\n' "$(derper_node_state_dir)"
+}
+
+file_sha256() {
+  [[ -f "$1" && ! -L "$1" ]] || return 1
+  sha256_hex <"$1"
+}
+
+read_kv_value() {
+  local file="$1" want="$2" line key value found=""
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    case "$line" in
+      *'`'*|*'$('*|*';'*|*'|'*|*'&'*|*'<'*|*'>'*)
+        echo "[错误] 恢复记录含不可执行内容，已拒绝。" >&2
+        return 2
+        ;;
+    esac
+    case "$line" in
+      *=*) ;;
+      *) echo "[错误] 恢复记录不是白名单键值。" >&2; return 2 ;;
+    esac
+    key=${line%%=*}
+    value=${line#*=}
+    case "$key" in
+      phase|recovery|binary_sha256|unit_sha256|config_sha256|state_sha256|cert_sha256|run_intent|verify_clients|daemon_revision|kind) ;;
+      *) echo "[错误] 恢复记录含未知字段。" >&2; return 2 ;;
+    esac
+    if [[ "$key" == "$want" ]]; then
+      found=$value
+    fi
+  done <"$file"
+  [[ -n "$found" ]] || return 1
+  printf '%s\n' "$found"
+}
+
+mode_grants_write_to() {
+  local mode="$1" owner_uid="$2" group_gid="$3" uid="$4" gid="$5"
+  local bits=$((8#$mode))
+  if [[ "$uid" == "$owner_uid" ]]; then
+    (( (bits & 0200) != 0 ))
+    return
+  fi
+  if [[ "$gid" == "$group_gid" ]]; then
+    (( (bits & 0020) != 0 ))
+    return
+  fi
+  (( (bits & 0002) != 0 ))
+}
+
+acquire_deploy_lock() {
+  local root
+  root=$(deploy_state_root)
+  mkdir -p "$root" || return 1
+  chmod 700 "$root" || return 1
+  if ! command -v flock >/dev/null 2>&1; then
+    echo "[错误] 缺少 flock，拒绝开始升级、回退、迁移、轮换或卸载。" >&2
+    return 1
+  fi
+  exec 9>>"${root}/deploy.lock" || return 1
+  if ! flock -n 9; then
+    echo "[错误] 变更锁已被占用。请等待另一项升级、回退、迁移、轮换或卸载结束。" >&2
+    return 1
+  fi
+  DEPLOY_LOCK_HELD=1
+}
+
+ordinary_change_allowed() {
+  local marker
+  marker="$(deploy_state_root)/incomplete"
+  [[ -e "$marker" ]] || return 0
+  if [[ -L "$marker" ]] || ! read_kv_value "$marker" phase >/dev/null; then
+    echo "[错误] 未完成变更记录无法按白名单读取，已阻断普通覆盖。请显式执行 --recover-interrupted；脚本不会 source 或自动继续。" >&2
+    return 1
+  fi
+  echo "[错误] 存在未完成变更，普通安装、修复、轮换和卸载已阻断。请显式执行 --recover-interrupted；脚本不会自动继续。" >&2
+  return 1
+}
+
+write_incomplete_marker() {
+  local phase="$1" root tmp recovery
+  case "$phase" in
+    switch|migrate|first-install) ;;
+    *) return 1 ;;
+  esac
+  root=$(deploy_state_root)
+  recovery="${root}/recovery"
+  mkdir -p "$root" || return 1
+  tmp=$(mktemp "${root}/.incomplete.XXXXXX") || return 1
+  printf 'phase=%s\nrecovery=%s\n' "$phase" "$recovery" >"$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "${root}/incomplete" || { rm -f "$tmp"; return 1; }
+}
+
+verify_recovery_dir() {
+  local dir="$1" expect got intent
+  [[ -f "${dir}/manifest" && ! -L "${dir}/manifest" && -f "${dir}/binary" && ! -L "${dir}/binary" ]] || return 1
+  expect=$(read_kv_value "${dir}/manifest" binary_sha256) || return 1
+  got=$(file_sha256 "${dir}/binary") || return 1
+  [[ "$expect" == "$got" ]] || return 1
+  intent=$(read_kv_value "${dir}/manifest" run_intent) || return 1
+  case "$intent" in
+    active|inactive|absent) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+promote_recovery_staging() {
+  local root staging recovery
+  root=$(deploy_state_root)
+  staging="${root}/recovery.staging"
+  recovery="${root}/recovery"
+  if ! verify_recovery_dir "$staging"; then
+    echo "[错误] 暂存恢复集未通过校验，不会覆盖唯一有效备份。" >&2
+    return 1
+  fi
+  rm -rf "${root}/recovery.replacing"
+  if [[ -d "$recovery" ]]; then
+    mv "$recovery" "${root}/recovery.replacing" || return 1
+  fi
+  if ! mv "$staging" "$recovery"; then
+    if [[ -d "${root}/recovery.replacing" ]]; then
+      mv "${root}/recovery.replacing" "$recovery" || true
+    fi
+    echo "[错误] 无法提交恢复集，已尝试放回原备份。" >&2
+    return 1
+  fi
+  rm -rf "${root}/recovery.replacing"
+  return 0
+}
+
+current_service_run_intent() {
+  if [[ ! -e "${SERVICE_PATH}" ]]; then
+    if ! command -v systemctl >/dev/null 2>&1 || ! systemctl cat derper >/dev/null 2>&1; then
+      printf 'absent\n'
+      return 0
+    fi
+  fi
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet derper; then
+    printf 'active\n'
+    return 0
+  fi
+  printf 'inactive\n'
+}
+
+capture_and_promote_recovery() {
+  local root staging intent sum config
+  root=$(deploy_state_root)
+  staging="${root}/recovery.staging"
+  rm -rf "$staging"
+  mkdir -p "$staging" || return 1
+  if [[ ! -f "$BIN_PATH" || -L "$BIN_PATH" ]]; then
+    echo "[错误] 没有可备份的正式二进制。" >&2
+    rm -rf "$staging"
+    return 1
+  fi
+  cp -p "$BIN_PATH" "${staging}/binary" || { rm -rf "$staging"; return 1; }
+  chmod 755 "${staging}/binary" || { rm -rf "$staging"; return 1; }
+  if [[ -f "$SERVICE_PATH" && ! -L "$SERVICE_PATH" ]]; then
+    cp -p "$SERVICE_PATH" "${staging}/unit" || { rm -rf "$staging"; return 1; }
+  fi
+  config=$(derper_config_path)
+  if [[ -f "$config" && ! -L "$config" ]]; then
+    cp -p "$config" "${staging}/config" || { rm -rf "$staging"; return 1; }
+  fi
+  local state_dir state_file
+  state_dir=$(derper_node_state_dir)
+  if [[ -d "$state_dir" && ! -L "$state_dir" ]]; then
+    mkdir -p "${staging}/state" || { rm -rf "$staging"; return 1; }
+    for state_file in "$state_dir"/*; do
+      [[ -f "$state_file" && ! -L "$state_file" ]] || continue
+      cp -p "$state_file" "${staging}/state/$(basename "$state_file")" || { rm -rf "$staging"; return 1; }
+    done
+  fi
+  intent=$(current_service_run_intent)
+  sum=$(file_sha256 "${staging}/binary") || { rm -rf "$staging"; return 1; }
+  {
+    printf 'binary_sha256=%s\n' "$sum"
+    printf 'run_intent=%s\n' "$intent"
+    printf 'verify_clients=%s\n' "${VERIFY_CLIENTS_MODE:-off}"
+  } >"${staging}/manifest" || { rm -rf "$staging"; return 1; }
+  promote_recovery_staging || return 1
+}
+
+stage_replace_file() {
+  local src="$1" dest="$2" dest_dir tmp src_sum tmp_sum
+  [[ -f "$src" && ! -L "$src" ]] || return 1
+  refuse_symlink "$dest" || return 1
+  dest_dir=$(dirname "$dest")
+  mkdir -p "$dest_dir" || return 1
+  tmp=$(mktemp "${dest_dir}/.derper-bin.XXXXXX") || return 1
+  if ! cp -p "$src" "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  chmod 755 "$tmp" || { rm -f "$tmp"; return 1; }
+  src_sum=$(file_sha256 "$src") || { rm -f "$tmp"; return 1; }
+  tmp_sum=$(file_sha256 "$tmp") || { rm -f "$tmp"; return 1; }
+  if [[ "$src_sum" != "$tmp_sum" ]]; then
+    rm -f "$tmp"
+    echo "[错误] 暂存副本与来源摘要不一致，已中止替换。" >&2
+    return 1
+  fi
+  if ! mv -f "$tmp" "$dest"; then
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+candidate_self_check() {
+  local bin="$1" out
+  [[ -x "$bin" && ! -L "$bin" ]] || return 1
+  out=$("$bin" -h 2>&1 || true)
+  if ! printf '%s\n' "$out" | grep -q -- '-a'; then
+    echo "[错误] 候选 derper 缺少 -a 监听能力，拒绝切换。" >&2
+    return 1
+  fi
+}
+
+tailscaled_daemon_revision() {
+  local out rev=""
+  command -v tailscaled >/dev/null 2>&1 || return 1
+  out=$(tailscaled --version 2>/dev/null || true)
+  rev=$(printf '%s\n' "$out" | awk '$1 == "tailscale" && $2 == "commit:" {print $3; exit}' | grep -E '^[0-9a-f]{7,40}$' || true)
+  [[ -n "$rev" ]] || return 1
+  printf '%s\n' "$rev"
+}
+
+derper_artifact_revision() {
+  local bin="$1" saved have
+  saved="${BIN_PATH}"
+  BIN_PATH="$bin"
+  have=$(get_installed_derper_version || true)
+  BIN_PATH="$saved"
+  [[ -n "$have" ]] || return 1
+  printf '%s\n' "$have"
+}
+
+same_derper_identity() {
+  local left right commit module canon rev
+  left=$(printf '%s' "${1:-}" | tr 'A-Z' 'a-z')
+  right=$(printf '%s' "${2:-}" | tr 'A-Z' 'a-z')
+  left="${left#v}"
+  right="${right#v}"
+  [[ -n "$left" && -n "$right" ]] || return 1
+  [[ "$left" == "$right" ]] && return 0
+  if [[ "$left" =~ ^[0-9a-f]{7,40}$ ]]; then
+    commit="$left"
+    module="$right"
+  elif [[ "$right" =~ ^[0-9a-f]{7,40}$ ]]; then
+    commit="$right"
+    module="$left"
+  else
+    return 1
+  fi
+  rev="${module##*-}"
+  if [[ "$module" =~ [.-][0-9]{14}-[0-9a-f]{12}$ && "$commit" == "$rev"* ]]; then
+    return 0
+  fi
+  canon=$(resolve_derper_module_version "$commit" || true)
+  canon=$(normalize_version_tag "$canon")
+  module=$(normalize_version_tag "$module")
+  [[ -n "$canon" && "$canon" == "$module" ]]
+}
+
+candidate_matches_running_daemon() {
+  local candidate="$1" daemon_rev artifact_rev
+  [[ "${VERIFY_CLIENTS_MODE:-off}" == "on" ]] || return 0
+  daemon_rev=$(tailscaled_daemon_revision) || {
+    echo "[错误] 无法确认正在运行的 tailscaled daemon 身份，已转人工处理，不会切换 derper，也不会升级或降级 tailscaled。" >&2
+    return 1
+  }
+  artifact_rev=$(derper_artifact_revision "$candidate") || {
+    echo "[错误] 无法读取候选 derper 的 revision，已转人工处理，不会切换。" >&2
+    return 1
+  }
+  if ! same_derper_identity "$daemon_rev" "$artifact_rev"; then
+    echo "[错误] 候选 derper 与 tailscaled daemon revision 不一致（daemon=${daemon_rev}，候选=${artifact_rev}）。已转人工处理，不会切换，也不会升级或降级 tailscaled。" >&2
+    return 1
+  fi
+}
+
+publish_derper_candidate() {
+  local candidate="$1"
+  candidate_self_check "$candidate" || return 1
+  candidate_matches_running_daemon "$candidate" || return 1
+  if [[ -e "$BIN_PATH" ]]; then
+    capture_and_promote_recovery || return 1
+    write_incomplete_marker switch || return 1
+    if ! stage_replace_file "$candidate" "$BIN_PATH"; then
+      echo "[错误] 写入正式二进制失败，未宣称成功。恢复集仍保留。" >&2
+      return 1
+    fi
+    return 0
+  fi
+  echo "[信息] 首次安装，没有可回退的上一版本。" >&2
+  write_incomplete_marker first-install || return 1
+  if ! stage_replace_file "$candidate" "$BIN_PATH"; then
+    rm -f "$BIN_PATH"
+    echo "[错误] 首次安装写入失败，已清理半成品，没有伪造上一版本。" >&2
+    return 1
+  fi
+}
+
+rollback_deploy_change() {
+  local root marker phase recovery intent
+  # 恢复使用旧 unit 的身份；不能污染调用方仍在使用的目标参数。
+  local RUN_USER="$RUN_USER" IP_ADDR="$IP_ADDR" restored_user restored_ip
+  root=$(deploy_state_root)
+  marker="${root}/incomplete"
+  [[ -f "$marker" && ! -L "$marker" ]] || return 0
+  phase=$(read_kv_value "$marker" phase) || return 1
+  recovery=$(read_kv_value "$marker" recovery) || return 1
+  if [[ "$recovery" != "${root}/recovery" ]]; then
+    echo "[错误] 未完成标记中的恢复路径不在固定恢复集内，已拒绝。" >&2
+    return 1
+  fi
+  if [[ "$phase" == "first-install" ]]; then
+    rm -f "$BIN_PATH"
+    rm -f "$marker"
+    echo "[信息] 首次安装未完成，已清理半成品。没有可恢复的上一版本。" >&2
+    return 0
+  fi
+  if [[ "$phase" == "migrate" ]]; then
+    if [[ -f "${recovery}/binary" && ! -L "${recovery}/binary" ]]; then
+      if ! verify_recovery_dir "$recovery"; then
+        echo "[错误] 迁移恢复集无法校验，已保留备份。" >&2
+        return 1
+      fi
+    elif ! read_kv_value "${recovery}/manifest" run_intent >/dev/null; then
+      echo "[错误] 迁移恢复集缺少运行意图，已保留备份。" >&2
+      return 1
+    fi
+  elif ! verify_recovery_dir "$recovery"; then
+    echo "[错误] 恢复集无法校验，已保留备份且不会宣称恢复成功。" >&2
+    return 1
+  fi
+  if ! ensure_derper_stopped; then
+    echo "[错误] 未能停止正在运行的 derper，已保留未完成标记。" >&2
+    return 1
+  fi
+  if [[ -f "${recovery}/binary" && ! -L "${recovery}/binary" ]]; then
+    if ! stage_replace_file "${recovery}/binary" "$BIN_PATH"; then
+      echo "[错误] 恢复正式二进制失败，已保留恢复集。" >&2
+      return 1
+    fi
+  fi
+  if [[ -f "${recovery}/unit" && ! -L "${recovery}/unit" ]]; then
+    restored_user=$(awk -F= '/^[[:space:]]*User=/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); user=$2} END {print user}' "${recovery}/unit") || return 1
+    restored_user="${restored_user:-root}"
+    if [[ ! "$restored_user" =~ ^[a-zA-Z0-9_][a-zA-Z0-9_.-]*\$?$ ]]; then
+      echo "[错误] 恢复 unit 的运行用户无法安全识别，已保留恢复集。" >&2
+      return 1
+    fi
+    RUN_USER="$restored_user"
+    restored_ip=$(sed -nE 's/.*-hostname[[:space:]]+([^[:space:]]+).*/\1/p' "${recovery}/unit" | head -n1)
+    [[ -z "$restored_ip" ]] || IP_ADDR="$restored_ip"
+    install_without_following_link "${recovery}/unit" "$SERVICE_PATH" || {
+      echo "[错误] 恢复 unit 失败，已保留恢复集。" >&2
+      return 1
+    }
+  fi
+  if ! restore_saved_payload "$recovery"; then
+    echo "[错误] 恢复配置或节点状态失败，已保留恢复集。" >&2
+    return 1
+  fi
+  if running_as_root && [[ -d "${INSTALL_DIR}/certs" ]]; then
+    harden_cert_dir || return 1
+  fi
+  intent=$(read_kv_value "${recovery}/manifest" run_intent) || return 1
+  if [[ "$intent" == "active" ]]; then
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl daemon-reload >/dev/null 2>&1 || return 1
+      systemctl start derper || return 1
+    fi
+    if ! verify_restored_service; then
+      echo "[错误] 已恢复文件，但复验未通过。恢复集仍保留。" >&2
+      return 1
+    fi
+  fi
+  rm -f "$marker"
+  return 0
+}
+
+ensure_derper_stopped() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  systemctl stop derper || return 1
+  if systemctl is-active --quiet derper; then
+    echo "[错误] derper 仍在运行，不能继续恢复。" >&2
+    return 1
+  fi
+}
+
+commit_deploy_change() {
+  rm -f "$(deploy_state_root)/incomplete"
+}
+
+running_as_root() {
+  local uid
+  uid=$(id -u 2>/dev/null || true)
+  [[ "$uid" == "0" ]]
+}
+
+claim_node_state_dir() {
+  local dir="$1"
+  running_as_root || return 0
+  [[ -d "$dir" && ! -L "$dir" ]] || return 1
+  chown root:root "$dir" || return 1
+  chmod 700 "$dir" || return 1
+}
+
+release_node_state_dir() {
+  local dir="$1" group
+  running_as_root || return 0
+  [[ -d "$dir" && ! -L "$dir" ]] || return 1
+  group=$(id -g -n "$RUN_USER" 2>/dev/null || echo "$RUN_USER")
+  chown "${RUN_USER}:${group}" "$dir" || return 1
+  chmod 700 "$dir" || return 1
+}
+
+node_config_readable_by_run_user() {
+  local config="$1" owner mode
+  [[ -f "$config" && ! -L "$config" ]] || return 1
+  if stat -c %U "$config" >/dev/null 2>&1; then
+    owner=$(stat -c %U "$config") || return 1
+    mode=$(stat -c %a "$config") || return 1
+  else
+    owner=$(stat -f %Su "$config") || return 1
+    mode=$(stat -f %Lp "$config") || return 1
+  fi
+  [[ "$owner" == "$RUN_USER" ]] || return 1
+  mode="${mode#0}"
+  [[ "$mode" == "600" ]]
+}
+
+install_without_following_link() {
+  local src="$1" dest="$2" dir tmp src_sum dest_sum
+  [[ -f "$src" && ! -L "$src" ]] || return 1
+  dir=$(dirname "$dest")
+  if [[ -L "$dir" ]]; then
+    echo "[错误] 拒绝把恢复内容写入符号链接目录：${dir}" >&2
+    return 1
+  fi
+  mkdir -p "$dir" || return 1
+  if [[ -L "$dir" ]]; then
+    echo "[错误] 拒绝把恢复内容写入符号链接目录：${dir}" >&2
+    return 1
+  fi
+  if [[ -L "$dest" ]]; then
+    rm -f -- "$dest" || return 1
+  fi
+  if [[ -L "$dest" ]]; then
+    echo "[错误] 拒绝把恢复内容写入符号链接：${dest}" >&2
+    return 1
+  fi
+  tmp=$(mktemp "${dir}/.restore.XXXXXX") || return 1
+  if ! cp -p "$src" "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if [[ -L "$dest" ]]; then
+    rm -f "$tmp"
+    echo "[错误] 恢复目标在写入前变成符号链接：${dest}" >&2
+    return 1
+  fi
+  if ! mv -f "$tmp" "$dest"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if [[ -L "$dest" ]]; then
+    echo "[错误] 恢复目标仍是符号链接：${dest}" >&2
+    return 1
+  fi
+  src_sum=$(file_sha256 "$src") || return 1
+  dest_sum=$(file_sha256 "$dest") || return 1
+  [[ "$src_sum" == "$dest_sum" ]]
+}
+
+restore_saved_payload() {
+  local recovery="$1" dest state_dir state_file rc=0 claimed=0
+  if [[ -f "${recovery}/config" && ! -L "${recovery}/config" ]] || [[ -d "${recovery}/state" && ! -L "${recovery}/state" ]]; then
+    state_dir=$(derper_node_state_dir)
+    if [[ -L "$state_dir" ]]; then
+      echo "[错误] 节点状态目录是符号链接，拒绝恢复。" >&2
+      return 1
+    fi
+    mkdir -p "$state_dir" || return 1
+    if [[ -L "$state_dir" ]]; then
+      echo "[错误] 节点状态目录是符号链接，拒绝恢复。" >&2
+      return 1
+    fi
+    claim_node_state_dir "$state_dir" || return 1
+    claimed=1
+  fi
+  if [[ -f "${recovery}/config" && ! -L "${recovery}/config" ]]; then
+    dest=$(derper_config_path)
+    install_without_following_link "${recovery}/config" "$dest" || rc=1
+  fi
+  if [[ "$rc" -eq 0 && -d "${recovery}/state" && ! -L "${recovery}/state" ]]; then
+    state_dir=$(derper_node_state_dir)
+    for state_file in "${recovery}/state/"*; do
+      [[ -f "$state_file" && ! -L "$state_file" ]] || continue
+      install_without_following_link "$state_file" "${state_dir}/$(basename "$state_file")" || rc=1
+    done
+  fi
+  if [[ "$claimed" -eq 1 ]]; then
+    release_node_state_dir "$state_dir" || rc=1
+  fi
+  return "$rc"
+}
+
+cert_tree_fingerprint() {
+  local dir="${INSTALL_DIR}/certs" file sum=""
+  [[ -d "$dir" && ! -L "$dir" ]] || {
+    printf '\n'
+    return 0
+  }
+  for file in "$dir"/*; do
+    [[ -f "$file" && ! -L "$file" ]] || continue
+    sum+=$(file_sha256 "$file" || return 1)
+  done
+  printf '%s\n' "$sum"
+}
+
+resume_service_intent() {
+  local intent="$1" do_verify="${2:-}"
+  if [[ "$intent" != "active" ]]; then
+    return 0
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl start derper || return 1
+  fi
+  if [[ "$do_verify" == "verify" ]]; then
+    verify_restored_service
+  fi
+}
+
+recover_interrupted_change() {
+  local marker
+  marker="$(deploy_state_root)/incomplete"
+  if [[ ! -f "$marker" || -L "$marker" ]]; then
+    echo "[错误] 没有可显式恢复的未完成标记。" >&2
+    return 1
+  fi
+  rollback_deploy_change
+}
+
+snapshot_migration_recovery() {
+  local legacy="$1" root staging intent sum phase recovery
+  root=$(deploy_state_root)
+  # 发布已经开始时必须复用唯一恢复集，不能用已发布的候选覆盖旧版本。
+  if [[ -e "${root}/incomplete" || -L "${root}/incomplete" ]]; then
+    phase=$(read_kv_value "${root}/incomplete" phase) || return 1
+    recovery=$(read_kv_value "${root}/incomplete" recovery) || return 1
+    [[ "$recovery" == "${root}/recovery" ]] || return 1
+    case "$phase" in
+      switch) verify_recovery_dir "$recovery" || return 1 ;;
+      migrate)
+        if [[ -f "${recovery}/binary" ]]; then
+          verify_recovery_dir "$recovery" || return 1
+        else
+          intent=$(read_kv_value "${recovery}/manifest" run_intent) || return 1
+          case "$intent" in active|inactive|absent) ;; *) return 1 ;; esac
+        fi
+        ;;
+      first-install) ;;
+      *) return 1 ;;
+    esac
+    return 0
+  fi
+  if ! mkdir -p "$root" 2>/dev/null || [[ ! -w "$root" || -L "$root" ]]; then
+    running_as_root && return 1
+    DEPLOY_STATE_DIR=$(mktemp -d "${TMPDIR:-/tmp}/derper-deploy.XXXXXX") || return 1
+    chmod 700 "$DEPLOY_STATE_DIR" || return 1
+    root="$DEPLOY_STATE_DIR"
+  else
+    chmod 700 "$root" || return 1
+  fi
+  staging="${root}/recovery.staging"
+  rm -rf "$staging"
+  mkdir -p "$staging" || return 1
+  intent=$(current_service_run_intent)
+  if [[ -f "$legacy" && ! -L "$legacy" ]]; then
+    cp -p "$legacy" "${staging}/config" || { rm -rf "$staging"; return 1; }
+  fi
+  if [[ -f "$SERVICE_PATH" && ! -L "$SERVICE_PATH" ]]; then
+    cp -p "$SERVICE_PATH" "${staging}/unit" || { rm -rf "$staging"; return 1; }
+  fi
+  {
+    printf 'kind=migrate\n'
+    printf 'run_intent=%s\n' "$intent"
+  } >"${staging}/manifest" || { rm -rf "$staging"; return 1; }
+  if [[ -f "$BIN_PATH" && ! -L "$BIN_PATH" ]]; then
+    cp -p "$BIN_PATH" "${staging}/binary" || { rm -rf "$staging"; return 1; }
+    sum=$(file_sha256 "${staging}/binary") || { rm -rf "$staging"; return 1; }
+    printf 'binary_sha256=%s\n' "$sum" >>"${staging}/manifest" || { rm -rf "$staging"; return 1; }
+  fi
+  rm -rf "${root}/recovery.replacing"
+  if [[ -d "${root}/recovery" ]]; then
+    mv "${root}/recovery" "${root}/recovery.replacing" || { rm -rf "$staging"; return 1; }
+  fi
+  if ! mv "$staging" "${root}/recovery"; then
+    if [[ -d "${root}/recovery.replacing" ]]; then
+      mv "${root}/recovery.replacing" "${root}/recovery" || true
+    fi
+    return 1
+  fi
+  rm -rf "${root}/recovery.replacing"
+  write_incomplete_marker migrate
+}
+
+migration_fail() {
+  local intent="$1"
+  echo "[错误] 节点状态迁移失败。" >&2
+  if ! resume_service_intent "$intent" verify; then
+    echo "[错误] 服务未能按原意图恢复。未完成标记已保留，请执行 --recover-interrupted。" >&2
+    return 1
+  fi
+  # 即使旧服务已恢复运行，外层发布尚未完成；保留显式恢复入口。
+  return 1
+}
+
+migrate_node_state() {
+  local legacy config state trim a b intent before after group
+  legacy="${INSTALL_DIR}/derper.json"
+  config=$(derper_config_path)
+  state=$(derper_node_state_dir)
+  mkdir -p "$state" || return 1
+  if [[ -L "$legacy" || -L "$config" || -L "$state" ]]; then
+    echo "[错误] 节点配置路径是符号链接，拒绝迁移。" >&2
+    return 1
+  fi
+  if [[ ! -f "$legacy" ]]; then
+    return 0
+  fi
+  trim=$(tr -d ' \t\r\n' <"$legacy" 2>/dev/null || true)
+  if [[ -z "$trim" || "$trim" == "{}" ]]; then
+    rm -f "$legacy"
+    return 0
+  fi
+  snapshot_migration_recovery "$legacy" || return 1
+  before=$(cert_tree_fingerprint) || { migration_fail "$(current_service_run_intent)"; return 1; }
+  intent=$(current_service_run_intent)
+  if [[ "$intent" == "active" ]]; then
+    systemctl stop derper || { migration_fail "$intent"; return 1; }
+  fi
+  claim_node_state_dir "$state" || { migration_fail "$intent"; return 1; }
+  if [[ ! -f "$config" ]]; then
+    if ! install_without_following_link "$legacy" "$config"; then
+      release_node_state_dir "$state" || true
+      migration_fail "$intent" || return 1
+      return 1
+    fi
+    a=$(file_sha256 "$legacy") || {
+      release_node_state_dir "$state" || true
+      migration_fail "$intent" || return 1
+      return 1
+    }
+    b=$(file_sha256 "$config") || {
+      release_node_state_dir "$state" || true
+      migration_fail "$intent" || return 1
+      return 1
+    }
+    if [[ "$a" != "$b" ]]; then
+      rm -f "$config"
+      echo "[错误] 节点身份副本与原文件不一致，已中止迁移。" >&2
+      release_node_state_dir "$state" || true
+      migration_fail "$intent" || return 1
+      return 1
+    fi
+  fi
+  if [[ -L "$config" ]]; then
+    echo "[错误] 节点配置是符号链接，拒绝修改属主。" >&2
+    release_node_state_dir "$state" || true
+    migration_fail "$intent" || return 1
+    return 1
+  fi
+  group=$(id -g -n "$RUN_USER" 2>/dev/null || echo "$RUN_USER")
+  chown "${RUN_USER}:${group}" "$config" || {
+    release_node_state_dir "$state" || true
+    migration_fail "$intent" || return 1
+    return 1
+  }
+  chmod 600 "$config" || {
+    release_node_state_dir "$state" || true
+    migration_fail "$intent" || return 1
+    return 1
+  }
+  if running_as_root && ! node_config_readable_by_run_user "$config"; then
+    echo "[错误] 运行用户无法读取节点配置：${config}" >&2
+    release_node_state_dir "$state" || true
+    migration_fail "$intent" || return 1
+    return 1
+  fi
+  after=$(cert_tree_fingerprint) || {
+    release_node_state_dir "$state" || true
+    migration_fail "$intent" || return 1
+    return 1
+  }
+  if [[ "$before" != "$after" ]]; then
+    echo "[错误] 迁移改变了证书内容，已中止。" >&2
+    release_node_state_dir "$state" || true
+    migration_fail "$intent" || return 1
+    return 1
+  fi
+  release_node_state_dir "$state" || { migration_fail "$intent"; return 1; }
+  if running_as_root && command -v runuser >/dev/null 2>&1; then
+    if ! runuser -u "$RUN_USER" -- test -r "$config"; then
+      echo "[错误] 运行用户无法读取节点配置：${config}" >&2
+      resume_service_intent "$intent" verify || true
+      return 1
+    fi
+  fi
+  if ! resume_service_intent "$intent"; then
+    echo "[错误] 迁移后的服务未能按原意图启动。未完成标记已保留。" >&2
+    return 1
+  fi
+  # 由最终 unit/服务验证后的 commit_deploy_change 提交整个变更。
+  echo "[信息] 已保留节点身份：${config}"
+}
+
+layout_install_tree() {
+  local state certs group
+  state=$(derper_node_state_dir)
+  certs="${INSTALL_DIR}/certs"
+  if [[ -L "$INSTALL_DIR" || -L "$certs" || ( -e "$state" && -L "$state" ) ]]; then
+    echo "[错误] 安装树、证书目录或节点状态目录是符号链接，拒绝迁移。" >&2
+    return 1
+  fi
+  mkdir -p "$INSTALL_DIR" "$certs" "$state" || return 1
+  if [[ -L "$certs" || -L "$state" ]]; then
+    echo "[错误] 安装树、证书目录或节点状态目录是符号链接，拒绝迁移。" >&2
+    return 1
+  fi
+  chown root:root "$INSTALL_DIR" || return 1
+  chmod 755 "$INSTALL_DIR" || return 1
+  group=$(id -g -n "$RUN_USER" 2>/dev/null || echo "$RUN_USER")
+  chown "${RUN_USER}:${group}" "$state" || return 1
+  chmod 700 "$state" || return 1
+  harden_cert_dir || return 1
+  migrate_node_state || return 1
+}
+
 install_derper() {
   echo "[步骤] 安装/构建 derper 可执行文件…"
   precheck_go_network || exit 1
   ensure_go
-  # 组装环境：可选 GOPROXY/GOSUMDB，自动工具链（避免被墙/版本不足问题）
-  local envs=("GOBIN=/usr/local/bin" "GO111MODULE=on" "GOTOOLCHAIN=${GOTOOLCHAIN_ARG}")
+  local candidate_dir
+  candidate_dir="$(deploy_state_root)/candidate"
+  mkdir -p "$candidate_dir" || exit 1
+  rm -f "${candidate_dir}/derper"
+  export GOBIN="${candidate_dir}"
+  local envs=("GOBIN=${candidate_dir}" "GO111MODULE=on" "GOTOOLCHAIN=${GOTOOLCHAIN_ARG}")
   if [[ -n "${GOPROXY_ARG}" ]]; then envs+=("GOPROXY=${GOPROXY_ARG}"); fi
   if [[ -n "${GOSUMDB_ARG}" ]]; then envs+=("GOSUMDB=${GOSUMDB_ARG}"); fi
   echo "[信息] 安装 derper 版本：${DERPER_VERSION}"
@@ -1689,10 +2466,11 @@ install_derper() {
     sed -n '1,160p' "${_tmpdir}/derper_install.err" >&2 || true
     exit 1
   fi
-  if [[ ! -x "${BIN_PATH}" ]]; then
-    echo "[错误] 未找到 derper 可执行文件：${BIN_PATH}" >&2
+  if [[ ! -x "${candidate_dir}/derper" ]]; then
+    echo "[错误] 候选 derper 未生成：${candidate_dir}/derper。正式二进制未被覆盖。" >&2
     exit 1
   fi
+  publish_derper_candidate "${candidate_dir}/derper" || exit 1
   echo "[信息] derper 安装到：${BIN_PATH}"
 }
 
@@ -2154,19 +2932,11 @@ ENVFILE
 }
 
 prepare_derper_config() {
-  local config_path="${INSTALL_DIR}/derper.json"
-  mkdir -p "${INSTALL_DIR}"
-  if [[ -f "$config_path" ]]; then
-    local config_trim
-    config_trim=$(tr -d ' \t\r\n' <"$config_path" 2>/dev/null || true)
-    if [[ -z "$config_trim" || "$config_trim" == "{}" ]]; then
-      rm -f "$config_path"
-      echo "[信息] 已移除旧的空 derper 配置；服务启动时将自动生成节点私钥：${config_path}"
-    else
-      chmod 600 "$config_path"
-      echo "[信息] 保留现有 derper 配置：${config_path}"
-    fi
-  else
+  mkdir -p "${INSTALL_DIR}" || return 1
+  migrate_node_state || return 1
+  local config_path
+  config_path=$(derper_config_path)
+  if [[ ! -f "$config_path" ]]; then
     echo "[信息] derper 将在首次启动时自动生成节点私钥配置：${config_path}"
   fi
 }
@@ -2353,18 +3123,7 @@ setup_service_user() {
   if id "$RUN_USER" >/dev/null 2>&1; then
     echo "[信息] 将使用现有用户运行 derper：$RUN_USER"
     
-    # 设置整个安装目录的所有权（包括父目录）
-    if [[ -d "${INSTALL_DIR}" ]]; then
-      local user_group
-      user_group=$(id -g -n "$RUN_USER" 2>/dev/null || echo "$RUN_USER")
-      chown -R "$RUN_USER":"$user_group" "${INSTALL_DIR}" || {
-        echo "[警告] 无法设置安装目录所有权（用户：$RUN_USER, 组：$user_group）" >&2
-        echo "  服务可能无法访问必要文件，建议手动执行：" >&2
-        echo "    chown -R $RUN_USER:$user_group ${INSTALL_DIR}" >&2
-      }
-    fi
-    # 证书目录必须收回 root 所有，服务账户只读（防止符号链接覆盖攻击）
-    harden_cert_dir || true
+    layout_install_tree || return 1
     return 0
   fi
   
@@ -2411,17 +3170,8 @@ setup_service_user() {
     exit 1
   fi
   
-  # 设置整个安装目录的所有权（包括父目录和所有子目录）
-  if [[ -d "${INSTALL_DIR}" ]]; then
-    local user_group
-    user_group=$(id -g -n "$RUN_USER" 2>/dev/null || echo "$RUN_USER")
-    echo "[步骤] 设置安装目录权限：${INSTALL_DIR}"
-    chown -R "$RUN_USER":"$user_group" "${INSTALL_DIR}" || {
-      echo "[警告] 无法设置安装目录所有权，服务启动时可能失败" >&2
-    }
-  fi
-  # 证书目录必须收回 root 所有，服务账户只读（防止符号链接覆盖攻击）
-  harden_cert_dir || true
+  echo "[步骤] 设置安装树与节点状态权限：${INSTALL_DIR}"
+  layout_install_tree || exit 1
 }
 
 # 启动后强制健康验证：active 状态、TLS/STUN 端口监听、TLS 握手、进程存活。
@@ -2534,7 +3284,7 @@ intercept_non_systemd_environment() {
     off) verify_flag="" ;;
   esac
 
-  local manual_cmd="${BIN_PATH} -c ${INSTALL_DIR}/derper.json"
+  local manual_cmd="${BIN_PATH} -c $(derper_config_path)"
   manual_cmd+=" -hostname ${IP_ADDR} -certmode manual -certdir ${INSTALL_DIR}/certs -http-port -1"
   manual_cmd+=" ${listen_args[*]} ${stun_args[*]}"
   [[ -n "${verify_flag}" ]] && manual_cmd+=" ${verify_flag}"
@@ -2747,7 +3497,7 @@ prepare_derper_exec_start_line() {
     off) verify_flag="" ;;
   esac
 
-  local exec_args=("${BIN_PATH}" "-c" "${INSTALL_DIR}/derper.json")
+  local exec_args=("${BIN_PATH}" "-c" "$(derper_config_path)")
   exec_args+=("-hostname" "${IP_ADDR}")
   exec_args+=("-certmode" "manual")
   exec_args+=("-certdir" "${INSTALL_DIR}/certs")
@@ -2837,7 +3587,13 @@ MemoryDenyWriteExecute=true"
 }
 
 render_derper_service_unit() {
-  local exec_cmd="$1" run_user="$2" run_group="$3" supplementary_section="$4" hardening_opts="$5" install_dir="$6"
+  local exec_cmd="$1" run_user="$2" run_group="$3" supplementary_section="$4" hardening_opts="$5" state_dir="$6"
+  local state_access="ReadWritePaths=${state_dir}"
+  if [[ "$state_dir" == "/var/lib/derper" ]]; then
+    state_access="StateDirectory=derper
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/derper"
+  fi
   cat <<SERVICE
 [Unit]
 Description=Tailscale DERP (derper) with self-signed IP cert
@@ -2866,8 +3622,8 @@ CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 # 安全加固（级别：${SECURITY_LEVEL}）
 ${hardening_opts}
 
-# 路径权限
-ReadWritePaths=${install_dir}
+# 只放行节点状态目录。证书和安装树保持 root 管理。
+${state_access}
 
 [Install]
 WantedBy=multi-user.target
@@ -2933,6 +3689,7 @@ deploy_and_verify_derper_service() {
       if [[ "$degraded_ok" -ne 1 ]]; then
         echo "[警告] 降级后服务仍未通过健康验证，开始回滚。" >&2
         rollback_cert_update || return 1
+        rollback_deploy_change || echo "[错误] 发布回退未完成，恢复集已保留。" >&2
         rollback_previous_unit "$unit_backup" "$was_running" || true
         cat >&2 <<'EOT'
 
@@ -2959,6 +3716,7 @@ EOT
     else
       echo "[步骤] 启动失败，正在回滚到备份的旧服务配置。" >&2
       rollback_cert_update || return 1
+      rollback_deploy_change || echo "[错误] 发布回退未完成，恢复集已保留。" >&2
       rollback_previous_unit "$unit_backup" "$was_running" || true
       cat >&2 <<'EOT'
 
@@ -2979,6 +3737,7 @@ EOT
     fi
   fi
 
+  commit_deploy_change
   systemctl status derper --no-pager -l || true
 
   if command -v systemd-analyze >/dev/null 2>&1; then
@@ -3008,7 +3767,7 @@ write_systemd_service() {
   hardening_options=$(get_security_hardening_options)
 
   local unit_content
-  unit_content=$(render_derper_service_unit "$DERPER_EXEC_START_LINE" "$RUN_USER" "$SERVICE_RUN_GROUP" "$SERVICE_SUPPLEMENTARY_GROUPS_SECTION" "$hardening_options" "$INSTALL_DIR")
+  unit_content=$(render_derper_service_unit "$DERPER_EXEC_START_LINE" "$RUN_USER" "$SERVICE_RUN_GROUP" "$SERVICE_SUPPLEMENTARY_GROUPS_SECTION" "$hardening_options" "$(derper_node_state_dir)")
 
   deploy_and_verify_derper_service "${SERVICE_PATH}" "$unit_content"
 }
@@ -3628,6 +4387,36 @@ remove_healthcheck_cron() {
     rm -f "${unit_dir}/derper-healthcheck.timer" "${unit_dir}/derper-healthcheck.service"
     echo "[信息] 已删除健康检查 timer：${unit_dir}/derper-healthcheck.timer"
   fi
+}
+
+purge_healthcheck_program() {
+  local stable
+  local dirs=(/usr/local/lib/derper-deploy "$(dirname "$HEALTHCHECK_CRON_PATH")/derper-healthcheck-program")
+  if [[ -n "${HEALTHCHECK_PROGRAM_DIR:-}" ]]; then
+    dirs=("$HEALTHCHECK_PROGRAM_DIR")
+  fi
+  for stable in "${dirs[@]}"; do
+    [[ -e "$stable" || -L "$stable" ]] || continue
+    refuse_symlink "$stable" || return 1
+    [[ -d "$stable" ]] || { echo "[错误] 健康检查副本路径不是目录：${stable}" >&2; return 1; }
+    if ! rm -f -- "${stable}/deploy_derper_ip_selfsigned.sh" "${stable}/status"; then
+      echo "[错误] 无法删除健康检查稳定副本或状态：${stable}" >&2
+      return 1
+    fi
+    if [[ -e "${stable}/deploy_derper_ip_selfsigned.sh" || -L "${stable}/deploy_derper_ip_selfsigned.sh" || -e "${stable}/status" || -L "${stable}/status" ]]; then
+      echo "[错误] 健康检查稳定副本或状态仍有残留：${stable}" >&2
+      return 1
+    fi
+    # 只清理本脚本写入的文件，目录内其他用户文件保持原样。
+    if ! rmdir "$stable" 2>/dev/null; then
+      if [[ -z "$(ls -A "$stable" 2>/dev/null)" ]]; then
+        echo "[错误] 无法删除空健康检查副本目录：${stable}" >&2
+        return 1
+      fi
+      echo "[信息] 已保留健康检查目录中的其他用户文件：${stable}"
+    fi
+    echo "[信息] 已清理健康检查稳定副本和状态：${stable}"
+  done
 }
 
 post_deploy_extras() {
@@ -4266,6 +5055,7 @@ uninstall_derper() {
   fi
 
   if [[ ${PURGE_ALL} -eq 1 ]]; then
+    purge_healthcheck_program || return 1
     if [[ -x "${BIN_PATH}" ]]; then
       echo "[步骤] 删除 derper 二进制：${BIN_PATH} …"
       rm -f "${BIN_PATH}" || true
@@ -4597,7 +5387,21 @@ main() {
   fi
 
   resolve_run_user
-  
+  if [[ -z "${NODE_STATE_DIR:-}" ]]; then
+    NODE_STATE_DIR=/var/lib/derper
+  fi
+
+  if [[ "${RECOVER_INTERRUPTED}" -eq 1 ]]; then
+    require_root
+    acquire_deploy_lock || exit 1
+    recover_interrupted_change || exit 1
+    exit 0
+  fi
+  if [[ "${CHECK_ONLY}" -ne 1 && "${HEALTH_CHECK}" -ne 1 ]]; then
+    ordinary_change_allowed || exit 1
+    acquire_deploy_lock || exit 1
+  fi
+
   # 环境检测（优先级最高，除了 --help 和 --uninstall）
   if [[ "${UNINSTALL}" -eq 1 ]]; then
     # 卸载优先处理：不依赖环境检测/公网 IP 探测/参数校验
@@ -4806,7 +5610,7 @@ finalize_deployment_report() {
 - 服务：systemctl status derper
 - 日志：journalctl -u derper -f
 - 证书：$(derper_manual_cert_file) / $(derper_manual_key_file)（上游 derper manual 模式读取；兼容链接 fullchain.pem/privkey.pem）
-- 配置：${INSTALL_DIR}/derper.json
+- 配置：$(derper_config_path)
 
 在 Tailscale 后台粘贴 derpMap 后，客户端数十秒内会自动下发。
 若本次重签了证书，请立即用新的 CertName 更新 ACL，避免短暂中断后无法接入。

@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.2.15] - 2026-10-21
+
+### ✨ Features
+
+1. **Single-step release rollback and install-tree permissions (local part of BUG-036, BUG-037, DEV-006)**
+    - Upgrade, rollback, migration, rotation, and uninstall share one flock. Builds land in a candidate directory and replace the live binary only after checks pass.
+    - A root-owned recovery set is staged on the destination filesystem. Unverified staging cannot replace the only backup. An incomplete marker blocks ordinary overwrite; `--recover-interrupted` is the explicit recovery path. Records are whitelist key/value files, never sourced or eval'd, and an interrupted step is not resumed automatically.
+    - A bad candidate or a failed write is not reported as success. A failed first install does not invent a previous version. A service that was stopped stays stopped after restore. If the running tailscaled daemon revision cannot be confirmed, the script does not switch derper and does not upgrade or downgrade tailscaled.
+    - The install tree stays root-owned. The node private key moves to the state directory without changing its bytes. A symlink certificate directory is refused. systemd write access is limited to the node state directory.
+    - Restoring config and state does not follow a destination symlink. If the state directory itself is a symlink, restore is refused. While root is writing, that directory is temporarily owned by root and then returned to the service user.
+    - With verify-clients left at its default, a candidate module version is compared with the running tailscaled commit by the pseudo-version's trailing 12 hex digits, or by the release tag from `go list -m`. A mismatch or an unresolved identity does not switch derper and does not upgrade or downgrade tailscaled.
+    - Rollback stops derper and checks that it is inactive before writing the previous files back, then starts only when that was the previous intent. A failed stop, start, or recheck keeps the incomplete marker.
+    - A migration that does not rebuild the binary records a recovery set and a migrate marker before stopping the service. A failure after the stop tries to resume the previous intent and keeps the marker for explicit recovery. The migrated node config is owned by the service user at mode 0600. As root, the script checks that this user can read it.
+    - Parses the complete standard `tailscale commit: <hash>` field instead of rejecting same-origin candidates by reading the wrong column. Missing, malformed, and mismatched identities remain rejected (BUG-055).
+    - Migration within an upgrade reuses the original recovery set. Repeated migration cannot replace the only previous binary with the candidate or clear the outer marker before final service verification (BUG-059).
+    - Rollback restores state-directory ownership and certificate group access for the saved unit user. The old user can read node identity and the previous IP private key without changing the caller's target user or IP (BUG-060).
+
+### 🔧 Bug fixes
+
+1. **Full uninstall removes the health-check stable copy (BUG-053)**
+    - `--uninstall --purge-all` removes the stable program and status, then empty directories. Ordinary uninstall and `--purge` keep them. Only script-created files are removed; unrelated user files remain. A symlink directory is refused and failed deletion returns non-zero.
+
+### 🧪 Tests
+
+- Adds eight behavior regressions in `tests/test_s2_fixes.sh`, observed failing before the fixes and passing afterwards, covering standard daemon output, upgrade/migration composition, failure markers, saved-user rollback, and full uninstall including failed file and empty-directory deletion; the suite is wired into CI. `tests/test_s2_evidence.sh` also verifies real two-user rollback access to node config and private keys in a disposable Ubuntu container.
+- `tests/test_review_regressions.sh` grows from 46 to 65 cases: new B1/B2/B3 rollback and migration cases (two-process lock, bad candidate never replaces the live binary, stopped intent is not started, failed first install invents no previous version, rollback restoring config and state, failed reverification keeping the recovery set, build timeout leaving the live binary alone, failed migration reverification, install-tree symlink refusal), plus targeted BUG-054–BUG-058 cases (restore not following a state symlink, symlinked state directory refused, a same-origin candidate passing the daemon gate, rollback reloading the previous process with stop failures keeping the marker, a pure migration failure keeping its marker, migrated config handed to the service user). Permission assertions that root cannot simulate are skipped as root; the main suite (104 cases) and the review regressions pass on both macOS Bash 3.2 and Linux Bash 5.2.
+
+This release covers the S2/phase-B working-tree changes committed after 0.2.14 (Build0280); see `task-list.md` in the repository root for the ledger (BUG-036, BUG-037, BUG-053–BUG-060, the local part of DEV-006, TST-013–TST-016, CHK-020–CHK-023). The phase-B VM fault injection remains `tests/test_systemd_integration.sh` and was not run on this machine.
+
+---
+
 ## [0.2.14] - 2026-10-21
 
 ### 🔧 Bug fixes
@@ -727,4 +758,4 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 **Update Date**: 2026-10-21
 
-**Version**: 0.2.14
+**Version**: 0.2.15

@@ -3,7 +3,7 @@
 > 本文是中文的详细技术参考。主仓库首页 `README.md` 为精简版中文快速上手；英文详细参考见同目录的 `REFERENCE_EN.md`。
 
 > **脚本文件**：`deploy_derper_ip_selfsigned.sh`  
-> **当前版本**：0.2.14（2026-10-21）\
+> **当前版本**：0.2.15（2026-10-21）\
 > **查看版本**：`bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
@@ -71,7 +71,7 @@ derper -c ./derper.json -hostname 127.0.0.1 -certmode manual -certdir ./certs \
 - **默认启用 `-verify-clients`**：脚本会在安装前检查本机 `tailscaled` 是否运行且已登录
   - ✅ 若未就绪，脚本会中止并提示登录方法
   - ⚠️ 若确需跳过校验，可使用 `--no-verify-clients`（**仅限测试环境**）
-  - 🔒 **版本对齐（v0.2.8 / v0.2.10）**：`-verify-clients` 要求 derper 与 tailscaled 由同一 Git revision 构建。未显式指定 `--derper-version` 时，脚本优先把目标对齐到 `tailscale version` 输出的 `tailscale commit`（真正同源）；取不到 commit 时退化为版本标签并给出警告。对齐时比较已安装伪版本的末尾 12 位 revision，或用 `go list -m` 把 commit 解析为规范标签，避免每次 `--repair` 都重编译。**若已安装 derper 与目标不一致，会实际重新安装二进制**（无需额外 `--force`）。可用 `--derper-version` 覆盖。
+  - 🔒 **版本对齐（v0.2.8 / v0.2.10）**：`-verify-clients` 要求 derper 与 tailscaled 由同一 Git revision 构建。未显式指定 `--derper-version` 时，脚本优先把目标对齐到 `tailscale version` 输出的 `tailscale commit`（真正同源）；取不到 commit 时退化为版本标签并给出警告。对齐时比较已安装伪版本的末尾 12 位 revision，或用 `go list -m` 把 commit 解析为规范标签，避免每次 `--repair` 都重编译。**若已安装 derper 与目标不一致，会实际重新安装二进制**（无需额外 `--force`）。可用 `--derper-version` 覆盖。切换正式二进制前，候选模块版本与正在运行的 tailscaled daemon commit 使用同一比较；对不上或无法确认时不切换，也不升级或降级 tailscaled。
   - 📝 检测逻辑：
     - 若检测到 `tailscale` CLI，通过 `tailscale ip` 判断是否已分配 Tailnet IP
     - 若未检测到 CLI，则仅依据 `tailscaled` 运行状态判断
@@ -232,7 +232,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
   - 缺少项（如 curl/openssl/git/go）：正式安装会按需补齐；离线/受限网络下请先用包管理器安装。
 - 服务管理器
   - 未检测到 systemd：无法写入服务。可手动前台运行（示例）：
-    `derper -c /opt/derper/derper.json -hostname <你的公网IP> -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun -stun-port 3478 -verify-clients -socket /run/tailscale/tailscaled.sock`
+    `derper -c /var/lib/derper/derper.json -hostname <你的公网IP> -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun -stun-port 3478 -verify-clients -socket /run/tailscale/tailscaled.sock`
     说明：老版本不支持 `-a` 时可改用 `-https-port 30399`。若不支持 `-stun-port`，只能使用默认 STUN 端口 3478；脚本会拒绝无法生效的自定义 STUN 端口。
 - 非 systemd 环境将给出手动运行示例，安装流程会中止。
 - 建议（建议动作汇总）
@@ -299,13 +299,16 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 --health-check            仅输出健康检查摘要（不更改系统，可用于 cron/监控）
                           退出码：0 健康，1 已确认故障；2 保留给未知且不会被当成健康。任意非 0 都表示未通过
                           --metrics-textfile 写入失败时仍输出摘要，但退出码为 1，旧指标文件保持不变
-                          不能与 --check/--dry-run/--repair/--force/--uninstall 同用
+                          不能与 --check/--dry-run/--repair/--force/--uninstall/--recover-interrupted 同用
 --metrics-textfile <P>    将健康检查导出为 Prometheus 文本指标到路径 P
                           （必须与 --health-check 或 --install-healthcheck-cron 一起使用；结合 node_exporter 使用）
 --uninstall               停止并卸载 derper 的 systemd 服务（保留二进制与证书；同时删除健康检查 timer/cron 与 --tls-connlimit 规则，
                           /usr/local/lib/derper-deploy 下的健康检查稳定副本保留，可手动删除）
 --purge                   搭配 --uninstall：额外删除安装目录（/opt/derper）
---purge-all               搭配 --uninstall：在 --purge 基础上同时删除二进制、/etc/derper/derper.env 和脚本创建的 tailscaled socket drop-in；防火墙规则和用户/组账户需手动确认
+--purge-all               搭配 --uninstall：在 --purge 基础上同时删除二进制、/etc/derper/derper.env、健康检查稳定程序/状态和脚本创建的 tailscaled socket drop-in；防火墙规则和用户/组账户需手动确认
+--recover-interrupted     显式恢复未完成的升级/迁移。不会自动继续中断的步骤。
+                          存在未完成标记时，普通安装/修复/轮换/卸载会被阻断；恢复集与标记位于
+                          /var/lib/derper-deploy（root 管理）。不能与安装、修复、检查或卸载同时使用。
 ```
 
 > 兼容性：脚本优先使用新版 `-a :<PORT>` 指定监听；若不支持则回退到旧参数 `-https-port <PORT>`。若当前 derper 不支持 `-stun-port`，脚本仅允许默认端口 3478；传入其他 STUN 端口会明确报错并中止。
@@ -693,7 +696,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall --purge
 sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall --purge-all
 ```
 
-注意：卸载不影响 Tailscale 本体（tailscaled、客户端等）。若需一起移除，请按发行版常规方式操作。健康检查稳定副本目录（默认 `/usr/local/lib/derper-deploy/`）任一卸载级别都不会删除，不再需要时可手动 `rm -rf`。
+注意：卸载不影响 Tailscale 本体（tailscaled、客户端等）。若需一起移除，请按发行版常规方式操作。普通卸载和 `--purge` 保留健康检查稳定副本；`--purge-all` 删除稳定程序和 status（默认目录 `/usr/local/lib/derper-deploy/`，并兼顾 cron 回退目录），空目录一并移除。目录内其他用户文件保留；副本目录为符号链接或删除失败时返回非零。
 
 ---
 

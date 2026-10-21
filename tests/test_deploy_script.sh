@@ -38,7 +38,7 @@ test_unit_matching_detects_config_drift() {
   SECURITY_LEVEL="standard"
 
   local unit
-  unit=$'[Service]\nUser=derper\n# 安全加固（级别：standard）\nExecStart=/usr/local/bin/derper -c /opt/derper/derper.json -hostname 203.0.113.10 -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun -stun-port 3478 -verify-clients\n'
+  unit=$'[Service]\nUser=derper\n# 安全加固（级别：standard）\nExecStart=/usr/local/bin/derper -c /opt/derper/state/derper.json -hostname 203.0.113.10 -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun -stun-port 3478 -verify-clients\n'
   unit_matches_desired_config "$unit" || fail "matching unit should be accepted"
 
   DERP_PORT="443"
@@ -127,7 +127,7 @@ test_nonempty_config_uses_separate_c_argument() {
     systemctl() { return 0; }
 
     write_systemd_service >/dev/null
-    grep -qF "ExecStart=${BIN_PATH} -c ${INSTALL_DIR}/derper.json -hostname" "$SERVICE_PATH" ||
+    grep -qF "ExecStart=${BIN_PATH} -c ${INSTALL_DIR}/state/derper.json -hostname" "$SERVICE_PATH" ||
       fail "non-empty config must emit -c and path as separate ExecStart arguments"
   )
   ok "non-empty derper config emits a valid -c argument"
@@ -345,7 +345,7 @@ test_unit_matching_rejects_wrong_socket_path() {
   RUN_USER="derper" VERIFY_CLIENTS_MODE="on" SECURITY_LEVEL="standard"
   derper_supports_socket_flag() { return 0; }
   local base good bad
-  base=$'[Service]\nUser=derper\n# 安全加固（级别：standard）\nExecStart=/usr/local/bin/derper -c /opt/derper/derper.json -hostname 203.0.113.10 -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun -stun-port 3478 -verify-clients'
+  base=$'[Service]\nUser=derper\n# 安全加固（级别：standard）\nExecStart=/usr/local/bin/derper -c /opt/derper/state/derper.json -hostname 203.0.113.10 -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun -stun-port 3478 -verify-clients'
   # 正确 socket 路径应被接受
   good="${base} -socket /run/tailscale/tailscaled.sock"
   unit_matches_desired_config "$good" || fail "correct -socket path should be accepted"
@@ -538,14 +538,14 @@ test_paranoid_degraded_unit_is_accepted() {
   RUN_USER="derper" VERIFY_CLIENTS_MODE="off" SECURITY_LEVEL="paranoid"
   derper_supports_socket_flag() { return 1; }
   local full degraded
-  full=$'[Service]\nUser=derper\n# 安全加固（级别：paranoid）\nMemoryDenyWriteExecute=true\nExecStart=/usr/local/bin/derper -c /opt/derper/derper.json -hostname 203.0.113.10 -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun -stun-port 3478\n'
+  full=$'[Service]\nUser=derper\n# 安全加固（级别：paranoid）\nMemoryDenyWriteExecute=true\nExecStart=/usr/local/bin/derper -c /opt/derper/state/derper.json -hostname 203.0.113.10 -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun -stun-port 3478\n'
   unit_matches_desired_config "$full" || fail "full paranoid unit should match"
 
-  degraded=$'[Service]\nUser=derper\n# 安全加固（级别：paranoid；已禁用 MemoryDenyWriteExecute）\nExecStart=/usr/local/bin/derper -c /opt/derper/derper.json -hostname 203.0.113.10 -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun -stun-port 3478\n'
+  degraded=$'[Service]\nUser=derper\n# 安全加固（级别：paranoid；已禁用 MemoryDenyWriteExecute）\nExecStart=/usr/local/bin/derper -c /opt/derper/state/derper.json -hostname 203.0.113.10 -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun -stun-port 3478\n'
   unit_matches_desired_config "$degraded" || fail "explicitly degraded paranoid unit should match"
 
   local fake_full
-  fake_full=$'[Service]\nUser=derper\n# 安全加固（级别：paranoid）\nExecStart=/usr/local/bin/derper -c /opt/derper/derper.json -hostname 203.0.113.10 -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun -stun-port 3478\n'
+  fake_full=$'[Service]\nUser=derper\n# 安全加固（级别：paranoid）\nExecStart=/usr/local/bin/derper -c /opt/derper/state/derper.json -hostname 203.0.113.10 -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun -stun-port 3478\n'
   unit_matches_desired_config "$fake_full" && fail "paranoid comment without MemoryDenyWriteExecute should be drift"
   ok "paranoid degraded marker is honored by config matching"
 }
@@ -1232,6 +1232,8 @@ test_install_derper_survives_missing_timeout() {
     trap 'rm -rf "$local_tmp"' EXIT
     BIN_PATH="${local_tmp}/derper"
     _tmpdir="$local_tmp"
+    DEPLOY_STATE_DIR="${local_tmp}/deploy-state"
+    VERIFY_CLIENTS_MODE=off
     DERPER_VERSION=v1.80.0
     GOPROXY_ARG=""
     GOSUMDB_ARG=""
@@ -1242,8 +1244,9 @@ test_install_derper_survives_missing_timeout() {
     precheck_go_network() { return 0; }
     ensure_go() { return 0; }
     go() {
-      printf '#!/bin/sh\n' >"$BIN_PATH"
-      chmod +x "$BIN_PATH"
+      mkdir -p "$GOBIN"
+      printf '#!/bin/sh\necho -a\n' >"$GOBIN/derper"
+      chmod +x "$GOBIN/derper"
     }
     env() { go; }
     install_derper >/dev/null || fail "install_derper must succeed without timeout"
@@ -2519,6 +2522,7 @@ test_health_check_report_expiry_tiers_and_uninstall_purge_modes() {
     SERVICE_PATH="${local_tmp}/derper.service"
     INSTALL_DIR="${local_tmp}/install"
     BIN_PATH="${local_tmp}/derper"
+    HEALTHCHECK_PROGRAM_DIR="${local_tmp}/health-program"
     mkdir -p "$INSTALL_DIR"
     printf '[Service]\nUser=derper_custom\n' >"$SERVICE_PATH"
     printf '#!/bin/sh\n' >"$BIN_PATH"
@@ -2587,6 +2591,10 @@ test_deployment_wizard_full_flow_and_validation() {
 test_main_modes_end_to_end_orchestration() {
   (
     DERPER_TEST_MODE=1 source "$SCRIPT"
+    local_tmp=$(mktemp -d)
+    trap 'rm -rf "$local_tmp"' EXIT
+    DEPLOY_STATE_DIR="$local_tmp/deploy-state"
+    flock() { return 0; }
     check_os_environment() { :; }
     require_root() { :; }
     recover_cert_update() { return 0; }

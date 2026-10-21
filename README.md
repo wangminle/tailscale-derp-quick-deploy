@@ -1,7 +1,7 @@
 # Tailscale DERP Quick Deploy Script
 
 > **Language / 语言**: [English](#english) | [中文](#中文)  
-> **Version / 版本**: `0.2.14` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
+> **Version / 版本**: `0.2.15` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ---
 
@@ -229,6 +229,7 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # Use current login user
 | `--metrics-textfile <path>` | Export Prometheus metrics (requires `--health-check` or `--install-healthcheck-cron`) | `.prom` file | With node_exporter monitoring |
 | `--install-healthcheck-cron` | Install a 5-minute health check: with systemd a `derper-healthcheck.timer` (oneshot service that calls a root-owned stable copy via `bash`; the old cron is removed), otherwise `/etc/cron.d/derper-healthcheck`. A failed install rolls back and keeps the existing schedule | systemd timer or cron file | Hands-off health + metrics; not with `--health-check`/`--check` |
 | `--tls-connlimit <N>` | Cap concurrent DERP TLS connections per source IP (explicit `0` removes installed rules; omit to leave them) | nftables/iptables rule | Soften TLS handshake floods; not with `--health-check`/`--check` |
+| `--recover-interrupted` | Explicitly roll back an unfinished upgrade/migration from the saved recovery set; interrupted steps are never resumed automatically | Text + exit code | Recovering after an interrupted change; not with install/repair/check/uninstall |
 
 `--uninstall` also removes the health-check timer/cron and `--tls-connlimit` rules (the stable copy under `/usr/local/lib/derper-deploy` is kept). `--relax-socket-perms` restores the original socket mode when the script exits.
 
@@ -255,7 +256,7 @@ derper_process_rss_bytes 3145728     # Process memory usage (bytes)
 |-----------|-------------|-----------------|------------------|
 | `--uninstall` | Stop and remove service | systemd unit, health-check timer/cron, `--tls-connlimit` rules | Binary, certificates, health-check stable copy |
 | `--uninstall --purge` | + Remove installation directory | + `/opt/derper` | Binary |
-| `--uninstall --purge-all` | + Remove binary and script-created config | + `/usr/local/bin/derper`, `/etc/derper/derper.env`, DERP tailscaled socket drop-in | Firewall rules, user/group accounts, `/usr/local/lib/derper-deploy` |
+| `--uninstall --purge-all` | + Remove binary and script-created config | + `/usr/local/bin/derper`, `/etc/derper/derper.env`, DERP tailscaled socket drop-in, health-check stable program/status | Firewall rules, user/group accounts, unrelated files in the stable program directory |
 
 ---
 
@@ -747,6 +748,7 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # 使用当前登录用户
 | `--metrics-textfile <path>` | 导出 Prometheus 指标（必须与 `--health-check` 或 `--install-healthcheck-cron` 一起使用） | `.prom` 文件 | 配合 node_exporter 监控 |
 | `--install-healthcheck-cron` | 安装每 5 分钟的健康检查：有 systemd 时写 `derper-healthcheck.timer`（oneshot 服务以 `bash` 调用 root 管理的稳定副本，并删除旧 cron），否则写 `/etc/cron.d/derper-healthcheck`。安装失败会回滚并保留原调度 | systemd timer 或 cron 文件 | 无人值守健康检查与指标；不能与 `--health-check`/`--check` 同用 |
 | `--tls-connlimit <N>` | 限制单 IP 并发 DERP TLS 连接（显式 `0` 移除已装规则；省略则不改动） | nftables/iptables 规则 | 缓解 TLS 握手洪水；不能与 `--health-check`/`--check` 同用 |
+| `--recover-interrupted` | 用保存的恢复集显式回退未完成的升级/迁移；不会自动继续中断的步骤 | 文本 + 退出码 | 中断后的显式恢复；不能与安装/修复/检查/卸载同用 |
 
 `--uninstall` 会同时删除健康检查 timer/cron 与 `--tls-connlimit` 规则（`/usr/local/lib/derper-deploy` 下的稳定副本保留）。`--relax-socket-perms` 在脚本退出时恢复 socket 原权限。
 
@@ -773,7 +775,7 @@ derper_process_rss_bytes 3145728     # 进程内存占用（字节）
 |------|------|----------|----------|
 | `--uninstall` | 停止并删除服务 | systemd 单元、健康检查 timer/cron、`--tls-connlimit` 规则 | 二进制、证书、健康检查稳定副本 |
 | `--uninstall --purge` | + 删除安装目录 | + `/opt/derper` | 二进制 |
-| `--uninstall --purge-all` | + 删除二进制和脚本生成配置 | + `/usr/local/bin/derper`、`/etc/derper/derper.env`、DERP 创建的 tailscaled socket drop-in | 防火墙规则、用户/组账户、`/usr/local/lib/derper-deploy` |
+| `--uninstall --purge-all` | + 删除二进制和脚本生成配置 | + `/usr/local/bin/derper`、`/etc/derper/derper.env`、DERP 创建的 tailscaled socket drop-in、健康检查稳定程序及状态 | 防火墙规则、用户/组账户、稳定副本目录中的其他用户文件 |
 
 ---
 
