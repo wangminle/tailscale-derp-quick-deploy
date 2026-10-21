@@ -1,5 +1,74 @@
 # 更新日志
 
+## [0.2.14] - 2026-10-21
+
+### 🔧 Bug 修复
+
+1. **端口冲突按协议判断，端口归属只认 PID 字段（BUG-040、BUG-043、BUG-044、BUG-048）**
+   - DERP 只检查 TCP（含 tcp6），STUN 只检查 UDP（含 udp6）。UDP 占用同号端口不再被报成 TCP 冲突；TCP 占用 STUN 端口号也不再阻断 UDP。
+   - 端口归属同时核对协议与进程：移除同名进程兜底，存在 MainPID 时监听进程必须严格一致；同端口另一种协议上的 derper 不能抵消外来监听。
+   - `port_listening_owned_by_derper` 与 `current_derper_owns_ports` 只认 ss 的 `pid=<PID>` 或 netstat 的 `<PID>/程序名`。MainPID 恰好等于 Send-Q 或 Recv-Q（例如 128）时，外来 nginx/unbound 占用会被报冲突，不再放行。
+
+2. **矛盾主模式在副作用前拒绝（BUG-041）**
+   - `--health-check` 与 `--check`/`--dry-run`/`--repair`/`--force`/`--uninstall` 互斥。`--health-check --uninstall` 不再进入卸载。
+   - 单独的健康检查、修复、卸载，以及部署附带 `--install-healthcheck-cron`，保持可用。
+
+3. **数字参数校验后写成规范十进制**
+   - 通过范围校验的端口、证书天数、RegionID、连接上限会去掉前导零，derpMap 不再输出 `0443`、`0900` 这类值。
+
+4. **健康检查退出码与 verify-clients 依赖判定（BUG-038）**
+   - 退出码 0 健康，1 已确认故障，2 未知；任意非 0 都表示未通过，旧的 cron 和 `if ! --health-check` 调用方不受影响。
+   - 实际探测 tailscaled LocalAPI HTTP 状态：verify-clients 开启而 tailscaled 未运行，或 403/401 明确鉴权被拒时 `TS_LOCALAPI_OK=0`、退出码 1、总体健康指标为 0；无法连接或调用者权限不足时记为未知，退出码 2。
+
+5. **限流规则失败不再被当成成功（BUG-035）**
+   - nft 的清空和添加放进同一次 `nft -f` 提交。提交失败时不改动已有规则，并返回非零。
+   - iptables 先把新规则装进临时链。临时链失败时不改正式链；正式链替换失败时恢复旧规则。恢复也失败时说明保护不完整，不宣称成功。
+   - 读取既有链快照失败时直接报错中止并保留原规则，不执行 `-F` 与虚假恢复。
+
+6. **显式移除限流失败（含混合后端残留）严格向外传播错误（BUG-046）**
+   - `--tls-connlimit 0` 在全部失败或混合后端任一后端（如 nft）删除失败导致规则残留时，均输出残留警告并返回非零错误码。
+
+7. **证书与私钥错配会阻止重启（BUG-039）**
+   - 用公钥比较 RSA 和 EC 证书对。不匹配时不重启；有备份则先恢复备份，否则要求显式 `--accept-cert-rotation` 才重签。
+
+8. **证书目录无搜索权限记为未知而非故障（DOC-008）**
+   - 证书目录不可读或不可检索时，明确判定为未知（`CERT_CHECK_UNKNOWN=1`，退出码 2），避免误报证书缺失或命名不兼容。
+
+9. **健康检查任务不再依赖源脚本的执行位（BUG-034）**
+   - 安装 root 可管理的稳定副本，并用 `bash` 显式调用。源脚本是 0644、之后源码目录被移走，任务仍可执行。
+
+10. **健康检查 timer 安装严格校验，失败保留旧调度并完整回滚（BUG-042、BUG-047、BUG-049、BUG-050、BUG-051）**
+    - 严格检查 unit 目录冲突、临时文件写入、mv 原子替换、daemon-reload 与 enable 每一个步骤。任一步失败清理残留并保留旧 cron，返回非零。
+    - 建立完整调度与程序事务快照（`rollback_healthcheck_transaction`）：已有 timer 更新失败时完整恢复原有 service/timer 单元文件、原有稳定副本程序与旧调度状态，并重新 reload systemd，调度与稳定副本均不丢失。
+    - 已有稳定副本、service、timer、cron 或 status 必须先完整快照；任一必要备份失败立即停止，原文件保持不变。复制后用 cmp（或大小）校验快照；回滚用 `.bak` 与 `.missing` 区分「有原件」和「原本就没有」，避免安装失败时删掉仍在运行的健康检查。
+    - 从 cron 迁到 timer 后检查旧 cron 是否仍在。只读挂载或 immutable 导致删不掉时，回滚新 timer/status 并返回非零。回退到 cron 时同样检查旧 timer/service；删不掉则撤销新 cron，避免两套每五分钟调度同时跑。
+    - 修改已有 timer 或迁移调度之前记录 active/enabled，回滚时分别恢复两个状态；原本停止的不会被拉起，原本禁用的不会被启用。
+    - 恢复复制、权限、清理或 systemd 操作失败会返回错误并保留快照目录，不再声称「已有调度保持原样」；文件恢复不完整时不会启动 timer。
+
+11. **systemd ExecStart 路径转义规范化（BUG-045）**
+    - ExecStart 参数使用双引号包裹与转义，不再复用 Bash 的 `printf %q`，消除 systemd unknown escape 警告。
+
+12. **健康检查单次采集优化与核心大函数职责解耦（DEV-009）**
+    - `main` 与 `health_check_report` 消除重复状态收集，文字、指标与退出码复用同一次采集结果。
+    - 维持单文件自包含交付模式不变，在单文件内按职责解耦三大核心函数：
+      - `write_systemd_service`：解耦参数准备、用户/socket 权限配置、纯 unit 渲染与发布验证/回滚；
+      - `install_healthcheck_cron`：解耦命令生成、unit/cron 模板渲染与调度事务回滚；
+      - `health_check_report`：解耦单次采集、控制台文本渲染与 Prometheus 指标导出。
+
+### 📖 文档
+
+- 打 tag 改为管理后台或 `tailscale up --advertise-tags`，并写明 verify-clients 需要服务器能看到合法客户端。
+- socket 0666 不再称为应急状态。127.0.0.0/8（含 127.0.0.53）不再被说成非回环地址。
+- README 与 REFERENCE 中英同步到本版行为：`--install-healthcheck-cron` 优先写 systemd timer 并以 bash 调用稳定副本、失败回滚且幂等；`--uninstall` 同时删除 timer/cron（`/usr/local/lib/derper-deploy` 稳定副本保留）；`--tls-connlimit` 安装/移除失败的返回语义；健康检查退出码 0/1/2 与指标写入失败时退出码 1；示例输出改为现行文案，Prometheus 指标样例补全 `derper_healthy`、`derper_check_unknown`、`derper_metrics_unixtime` 等全部导出项。
+
+### 🧪 测试
+
+- `tests/test_review_regressions.sh` 从 28 项扩充到 46 项：协议端口冲突与归属、矛盾主模式副作用、前导零规范化、健康退出码、nft/iptables 失败保留旧规则与快照读取失败、LocalAPI 403、证书错配与目录无权限、调度备份失败保留原 unit、Send-Q/Recv-Q 不充当 PID、cron/timer 互相删除失败时撤销新调度、回滚恢复 timer 原运行状态、恢复复制失败保留快照。root 下跳过无法模拟的权限断言，缺 python3 或禁止 Unix socket 时跳过 LocalAPI 403 用例。主套件 LocalAPI 探活使用独立探测路径，并在服务写出就绪标记后才连接，accept 与等待都有超时，EXIT 会清理子进程；故意延迟服务启动仍能完成探活。主套件 104 项在禁止 Unix socket 的沙箱与允许 socket 的环境均通过。
+
+本版合并了 2026-10-20～21 开发期间的工作区版本 0.2.14～0.2.17（均未单独发布）；修复记录见仓库根目录 `task-list.md`（BUG-034～BUG-052、DOC-007～DOC-008、ADJ-015～ADJ-020）。
+
+---
+
 ## [0.2.13] - 2026-10-20
 
 ### 📖 文档与仓库结构
@@ -656,6 +725,6 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 **贡献者**：感谢架构师的专业建议
 
-**更新日期**：2026-10-20
+**更新日期**：2026-10-21
 
-**版本**：0.2.13
+**版本**：0.2.14

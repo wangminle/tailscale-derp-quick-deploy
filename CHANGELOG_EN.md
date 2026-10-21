@@ -1,5 +1,74 @@
 # Changelog
 
+## [0.2.14] - 2026-10-21
+
+### 🔧 Bug fixes
+
+1. **Port conflicts are judged per protocol, and ownership matches PID fields only (BUG-040, BUG-043, BUG-044, BUG-048)**
+   - DERP checks TCP only (including tcp6); STUN checks UDP only (including udp6). A UDP listener on the same number is no longer reported as a TCP conflict, and a TCP listener does not block STUN.
+   - Ownership compares protocol and process together: the fallback that matched by process name alone is removed, and when MainPID is known the listener PID must match it strictly. derper on the other protocol cannot excuse a foreign listener.
+   - `port_listening_owned_by_derper` and `current_derper_owns_ports` accept only ss `pid=<PID>` or netstat `<PID>/program`. When MainPID happens to equal Send-Q or Recv-Q (for example 128), a foreign nginx/unbound listener is reported as a conflict.
+
+2. **Contradictory primary modes are rejected before side effects (BUG-041)**
+   - `--health-check` is mutually exclusive with `--check`/`--dry-run`/`--repair`/`--force`/`--uninstall`. `--health-check --uninstall` no longer uninstalls.
+   - Health check, repair, and uninstall alone still work, as does a deploy that also passes `--install-healthcheck-cron`.
+
+3. **Numeric arguments are canonical after validation**
+   - Ports, certificate lifetime, RegionID, and the connection limit drop leading zeros once they pass the range check, so derpMap output does not keep values such as `0443` or `0900`.
+
+4. **Health-check exit codes and the verify-clients dependency (BUG-038)**
+   - Exit 0 healthy, 1 confirmed fault, 2 unknown. Any non-zero status means not healthy, so existing cron jobs and `if ! --health-check` callers are unaffected.
+   - Actively probes the tailscaled LocalAPI HTTP status. With verify-clients enabled, a stopped tailscaled or a 403/401 forbidden response sets `TS_LOCALAPI_OK=0`, exit code 1, and `derper_healthy 0`. Inability to connect, or insufficient caller permission, is reported as unknown with exit code 2.
+
+5. **A failed connection-limit install is no longer reported as success (BUG-035)**
+   - nft flush and rule insertion go through one `nft -f` transaction. If it fails, existing rules stay in place and the command returns non-zero.
+   - iptables installs the new rule on a temporary chain first. A temporary-chain failure leaves the live chain alone; if replacing the live chain fails, the previous rules are restored. If that restore also fails, the command says protection is incomplete and does not claim success.
+   - Failure to read the existing chain snapshot halts the operation without flushing the live chain and without a false recovery message.
+
+6. **Firewall rule deletion failure propagates error on mixed-backend lingering rules (BUG-046)**
+   - Under `--tls-connlimit 0`, if every backend fails or any backend (such as nft) fails to delete and leaves lingering rules, the command warns about the residue and returns non-zero.
+
+7. **A mismatched certificate and key blocks restart (BUG-039)**
+   - RSA and EC pairs are compared by public key. A mismatch does not restart the service; an existing backup is restored first, otherwise an explicit `--accept-cert-rotation` is required before re-signing.
+
+8. **Unsearchable certificate directory reported as unknown instead of fault (DOC-008)**
+   - When the certificate directory lacks read or search permissions, it is explicitly classified as unknown (`CERT_CHECK_UNKNOWN=1`, exit code 2) instead of a missing or misnamed certificate.
+
+9. **The health task no longer depends on the source script being executable (BUG-034)**
+   - Installs a root-managed stable copy and invokes it explicitly via `bash`. A 0644 source script, or a source directory that is later moved away, no longer breaks the task.
+
+10. **Strict verification for the healthcheck timer install, keeping the old scheduler and rolling back completely on failure (BUG-042, BUG-047, BUG-049, BUG-050, BUG-051)**
+    - Verifies unit path directory conflicts, temporary file writes, atomic mv replacement, daemon-reload, and enable. Any failure cleans up and preserves the legacy cron, returning non-zero.
+    - Transactional rollback (`rollback_healthcheck_transaction`) snapshots the existing stable program, service/timer units, cron, and status before the update, fully restores them if the reinstall fails, and reloads systemd so existing schedules stay intact.
+    - Existing stable program, service, timer, cron, and status files must be snapshotted first. Any required backup failure stops the update and leaves originals untouched. Snapshots are verified with cmp (or size); rollback distinguishes `.bak` (original existed) from `.missing` (original was absent), so a later install failure cannot delete a still-healthy scheduler.
+    - After migrating cron to timer, a remaining cron file (read-only mount, immutable flag) is treated as migration failure: the new timer and status are rolled back and the installer returns non-zero. Falling back to cron likewise checks leftover timer/service files and revokes the new cron, so two five-minute schedules cannot both remain.
+    - The timer's active/enabled states are recorded before updating an existing timer or migrating schedules. Rollback restores the two states independently: a previously stopped timer is not started, and a previously disabled timer is not enabled.
+    - A failed restore copy, permission change, cleanup, or systemd operation returns an error and keeps the snapshot directory instead of claiming the previous scheduler is intact. The timer is not started if file restoration is incomplete.
+
+11. **systemd ExecStart path quoting standardized (BUG-045)**
+    - ExecStart arguments are quoted and escaped according to systemd unit rules instead of reusing Bash `printf %q`, eliminating unknown escape sequence warnings.
+
+12. **Single health status collection cycle and large function refactoring (DEV-009)**
+    - Eliminates redundant status collection between `main` and `health_check_report`; summary text, metrics, and exit code all reuse one collection pass.
+    - Preserves single-file self-contained delivery while cleanly decoupling responsibilities in core functions:
+      - `write_systemd_service`: decoupled into argument preparation, user/socket permissions, pure unit rendering, and deployment/verification/rollback.
+      - `install_healthcheck_cron`: decoupled into command generation, unit/cron rendering, and transaction rollback.
+      - `health_check_report`: decoupled into status collection, summary text rendering, and Prometheus metrics writing.
+
+### 📖 Docs
+
+- Tagging now points at the admin console or `tailscale up --advertise-tags`, and states that verify-clients needs the server to see legitimate clients.
+- Mode 0666 on the tailscaled socket is no longer called an emergency state. Addresses in 127.0.0.0/8, including 127.0.0.53, are not reported as non-loopback.
+- README and both REFERENCE documents now match this release: `--install-healthcheck-cron` prefers a systemd timer that calls a stable copy via bash, rolls back on failure, and is idempotent; `--uninstall` also removes the timer/cron (the stable copy under `/usr/local/lib/derper-deploy` is kept); the return semantics of a failed `--tls-connlimit` install or removal; health-check exit codes 0/1/2 and exit code 1 when the metrics file cannot be written; the sample output uses the current wording and the Prometheus example lists every emitted metric, including `derper_healthy`, `derper_check_unknown`, and `derper_metrics_unixtime`.
+
+### 🧪 Tests
+
+- `tests/test_review_regressions.sh` grows from 28 to 46 cases: protocol-specific conflicts and ownership, contradictory-mode side effects, leading-zero canonicalization, health exit codes, nft/iptables failures keeping old rules and snapshot read failure, LocalAPI 403, mismatched certificate pairs and unsearchable directories, backup-copy failure keeping original units, Send-Q/Recv-Q never treated as a PID, cron/timer deletion failures revoking the new scheduler, timer runtime restored on rollback, and a failed restore copy keeping the snapshot. Permission assertions that root cannot simulate are skipped as root; the LocalAPI 403 case is skipped when python3 is missing or Unix sockets are blocked. The main suite's LocalAPI probe uses a separate socket path and connects only after a ready marker, with timeouts on accept and wait and child cleanup on exit. A deliberately delayed server startup is also covered. The main suite (104 cases) passes both when Unix sockets are blocked and when they are allowed.
+
+This release folds together the working-tree versions 0.2.14–0.2.17 produced during development on 2026-10-20/21 (none of which shipped separately); see `task-list.md` in the repository root for the ledger (BUG-034–BUG-052, DOC-007–DOC-008, ADJ-015–ADJ-020).
+
+---
+
 ## [0.2.13] - 2026-10-20
 
 ### 📖 Docs & Repository Structure
@@ -656,6 +725,6 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 **Contributors**: Thanks to architects for professional advice
 
-**Update Date**: 2026-10-20
+**Update Date**: 2026-10-21
 
-**Version**: 0.2.13
+**Version**: 0.2.14

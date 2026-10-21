@@ -3,7 +3,7 @@
 > This is the detailed English reference. For the simplified Chinese quickstart now used as the main README, go to `../README.md`. For the detailed Chinese reference, see `REFERENCE_CN.md` in this folder.
 
 > **Script File**: `deploy_derper_ip_selfsigned.sh`  
-> **Current Version**: 0.2.13 (2026-10-20)  
+> **Current Version**: 0.2.14 (2026-10-21)\
 > **Show version**: `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
@@ -241,8 +241,10 @@ Common paths:
 --relax-socket-perms      Temporarily chmod tailscaled socket to 0666 (emergency only; restored on exit)
 --tls-connlimit N         Cap concurrent DERP TLS connections per source IP (nft/iptables connlimit)
                           Explicit 0 removes installed rules; omit the flag to leave existing rules
+                          A failed install keeps the previous rules and returns non-zero; a failed or partial removal with explicit 0 also returns non-zero
                           Incompatible with --health-check/--check/--dry-run
---install-healthcheck-cron  Write /etc/cron.d/derper-healthcheck (every 5 minutes --health-check)
+--install-healthcheck-cron  Install a health check every 5 minutes. With systemd, write an oneshot timer and remove the old cron; otherwise write a cron that invokes a stable copy with bash
+                          Any failed step rolls back to the previous schedule and returns non-zero; pass it during deploy or --repair, or run it alone against an existing deployment (idempotent)
                           Incompatible with --uninstall/--health-check/--check/--dry-run
 --yes, --non-interactive  Non-interactive mode; does not confirm certificate rotation
 --derper-version VER      Pin derper version (default latest); also accepts a Git commit
@@ -259,10 +261,14 @@ Common paths:
                           deployment mode rejects non-globally-routable addresses by default)
 
 # Operations & Maintenance
---health-check            Only output health check summary (no system changes, for cron/monitoring; config drift/certificate problems return non-zero)
+--health-check            Only output health check summary (no system changes, for cron/monitoring)
+                          Exit codes: 0 healthy, 1 confirmed fault; 2 is reserved for unknown and is never reported as healthy. Any non-zero means not healthy
+                          If --metrics-textfile cannot be written, the summary is still printed but the exit code is 1 and the old metrics file is left unchanged
+                          Cannot be combined with --check/--dry-run/--repair/--force/--uninstall
 --metrics-textfile <P>    Export health check as Prometheus text metrics to path P
                           (requires --health-check or --install-healthcheck-cron; use with node_exporter)
---uninstall               Stop and uninstall derper systemd service (keep binary and certificates; also removes health-check cron and --tls-connlimit rules)
+--uninstall               Stop and uninstall derper systemd service (keep binary and certificates; also removes the health-check timer/cron and --tls-connlimit rules;
+                          the health-check stable copy under /usr/local/lib/derper-deploy is kept and can be removed manually)
 --purge                   With --uninstall: additionally delete installation directory (/opt/derper)
 --purge-all               With --uninstall: on top of --purge, also delete binary, /etc/derper/derper.env, and the script-created tailscaled socket drop-in; firewall rules and user/group accounts require manual confirmation
 ```
@@ -529,7 +535,7 @@ Tip: Replace `<DERP_PORT>` with actual port (default 30399). If handshake fails,
 
 ## Monitoring & Alerting (Health Check + Prometheus)
 
-### Health Check (for cron periodic execution)
+### Health Check (for cron/timer periodic execution)
 
 ```bash
 # Only output health summary (no system changes)
@@ -545,13 +551,18 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 Exit code semantics (for shell/monitoring decision):
 
 ```text
-0  Key health items normal (service, listeners, desired configuration, and certificates are healthy, and the live certificate matches the on-disk certificate)
-1  At least one critical health check failed
+0  All key health items normal (service, listeners, desired configuration, and certificates are healthy, the live certificate matches the on-disk certificate; with -verify-clients on, tailscaled is running and LocalAPI is reachable)
+1  At least one critical health check is a confirmed failure, or --metrics-textfile could not be written
+2  Result unknown: the caller cannot read the certificate directory, or the tailscaled LocalAPI state cannot be confirmed; unknown is never reported as healthy
 ```
+
+Any non-zero status means not healthy, so an existing `if ! --health-check` guard keeps working unchanged.
 
 > 💡 **v0.2.2 Improvement**: `--metrics-textfile` write failure no longer causes script abort; outputs warning and continues execution.
 >
 > 💡 **v0.2.5 Improvement**: Health checks connect to the DERP TLS port and compare the live certificate fingerprint with the on-disk certificate, preventing false positives when a renewed certificate has not been loaded.
+>
+> 💡 **v0.2.14 Improvement**: Exit codes distinguish confirmed fault (1) from unknown (2); with `-verify-clients` on, tailscaled running state and LocalAPI authorization are part of the verdict; a mismatched certificate/key pair is detected and blocks restart; new `derper_check_unknown` and `derper_metrics_unixtime` metrics.
 
 Example (alert only on anomaly):
 
@@ -571,30 +582,51 @@ Example output (excerpt):
 ✅ Configuration: current unit uses pure IP mode
 ✅ Configuration: current unit matches requested parameters
 ✅ Certificate: live service matches the on-disk certificate
-ℹ️  Client verification: current unit enables -verify-clients
+✅ Certificate: naming is compatible with derper manual mode (<hostname>.crt/.key)
+✅ Client verification: tailscaled is running
 ✅ Certificate: 287 days remaining
 ℹ️  Resource: derper memory RSS ~3 MiB
 ```
+
+An unknown result is shown as a ⚠️ line (for example "Certificate: no permission to confirm" or "Client verification: enabled, but the current identity cannot confirm tailscaled LocalAPI") and returns exit code 2.
 
 Prometheus metrics sample (text file content):
 
 ```text
 derper_up 1
+derper_healthy 1
 derper_tls_listen 1
 derper_stun_listen 1
 derper_cert_days_remaining 287
 derper_verify_clients 1
 derper_pure_ip_config_ok 1
 derper_desired_config_ok 1
+derper_cert_live_match 1
+derper_metrics_unixtime 1792540800
+derper_check_unknown 0
 derper_process_rss_bytes 3145728
 ```
 
 Notes:
 - This script's built-in is "textfile export" method, recommended with `node_exporter`'s `--collector.textfile`;
 - If you've deployed `node_exporter` (default listens 9100), Prometheus directly scrapes its 9100 port, while enabling textfile collection of above file;
-- To change file path, adjust `node_exporter`'s `--collector.textfile.directory` parameter accordingly.
+- To change file path, adjust `node_exporter`'s `--collector.textfile.directory` parameter accordingly;
+- `derper_healthy` is 0 on any failed check or unknown result; `derper_check_unknown 1` means the result is unknown rather than a confirmed fault; a `derper_metrics_unixtime` that stops advancing means the scheduler is not running.
 
-crontab example (refresh metrics every 1 minute):
+Hands-off scheduling (recommended):
+
+```bash
+# Pass it during deploy or --repair; running it alone against an already healthy deployment only updates the schedule (idempotent)
+sudo bash scripts/deploy_derper_ip_selfsigned.sh --ip <your-public-ip> --install-healthcheck-cron \
+  --metrics-textfile /var/lib/node_exporter/textfile_collector/derper.prom
+```
+
+- With systemd it writes `derper-healthcheck.timer` + `derper-healthcheck.service` (every 5 minutes) and removes any old `/etc/cron.d/derper-healthcheck`; without systemd it writes that cron file instead.
+- The schedule calls a root-owned stable copy via `bash` (default `/usr/local/lib/derper-deploy/deploy_derper_ip_selfsigned.sh`), so a source script without the executable bit, or one moved away later, does not break it; re-running only updates this single schedule, so cron and timer never coexist.
+- Any failed install or migration step rolls back to the previous schedule and returns non-zero; a timer that was stopped or disabled before is not started.
+- Inspect with `systemctl list-timers derper-healthcheck.timer` and `journalctl -u derper-healthcheck.service`.
+
+Manual crontab example (refresh metrics every 1 minute):
 
 ```cron
 * * * * * root bash /path/scripts/deploy_derper_ip_selfsigned.sh --ip <your-public-ip> --health-check --metrics-textfile /var/lib/node_exporter/textfile_collector/derper.prom >/var/log/derper_health.log 2>&1
@@ -619,7 +651,7 @@ If temporarily unable to login, can append `--no-verify-clients` when running sc
 ## Uninstall
 
 ```bash
-# Stop and uninstall systemd service (keep binary and certificates)
+# Stop and uninstall systemd service (keep binary and certificates; also removes the health-check timer/cron and --tls-connlimit rules)
 sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall
 
 # Uninstall and cleanup installation directory (certificates etc.)
@@ -629,7 +661,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall --purge
 sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall --purge-all
 ```
 
-Note: Uninstall doesn't affect Tailscale itself (tailscaled, clients etc.). To remove together, use distro's normal method.
+Note: Uninstall doesn't affect Tailscale itself (tailscaled, clients etc.). To remove together, use distro's normal method. The health-check stable copy directory (default `/usr/local/lib/derper-deploy/`) is not removed by any uninstall level; `rm -rf` it manually once it is no longer needed.
 
 ---
 

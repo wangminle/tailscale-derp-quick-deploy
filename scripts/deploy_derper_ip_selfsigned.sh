@@ -9,8 +9,8 @@
 set -euo pipefail
 
 # 脚本自身版本（与仓库根目录 CHANGELOG_*.md、VERSION 保持同步）
-SCRIPT_VERSION="0.2.13"
-SCRIPT_VERSION_DATE="2026-10-20"
+SCRIPT_VERSION="0.2.14"
+SCRIPT_VERSION_DATE="2026-10-21"
 
 # 默认端口
 DERP_PORT="30399"        # DERP TLS 端口
@@ -152,23 +152,29 @@ usage() {
   --tls-connlimit N       限制单 IP 并发 DERP TLS 连接数（nftables/iptables connlimit）。
                           显式传 0 会移除已安装规则；省略该选项则不改动已有规则。
                           不能与 --health-check/--check/--dry-run 同时使用。
-  --install-healthcheck-cron  写入 /etc/cron.d/derper-healthcheck（每 5 分钟 --health-check）。
+  --install-healthcheck-cron  安装每 5 分钟的健康检查。有 systemd 时写 oneshot timer，并去掉旧 cron；否则用显式 bash 调用 root 管理的稳定副本写入 cron。
                           --uninstall 会删除该 cron。
                           不能与 --uninstall/--health-check/--check/--dry-run 同时使用。
   --yes, --non-interactive 非交互模式，自动确认所有选择（适合 CI/自动化脚本）。
   --check, --dry-run      仅进行状态与参数检查，不执行安装/写服务/放行端口等操作。
+                          不能与 --health-check/--repair/--force/--uninstall 同时使用。
   --repair                仅修复/重写配置（systemd/证书等），不中断可用的依赖；
                           默认不重装 derper，但若已部署二进制与目标版本不一致，
                           会重新安装以对齐（如 -verify-clients 的版本对齐）。
+                          不能与 --health-check/--check/--dry-run/--force/--uninstall 同时使用。
   --force                 强制全量重装（重新安装 derper、重签证书、重写服务）。
+                          不能与 --health-check/--check/--dry-run/--repair/--uninstall 同时使用。
   --derper-version VER    指定 derper 版本（默认 latest），例如 v1.74.1 以确保可复现构建；
                           也接受 Git commit（与 tailscaled 同源对齐时使用）。
 
   --health-check          输出健康检查摘要（适合 cron 周期探测；不更改系统）。
+                          不能与 --check/--dry-run/--repair/--force/--uninstall 同时使用。
+                          退出码：0 健康，1 已确认故障；2 保留给未知且不会被当成健康。任意非 0 都表示未通过。
   --metrics-textfile P    将健康检查结果以 Prometheus 文本格式写入到文件 P。
                           必须与 --health-check 或 --install-healthcheck-cron 一起使用；
                           建议结合 node_exporter 的 textfile collector 使用。
   --uninstall             停止并卸载 derper systemd 服务（保留二进制与证书）。
+                          不能与 --health-check/--check/--dry-run/--repair/--force 同时使用。
   --purge                 必须与 --uninstall 一起使用：额外删除 ${INSTALL_DIR}（证书等）。
   --purge-all             必须与 --uninstall 一起使用：在 --purge 基础上，同时删除 ${BIN_PATH}、
                           /etc/derper/derper.env 和脚本创建的 tailscaled socket drop-in。
@@ -514,6 +520,13 @@ validate_arg_combos() {
       err=1
     fi
   fi
+  # 部署是“未选择其他主模式”。只读检查与破坏性操作不能静默互相覆盖。
+  if [[ "${HEALTH_CHECK}" -eq 1 ]]; then
+    if [[ "${UNINSTALL}" -eq 1 || "${REPAIR}" -eq 1 || "${FORCE}" -eq 1 || "${DRY_RUN}" -eq 1 || "${CHECK_ONLY}" -eq 1 ]]; then
+      echo "[错误] --health-check 不能与 --check/--dry-run/--repair/--force/--uninstall 一起使用；这些主模式互斥。" >&2
+      err=1
+    fi
+  fi
   [[ "$err" -eq 0 ]]
 }
 
@@ -830,14 +843,17 @@ validate_settings() {
     echo "[错误] --derp-port 必须为 1-65535 的整数，当前：${DERP_PORT}" >&2
     return 1
   fi
+  DERP_PORT=$(_decimal_norm "${DERP_PORT}")
   if ! decimal_in_closed_range "${STUN_PORT}" 1 65535; then
     echo "[错误] --stun-port 必须为 1-65535 的整数，当前：${STUN_PORT}" >&2
     return 1
   fi
+  STUN_PORT=$(_decimal_norm "${STUN_PORT}")
   if ! decimal_in_closed_range "${CERT_DAYS}" 1 "${CERT_DAYS_MAX}"; then
     echo "[错误] --cert-days 必须为 1-${CERT_DAYS_MAX} 的整数，当前：${CERT_DAYS}" >&2
     return 1
   fi
+  CERT_DAYS=$(_decimal_norm "${CERT_DAYS}")
   # IPv4 合法性校验：格式 + 每段范围 0-255
   if ! [[ "${IP_ADDR}" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
     echo "[错误] 公网 IP 不合法：${IP_ADDR}" >&2
@@ -893,10 +909,9 @@ validate_settings() {
     echo "[错误] --region-id 超出 JavaScript 安全整数范围（1–9007199254740991）：${REGION_ID}" >&2
     return 1
   fi
-  local region_id_norm
-  region_id_norm=$(_decimal_norm "${REGION_ID}")
+  REGION_ID=$(_decimal_norm "${REGION_ID}")
   # 上游约定 900-999 保留给用户自建区域（位数很少，算术安全）
-  if (( 10#$region_id_norm < 900 || 10#$region_id_norm > 999 )); then
+  if (( 10#$REGION_ID < 900 || 10#$REGION_ID > 999 )); then
     echo "[警告] --region-id ${REGION_ID} 不在 900-999 范围；上游约定该范围保留给用户自建区域，建议使用 900-999。" >&2
   fi
 
@@ -910,6 +925,7 @@ validate_settings() {
     echo "[错误] --tls-connlimit 必须为 0-${TLS_CONNLIMIT_MAX} 的整数，当前：${TLS_CONNLIMIT}" >&2
     return 1
   fi
+  TLS_CONNLIMIT=$(_decimal_norm "${TLS_CONNLIMIT:-0}")
 }
 
 detect_public_ip() {
@@ -1092,6 +1108,8 @@ check_tailscale_status() {
   if [[ -S /run/tailscale/tailscaled.sock ]] || [[ -S /var/run/tailscale/tailscaled.sock ]]; then active="active"; fi
   if pgrep -x tailscaled >/dev/null 2>&1; then active="active"; fi
   [[ "$active" == "active" ]] && TS_RUNNING=1 || TS_RUNNING=0
+  TS_AUTH_UNKNOWN=0
+  TS_LOCALAPI_OK=0
   
   # 版本检查提示（非阻断）
   if [[ "${TS_INSTALLED}" -eq 1 && "${TS_VER_OK}" -eq 0 && -n "${TS_VERSION}" ]]; then
@@ -1137,12 +1155,15 @@ read_derper_unit_content() {
 
 check_ports_status() {
   PORT_TLS_OK=0; PORT_STUN_OK=0
+  local derp_port stun_port
+  derp_port=$(_decimal_norm "${DERP_PORT}")
+  stun_port=$(_decimal_norm "${STUN_PORT}")
   if command -v ss >/dev/null 2>&1; then
-    ss -ltnp 2>/dev/null | grep -E ":${DERP_PORT}([^0-9]|$)" >/dev/null 2>&1 && PORT_TLS_OK=1 || true
-    ss -lunp 2>/dev/null | grep -E ":${STUN_PORT}([^0-9]|$)" >/dev/null 2>&1 && PORT_STUN_OK=1 || true
+    ss -ltnp 2>/dev/null | grep -E ":${derp_port}([^0-9]|$)" >/dev/null 2>&1 && PORT_TLS_OK=1 || true
+    ss -lunp 2>/dev/null | grep -E ":${stun_port}([^0-9]|$)" >/dev/null 2>&1 && PORT_STUN_OK=1 || true
   elif command -v netstat >/dev/null 2>&1; then
-    netstat -ltnp 2>/dev/null | grep -E ":${DERP_PORT}([^0-9]|$)" >/dev/null 2>&1 && PORT_TLS_OK=1 || true
-    netstat -lunp 2>/dev/null | grep -E ":${STUN_PORT}([^0-9]|$)" >/dev/null 2>&1 && PORT_STUN_OK=1 || true
+    netstat -ltnp 2>/dev/null | grep -E ":${derp_port}([^0-9]|$)" >/dev/null 2>&1 && PORT_TLS_OK=1 || true
+    netstat -lunp 2>/dev/null | grep -E ":${stun_port}([^0-9]|$)" >/dev/null 2>&1 && PORT_STUN_OK=1 || true
   fi
 }
 
@@ -1275,8 +1296,8 @@ current_derper_owns_ports() {
     return 0
   fi
 
-  echo "$listeners" | grep -E ":${DERP_PORT}([^0-9]|$)" | grep -Eq "(pid[=,]|^|,)${main_pid}([^0-9]|$)|\"derper\"" || return 1
-  echo "$listeners" | grep -E ":${STUN_PORT}([^0-9]|$)" | grep -Eq "(pid[=,]|^|,)${main_pid}([^0-9]|$)|\"derper\"" || return 1
+  echo "$listeners" | listening_port_lines_stdin tcp "${DERP_PORT}" | listener_pid_field_matches "$main_pid" || return 1
+  echo "$listeners" | listening_port_lines_stdin udp "${STUN_PORT}" | listener_pid_field_matches "$main_pid" || return 1
 
   CURRENT_DERPER_OWNS_PORTS=1
   return 0
@@ -1300,21 +1321,94 @@ check_derper_status() {
   fi
   check_ports_status
   current_derper_owns_ports || true
+  note_tailscaled_auth_visibility
+}
+
+# 探测 tailscaled LocalAPI 连通性与 HTTP 状态码
+probe_tailscaled_localapi() {
+  local sock="$1" http_code=""
+  if command -v curl >/dev/null 2>&1; then
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 3 --unix-socket "$sock" "http://local-tailscaled.sock/localapi/v0/status" 2>/dev/null || echo "")
+  elif command -v python3 >/dev/null 2>&1; then
+    http_code=$(python3 -c '
+import socket, sys
+sockpath = sys.argv[1]
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(3)
+    s.connect(sockpath)
+    s.sendall(b"GET /localapi/v0/status HTTP/1.1\r\nHost: local-tailscaled.sock\r\n\r\n")
+    data = s.recv(1024).decode("latin1", "replace")
+    parts = data.split()
+    if len(parts) > 1:
+        print(parts[1])
+except Exception:
+    pass
+' "$sock" 2>/dev/null || echo "")
+  fi
+  printf '%s\n' "$http_code"
+}
+
+# verify-clients 开启时，区分 tailscaled 已停止、LocalAPI 明确拒绝和当前身份无法确认。
+note_tailscaled_auth_visibility() {
+  TS_AUTH_UNKNOWN=0
+  TS_LOCALAPI_OK=0
+  [[ "${DERPER_VERIFY_CLIENTS_EFFECTIVE:-0}" -eq 1 ]] || return 0
+  if [[ "${TS_RUNNING:-0}" -ne 1 ]]; then
+    return 0
+  fi
+  local sock
+  sock=$(expected_tailscaled_socket)
+  if [[ ! -S "$sock" || ! -r "$sock" || ! -w "$sock" ]]; then
+    TS_AUTH_UNKNOWN=1
+    return 0
+  fi
+  local http_code
+  http_code=$(probe_tailscaled_localapi "$sock")
+  if [[ "$http_code" =~ ^2[0-9]{2}$ ]]; then
+    TS_LOCALAPI_OK=1
+    TS_AUTH_UNKNOWN=0
+  elif [[ "$http_code" == "403" || "$http_code" == "401" ]]; then
+    TS_LOCALAPI_OK=0
+    TS_AUTH_UNKNOWN=0
+  else
+    TS_LOCALAPI_OK=0
+    TS_AUTH_UNKNOWN=1
+  fi
+}
+
+# 0 公钥一致，1 确认不匹配，2 无法读取或无法解析（未知，不是坏证书）。
+cert_keypair_matches() {
+  local cert="$1" key="$2" cpub kpub
+  [[ -r "$cert" && -r "$key" ]] || return 2
+  cpub=$(openssl x509 -in "$cert" -noout -pubkey 2>/dev/null) || return 2
+  kpub=$(openssl pkey -in "$key" -pubout 2>/dev/null) || return 2
+  [[ -n "$cpub" && "$cpub" == "$kpub" ]]
 }
 
 check_cert_status() {
   CERT_PRESENT=0; CERT_SAN_MATCH=0; CERT_EXPIRY_OK=0; CERT_NAMING_OK=0
+  CERT_KEY_MATCH=1; CERT_CHECK_UNKNOWN=0
+  local cert_dir="${INSTALL_DIR}/certs"
+  if [[ -e "$cert_dir" && ( ! -r "$cert_dir" || ! -x "$cert_dir" ) ]]; then
+    CERT_CHECK_UNKNOWN=1
+    return 0
+  fi
   local cert_pem key_pem
   cert_pem=$(resolve_disk_cert_pem 2>/dev/null || true)
   key_pem=$(resolve_disk_key_pem 2>/dev/null || true)
-  if [[ -n "$cert_pem" && -n "$key_pem" && -f "$cert_pem" && -f "$key_pem" ]]; then
+  if [[ -n "$cert_pem" && -n "$key_pem" && -e "$cert_pem" && -e "$key_pem" ]]; then
+    if [[ ! -r "$cert_pem" || ! -r "$key_pem" ]]; then
+      CERT_CHECK_UNKNOWN=1
+      return 0
+    fi
     CERT_PRESENT=1
     # 上游 manual 模式固定读取 <hostname>.crt/.key；旧命名视为需迁移
     if [[ -f "$(derper_manual_cert_file)" && -f "$(derper_manual_key_file)" ]]; then
       CERT_NAMING_OK=1
     fi
     if command -v openssl >/dev/null 2>&1; then
-      local san_text=""
+      local san_text="" match_rc=0
       san_text=$(openssl x509 -in "$cert_pem" -noout -ext subjectAltName 2>/dev/null || true)
       [[ -n "$san_text" ]] || san_text=$(openssl x509 -in "$cert_pem" -noout -text 2>/dev/null || true)
       if cert_text_san_has_ip "$san_text" "$IP_ADDR"; then
@@ -1322,6 +1416,14 @@ check_cert_status() {
       fi
       if openssl x509 -checkend $((30*24*3600)) -in "$cert_pem" -noout >/dev/null 2>&1; then
         CERT_EXPIRY_OK=1
+      fi
+      cert_keypair_matches "$cert_pem" "$key_pem" || match_rc=$?
+      if [[ "$match_rc" -eq 2 ]]; then
+        CERT_CHECK_UNKNOWN=1
+      elif [[ "$match_rc" -eq 0 ]]; then
+        CERT_KEY_MATCH=1
+      else
+        CERT_KEY_MATCH=0
       fi
     fi
   fi
@@ -1651,6 +1753,10 @@ refuse_symlink() {
 atomic_install_file() {
   local dest="$1" dir tmp
   refuse_symlink "$dest" || return 1
+  if [[ -d "$dest" ]]; then
+    echo "[错误] 拒绝写入：$dest 是目录，无法写入文件。" >&2
+    return 1
+  fi
   dir=$(dirname "$dest")
   tmp=$(mktemp "${dir}/.derper-unit.XXXXXX") || return 1
   if ! cat >"$tmp"; then
@@ -1947,6 +2053,27 @@ CONF
 # --repair 与默认幂等路径共用，避免 repair 把可迁移证书直接重签导致 ACL 指纹变化。
 ensure_compatible_certs() {
   CERTS_CHANGED=0
+  if [[ "${CERT_CHECK_UNKNOWN:-0}" -eq 1 ]]; then
+    echo "[错误] 无法读取证书或私钥，不能确认是否匹配，已阻止重启。" >&2
+    return 1
+  fi
+  if [[ "${CERT_KEY_MATCH:-1}" -eq 0 ]]; then
+    echo "[错误] 证书与私钥公钥不一致，已阻止重启。" >&2
+    if [[ -d "${SERVICE_PATH}.certs-rollback" ]]; then
+      if rollback_cert_update; then
+        echo "[信息] 已恢复备份中的证书对；本次不会用错误私钥重启服务。" >&2
+      else
+        echo "[错误] 证书备份恢复失败，当前保护不完整。" >&2
+      fi
+    elif [[ "${ACCEPT_CERT_ROTATION:-0}" -eq 1 ]]; then
+      generate_selfsigned_cert || return 1
+      CERTS_CHANGED=1
+      return 0
+    else
+      echo "[错误] 没有可恢复的证书备份。重签会改变指纹，确认窗口后使用 --accept-cert-rotation。" >&2
+    fi
+    return 1
+  fi
   if [[ ${CERT_PRESENT:-0} -eq 1 && ${CERT_SAN_MATCH:-0} -eq 1 && ${CERT_EXPIRY_OK:-0} -eq 1 && ${CERT_NAMING_OK:-0} -eq 1 ]]; then
     repair_cert_layout || return 1
     return 0
@@ -2167,7 +2294,7 @@ warn_world_writable_socket() {
   local perms
   perms=$(socket_mode "$sock")
   if [[ "$perms" == "666" ]]; then
-    echo "[警告] tailscaled socket ${sock} 权限为 0666（world 可写）。这是应急状态，请改用 socket unit/ACL。" >&2
+    echo "[警告] tailscaled socket ${sock} 权限为 0666。支持 peer credentials 的平台会主动使用该权限，这本身不是应急状态，也不能证明管理权限已放开；LocalAPI 另行鉴权。" >&2
   fi
 }
 
@@ -2383,19 +2510,13 @@ rollback_previous_unit() {
   return 1
 }
 
-write_systemd_service() {
-  echo "[步骤] 写入 systemd 服务单元：${SERVICE_PATH}…"
-  prepare_derper_config
+intercept_non_systemd_environment() {
+  local socket_path="$1"
   local stun_args=()
   if derper_supports_stun_port; then
     stun_args=("-stun" "-stun-port" "${STUN_PORT}")
   else
     stun_args=("-stun")
-    if [[ "${STUN_PORT}" != "3478" ]]; then
-      echo "[错误] 当前 derper 不支持 -stun-port，无法使用自定义 STUN 端口 ${STUN_PORT}。" >&2
-      echo "  请改用 --stun-port 3478，或升级 derper 后重试。" >&2
-      return 1
-    fi
   fi
 
   local listen_args=()
@@ -2407,54 +2528,63 @@ write_systemd_service() {
     listen_args=("-a" ":${DERP_PORT}")
   fi
 
-  # 根据配置决定是否启用客户端校验
   local verify_flag=""
   case "${VERIFY_CLIENTS_MODE}" in
     on) verify_flag="-verify-clients" ;;
     off) verify_flag="" ;;
   esac
 
-  # 先创建/校准运行用户，再处理 socket 权限（避免 usermod 时用户尚不存在）
+  local manual_cmd="${BIN_PATH} -c ${INSTALL_DIR}/derper.json"
+  manual_cmd+=" -hostname ${IP_ADDR} -certmode manual -certdir ${INSTALL_DIR}/certs -http-port -1"
+  manual_cmd+=" ${listen_args[*]} ${stun_args[*]}"
+  [[ -n "${verify_flag}" ]] && manual_cmd+=" ${verify_flag}"
+  if [[ -n "${verify_flag}" ]] && derper_supports_socket_flag; then
+    manual_cmd+=" -socket ${socket_path:-/run/tailscale/tailscaled.sock}"
+  fi
+  cat >&2 <<EOT
+[阻断] 未检测到 systemd，无法写入服务单元：${SERVICE_PATH}
+
+你可以手动前台运行 derper（示例）：
+  ${manual_cmd}
+
+说明：若 derper 旧版本不支持 "-a" 或 "-stun-port"，请改用 "-https-port ${DERP_PORT}"，并去掉 "-stun-port"。
+EOT
+}
+
+configure_service_user_and_socket() {
   setup_service_user
-  
-  # 检测 tailscaled socket 路径和权限（用于 verify-clients）
+
   local tailscale_socket_group=""
   local socket_needs_permission_fix=0
   local tailscaled_socket_unit_has_override=0
   local tailscaled_socket_override_group=""
   local need_add_user_to_tailscale_group=0
-  local socket_path=""  # 在函数级别初始化，避免后续引用时未定义
+  local socket_path=""
+
   if [[ "${VERIFY_CLIENTS_MODE}" == "on" ]]; then
     if [[ -S /run/tailscale/tailscaled.sock ]]; then
       socket_path="/run/tailscale/tailscaled.sock"
     elif [[ -S /var/run/tailscale/tailscaled.sock ]]; then
       socket_path="/var/run/tailscale/tailscaled.sock"
     fi
-    
+
     if [[ -n "$socket_path" ]]; then
-      # 获取 socket 的所属组和权限
       tailscale_socket_group=$(stat -c '%G' "$socket_path" 2>/dev/null || true)
       local socket_perms
       socket_perms=$(stat -c '%a' "$socket_path" 2>/dev/null || true)
 
-      # 若运行用户已能读写 socket（含 0666/world 可写），则跳过侵入式改组/重启
       if user_can_access_socket "$RUN_USER" "$socket_path"; then
         echo "[信息] ${RUN_USER} 已可访问 tailscaled socket（${socket_path}，组=${tailscale_socket_group:-?}，权限=${socket_perms:-?}），跳过权限修复。"
-        # 仍记录组名，便于 SupplementaryGroups（若用户已在该组）
       else
         socket_needs_permission_fix=1
         echo "[步骤] 配置 tailscaled socket 访问权限（当前组：${tailscale_socket_group}，权限：${socket_perms}）"
 
-        # 优先持久 socket 配置与用户 ACL；不为试探权限而重启 tailscaled。
         if [[ "$socket_needs_permission_fix" -eq 1 ]]; then
-          # 将 derper 用户加入 tailscale 组（若存在）
           if getent group tailscale >/dev/null 2>&1; then
             need_add_user_to_tailscale_group=1
             usermod -a -G tailscale "$RUN_USER" 2>/dev/null || true
           fi
-          # 优先使用 systemd 覆盖 tailscaled.socket 的组与权限（更安全、持久）
           if command -v systemctl >/dev/null 2>&1 && systemctl cat tailscaled.socket >/dev/null 2>&1; then
-            # 选择一个合适的组：优先 tailscale 组，其次 derper 组
             if getent group tailscale >/dev/null 2>&1; then
               tailscaled_socket_override_group="tailscale"
             else
@@ -2471,7 +2601,6 @@ EOF
             if restart_tailscaled_socket_unit; then
               tailscaled_socket_unit_has_override=1
               echo "[信息] 已为 tailscaled.socket 应用覆盖：SocketGroup=${tailscaled_socket_override_group} SocketMode=0660"
-              # 同步将 derper 用户加入该组（若为 tailscale 组）
               if [[ "$tailscaled_socket_override_group" == "tailscale" ]]; then
                 usermod -a -G tailscale "$RUN_USER" 2>/dev/null || true
               fi
@@ -2480,7 +2609,6 @@ EOF
             fi
           fi
 
-          # 若无法持久覆盖，尝试 ACL，失败则报错并提示解决方案
           if [[ "$tailscaled_socket_unit_has_override" -ne 1 ]]; then
             local acl_success=0
             if command -v setfacl >/dev/null 2>&1; then
@@ -2492,15 +2620,12 @@ EOF
                 echo "[警告] ACL 设置失败" >&2
               fi
             fi
-            
-            # 如果 systemd drop-in 和 ACL 都失败，检查是否需要报错
+
             if [[ "$acl_success" -ne 1 ]]; then
               if ! user_can_access_socket "$RUN_USER" "$socket_path"; then
-                # 权限不足且没有成功的解决方案
                 if [[ "$RELAX_SOCKET_PERMS" -eq 1 ]]; then
                   relax_socket_world_writable "$socket_path" || return 1
                 else
-                  # 报错并提供三种合规解决方案
                   cat >&2 <<EOT
 
 ╔══════════════════════════════════════════════════════════════════════════════╗
@@ -2541,11 +2666,11 @@ EOF
 
 方案 3：使用当前用户运行 derper（简单，适合个人环境）
   重新执行脚本并使用当前用户：
-    bash $0 --use-current-user [其他参数]
+    bash \$0 --use-current-user [其他参数]
 
 方案 4：临时放宽权限（不推荐，仅紧急情况）
   如果你了解风险，可添加 --relax-socket-perms 参数：
-    bash $0 --relax-socket-perms [其他参数]
+    bash \$0 --relax-socket-perms [其他参数]
   注意：该方案在 tailscaled 重启后失效，且存在安全风险
 
 EOT
@@ -2565,36 +2690,13 @@ EOT
     fi
   fi
 
-  # 非 systemd 环境前置拦截并给出手动运行示例
-  if ! command -v systemctl >/dev/null 2>&1; then
-    local manual_cmd="${BIN_PATH} -c ${INSTALL_DIR}/derper.json"
-    manual_cmd+=" -hostname ${IP_ADDR} -certmode manual -certdir ${INSTALL_DIR}/certs -http-port -1"
-    manual_cmd+=" ${listen_args[*]} ${stun_args[*]}"
-    [[ -n "${verify_flag}" ]] && manual_cmd+=" ${verify_flag}"
-    if [[ -n "${verify_flag}" ]] && derper_supports_socket_flag; then
-      manual_cmd+=" -socket ${socket_path:-/run/tailscale/tailscaled.sock}"
-    fi
-    cat >&2 <<EOT
-[阻断] 未检测到 systemd，无法写入服务单元：${SERVICE_PATH}
-
-你可以手动前台运行 derper（示例）：
-  ${manual_cmd}
-
-说明：若 derper 旧版本不支持 "-a" 或 "-stun-port"，请改用 "-https-port ${DERP_PORT}"，并去掉 "-stun-port"。
-EOT
-    exit 1
-  fi
-
-  # 若需要，将运行用户加入 tailscale 组（再次执行以确保用户已存在）
   if [[ "$need_add_user_to_tailscale_group" -eq 1 ]] && getent group tailscale >/dev/null 2>&1; then
     usermod -a -G tailscale "$RUN_USER" 2>/dev/null || true
   fi
-  
-  # 获取用户的组名
+
   local run_group
   run_group=$(id -g -n "$RUN_USER" 2>/dev/null || echo "$RUN_USER")
-  
-  # 构建 SupplementaryGroups 配置（用于 tailscaled socket 访问）
+
   local supplementary_groups_line=""
   local target_group_for_access=""
   if [[ -n "$tailscaled_socket_override_group" ]]; then
@@ -2606,7 +2708,45 @@ EOT
     supplementary_groups_line="SupplementaryGroups=${target_group_for_access}"
   fi
 
-  # 动态构建 ExecStart 命令参数（每个参数独立为数组元素，避免空格拼接错误）
+  SERVICE_RUN_GROUP="$run_group"
+  if [[ -n "${supplementary_groups_line}" ]]; then
+    SERVICE_SUPPLEMENTARY_GROUPS_SECTION="
+${supplementary_groups_line}"
+  else
+    SERVICE_SUPPLEMENTARY_GROUPS_SECTION=""
+  fi
+  DETECTED_SOCKET_PATH="$socket_path"
+}
+
+prepare_derper_exec_start_line() {
+  local socket_path="$1"
+  local stun_args=()
+  if derper_supports_stun_port; then
+    stun_args=("-stun" "-stun-port" "${STUN_PORT}")
+  else
+    stun_args=("-stun")
+    if [[ "${STUN_PORT}" != "3478" ]]; then
+      echo "[错误] 当前 derper 不支持 -stun-port，无法使用自定义 STUN 端口 ${STUN_PORT}。" >&2
+      echo "  请改用 --stun-port 3478，或升级 derper 后重试。" >&2
+      return 1
+    fi
+  fi
+
+  local listen_args=()
+  if derper_supports_listen_a; then
+    listen_args=("-a" ":${DERP_PORT}")
+  elif derper_supports_https_port; then
+    listen_args=("-https-port" "${DERP_PORT}")
+  else
+    listen_args=("-a" ":${DERP_PORT}")
+  fi
+
+  local verify_flag=""
+  case "${VERIFY_CLIENTS_MODE}" in
+    on) verify_flag="-verify-clients" ;;
+    off) verify_flag="" ;;
+  esac
+
   local exec_args=("${BIN_PATH}" "-c" "${INSTALL_DIR}/derper.json")
   exec_args+=("-hostname" "${IP_ADDR}")
   exec_args+=("-certmode" "manual")
@@ -2616,7 +2756,6 @@ EOT
   exec_args+=("${stun_args[@]}")
   [[ -n "${verify_flag}" ]] && exec_args+=("${verify_flag}")
 
-  # 根据 verify-clients 与已探测的 socket 路径，传入 derper 实际支持的 -socket 参数。
   if [[ "${VERIFY_CLIENTS_MODE}" == "on" ]]; then
     local chosen_socket=""
     if [[ -S /run/tailscale/tailscaled.sock ]]; then
@@ -2626,7 +2765,6 @@ EOT
     elif [[ -n "$socket_path" ]]; then
       chosen_socket="$socket_path"
     fi
-    # 即便未检测到，也显式使用常见路径。
     [[ -z "$chosen_socket" ]] && chosen_socket="/run/tailscale/tailscaled.sock"
     if derper_supports_socket_flag; then
       exec_args+=("-socket" "${chosen_socket}")
@@ -2636,10 +2774,10 @@ EOT
     fi
   fi
 
-  # 将参数数组转换为单行命令字符串
-  local exec_start_line="${exec_args[*]}"
+  DERPER_EXEC_START_LINE="${exec_args[*]}"
+}
 
-  # 根据安全级别生成加固选项
+get_security_hardening_options() {
   local hardening_basic="NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true"
@@ -2677,19 +2815,18 @@ RestrictNamespaces=true
 RemoveIPC=true
 MemoryDenyWriteExecute=true"
 
-  local hardening_options="$hardening_standard"  # 默认 standard
   case "${SECURITY_LEVEL}" in
     basic)
-      hardening_options="$hardening_basic"
-      echo "[信息] 使用 basic 安全级别（最大兼容性）"
+      echo "[信息] 使用 basic 安全级别（最大兼容性）" >&2
+      printf '%s' "$hardening_basic"
       ;;
     standard)
-      hardening_options="$hardening_standard"
-      echo "[信息] 使用 standard 安全级别（推荐）"
+      echo "[信息] 使用 standard 安全级别（推荐）" >&2
+      printf '%s' "$hardening_standard"
       ;;
     paranoid)
-      hardening_options="$hardening_paranoid"
-      echo "[信息] 使用 paranoid 安全级别（最严格加固）"
+      echo "[信息] 使用 paranoid 安全级别（最严格加固）" >&2
+      printf '%s' "$hardening_paranoid"
       ;;
     *)
       echo "[错误] 无效的安全级别：${SECURITY_LEVEL}" >&2
@@ -2697,26 +2834,11 @@ MemoryDenyWriteExecute=true"
       exit 1
       ;;
   esac
+}
 
-  # 构建 supplementary groups 行（避免空行）
-  local supplementary_groups_section=""
-  if [[ -n "${supplementary_groups_line}" ]]; then
-    supplementary_groups_section="
-${supplementary_groups_line}"
-  fi
-
-  # 写入前备份旧 unit，便于失败回滚
-  local unit_backup=""
-  refuse_symlink "${SERVICE_PATH}" || return 1
-  if [[ -f "${SERVICE_PATH}" ]]; then
-    unit_backup="${SERVICE_PATH}.bak.$(date +%Y%m%d%H%M%S)"
-    cp -a "${SERVICE_PATH}" "$unit_backup" 2>/dev/null || unit_backup=""
-    if [[ -n "$unit_backup" ]]; then
-      echo "[信息] 已备份旧 systemd 单元：$unit_backup"
-    fi
-  fi
-
-  atomic_install_file "${SERVICE_PATH}" <<SERVICE
+render_derper_service_unit() {
+  local exec_cmd="$1" run_user="$2" run_group="$3" supplementary_section="$4" hardening_opts="$5" install_dir="$6"
+  cat <<SERVICE
 [Unit]
 Description=Tailscale DERP (derper) with self-signed IP cert
 After=network-online.target tailscaled.service
@@ -2726,13 +2848,13 @@ StartLimitIntervalSec=60
 
 [Service]
 Type=simple
-User=${RUN_USER}
-Group=${run_group}${supplementary_groups_section}
+User=${run_user}
+Group=${run_group}${supplementary_section}
 
 # 环境变量（支持敏感配置）
 EnvironmentFile=-/etc/derper/derper.env
 
-ExecStart=${exec_start_line}
+ExecStart=${exec_cmd}
 Restart=on-failure
 RestartSec=2
 LimitNOFILE=65535
@@ -2742,18 +2864,32 @@ AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
 # 安全加固（级别：${SECURITY_LEVEL}）
-$hardening_options
+${hardening_opts}
 
 # 路径权限
-ReadWritePaths=${INSTALL_DIR}
+ReadWritePaths=${install_dir}
 
 [Install]
 WantedBy=multi-user.target
 SERVICE
+}
+
+deploy_and_verify_derper_service() {
+  local svc_path="$1" unit_content="$2"
+  local unit_backup=""
+  refuse_symlink "${svc_path}" || return 1
+  if [[ -f "${svc_path}" ]]; then
+    unit_backup="${svc_path}.bak.$(date +%Y%m%d%H%M%S)"
+    cp -a "${svc_path}" "$unit_backup" 2>/dev/null || unit_backup=""
+    if [[ -n "$unit_backup" ]]; then
+      echo "[信息] 已备份旧 systemd 单元：$unit_backup"
+    fi
+  fi
+
+  atomic_install_file "${svc_path}" <<<"$unit_content"
 
   systemctl daemon-reload
 
-  # 尝试启动或重启服务，确保修复/重写后的 unit 和证书立即生效。
   systemctl enable derper >/dev/null 2>&1 || true
   local was_running=0
   if systemctl is-active --quiet derper 2>/dev/null; then
@@ -2768,8 +2904,6 @@ SERVICE
     service_started=1
   fi
 
-  # start/restart 即时返回成功 ≠ 服务健康：必须验证 active/端口监听/TLS 握手/进程存活，
-  # 否则“启动后立即崩溃”会被误判为部署成功。
   if [[ "${service_started}" -eq 1 ]]; then
     if ! service_verified_running; then
       echo "[警告] 服务启动命令成功，但未通过健康验证（active/端口/TLS/进程）。" >&2
@@ -2779,17 +2913,15 @@ SERVICE
 
   if [[ "${service_started}" -ne 1 ]]; then
     echo "[警告] 服务启动失败或健康验证未通过（active/端口/TLS/进程）。" >&2
-    
-    # 检查是否是 MemoryDenyWriteExecute 导致的问题（Go 程序常见）
+
     if [[ "${SECURITY_LEVEL}" == "paranoid" ]]; then
       echo "[信息] paranoid 加固可能与当前系统不兼容，尝试禁用 MemoryDenyWriteExecute 后重试。" >&2
-      # 删除加固项，并更新注释标记，避免漂移检测把“已降级”误判为完整 paranoid
       sed -i.bak \
         -e '/^MemoryDenyWriteExecute=/d' \
         -e 's/# 安全加固（级别：paranoid）/# 安全加固（级别：paranoid；已禁用 MemoryDenyWriteExecute）/' \
-        "${SERVICE_PATH}" && rm -f "${SERVICE_PATH}.bak"
+        "${svc_path}" && rm -f "${svc_path}.bak"
       systemctl daemon-reload
-      
+
       systemctl enable derper >/dev/null 2>&1 || true
       local degraded_ok=0
       if systemctl restart derper 2>/dev/null || systemctl start derper 2>/dev/null; then
@@ -2846,10 +2978,9 @@ EOT
       exit 1
     fi
   fi
-  
+
   systemctl status derper --no-pager -l || true
-  
-  # 显示安全评分（如果可用）
+
   if command -v systemd-analyze >/dev/null 2>&1; then
     echo ""
     echo "[信息] systemd 安全评分："
@@ -2857,16 +2988,97 @@ EOT
   fi
 }
 
+write_systemd_service() {
+  echo "[步骤] 写入 systemd 服务单元：${SERVICE_PATH}…"
+  prepare_derper_config
+
+  local DETECTED_SOCKET_PATH="" SERVICE_RUN_GROUP="" SERVICE_SUPPLEMENTARY_GROUPS_SECTION=""
+  configure_service_user_and_socket || return 1
+
+  # 非 systemd 环境前置拦截并给出手动运行示例
+  if ! command -v systemctl >/dev/null 2>&1; then
+    intercept_non_systemd_environment "$DETECTED_SOCKET_PATH"
+    exit 1
+  fi
+
+  local DERPER_EXEC_START_LINE=""
+  prepare_derper_exec_start_line "$DETECTED_SOCKET_PATH" || return 1
+
+  local hardening_options
+  hardening_options=$(get_security_hardening_options)
+
+  local unit_content
+  unit_content=$(render_derper_service_unit "$DERPER_EXEC_START_LINE" "$RUN_USER" "$SERVICE_RUN_GROUP" "$SERVICE_SUPPLEMENTARY_GROUPS_SECTION" "$hardening_options" "$INSTALL_DIR")
+
+  deploy_and_verify_derper_service "${SERVICE_PATH}" "$unit_content"
+}
+
+iptables_append_connlimit() {
+  local chain="$1"
+  iptables -A "$chain" -p tcp --dport "${DERP_PORT}" \
+    -m connlimit --connlimit-above "${TLS_CONNLIMIT}" --connlimit-mask 32 \
+    -j REJECT --reject-with tcp-reset
+}
+
+discard_iptables_connlimit_staging() {
+  local staging="$1"
+  iptables -F "$staging" 2>/dev/null || true
+  iptables -X "$staging" 2>/dev/null || true
+}
+
+# 回放 iptables -S 保存的规则。调用方处于条件表达式中，必须显式检查返回值。
+restore_iptables_connlimit_snapshot() {
+  local chain="$1" snapshot="$2" chain_existed="$3"
+  if [[ "$chain_existed" -eq 0 ]]; then
+    iptables -F "$chain" 2>/dev/null || true
+    iptables -X "$chain" 2>/dev/null || return 1
+    return 0
+  fi
+  iptables -F "$chain" || return 1
+  local line rc=0
+  while IFS= read -r line; do
+    [[ "$line" == "-A ${chain} "* || "$line" == "-A ${chain}" ]] || continue
+    set -f
+    # shellcheck disable=SC2086
+    iptables $line
+    rc=$?
+    set +f
+    [[ "$rc" -eq 0 ]] || return 1
+  done <<<"$snapshot"
+  return 0
+}
+
 apply_tls_connlimit_nft() {
   local table="${NFT_CONNLIMIT_TABLE}"
-  nft list table inet "${table}" >/dev/null 2>&1 || nft add table inet "${table}"
-  nft list chain inet "${table}" input >/dev/null 2>&1 \
-    || nft "add chain inet ${table} input { type filter hook input priority 0; policy accept; }"
-  nft flush chain inet "${table}" input 2>/dev/null || true
-  nft add rule inet "${table}" input tcp dport "${DERP_PORT}" ct state new \
-    meter derper_tls \{ ip saddr ct count over "${TLS_CONNLIMIT}" \} counter drop \
-    comment \"derper-tls-connlimit\"
-  remove_legacy_nft_derper_connlimit_rules
+  local rule batch
+  rule="add rule inet ${table} input tcp dport ${DERP_PORT} ct state new meter derper_tls { ip saddr ct count over ${TLS_CONNLIMIT} } counter drop comment \"derper-tls-connlimit\""
+  if ! nft list table inet "${table}" >/dev/null 2>&1; then
+    batch=$(cat <<EOF
+add table inet ${table}
+add chain inet ${table} input { type filter hook input priority 0; policy accept; }
+${rule}
+EOF
+)
+  elif ! nft list chain inet "${table}" input >/dev/null 2>&1; then
+    batch=$(cat <<EOF
+add chain inet ${table} input { type filter hook input priority 0; policy accept; }
+${rule}
+EOF
+)
+  else
+    # flush 与 add rule 放进同一次 nft -f，提交失败时内核回滚，旧规则保持原样。
+    batch=$(cat <<EOF
+flush chain inet ${table} input
+${rule}
+EOF
+)
+  fi
+  if ! nft -f - <<<"$batch"; then
+    echo "[错误] nft 限流规则提交失败，已有规则保持原样。" >&2
+    return 1
+  fi
+  remove_legacy_nft_derper_connlimit_rules || true
+  return 0
 }
 
 # 旧版误用 inet derper 表：只按 comment 删除本脚本规则，绝不 flush/删除该表。
@@ -2880,12 +3092,72 @@ remove_legacy_nft_derper_connlimit_rules() {
 }
 
 apply_tls_connlimit_iptables() {
-  iptables -N DERPER-CONNLIMIT 2>/dev/null || true
-  iptables -F DERPER-CONNLIMIT
-  iptables -C INPUT -j DERPER-CONNLIMIT 2>/dev/null || iptables -I INPUT -j DERPER-CONNLIMIT
-  iptables -A DERPER-CONNLIMIT -p tcp --dport "${DERP_PORT}" \
-    -m connlimit --connlimit-above "${TLS_CONNLIMIT}" --connlimit-mask 32 \
-    -j REJECT --reject-with tcp-reset
+  local chain="DERPER-CONNLIMIT"
+  local staging="${chain}-NEW"
+  local snapshot="" chain_existed=0 jump_existed=0
+  if iptables -S "$chain" >/dev/null 2>&1; then
+    chain_existed=1
+    if ! snapshot=$(iptables -S "$chain" 2>/dev/null); then
+      discard_iptables_connlimit_staging "$staging"
+      echo "[错误] 无法读取既有 iptables 限流规则快照，已有规则保持原样。" >&2
+      return 1
+    fi
+  fi
+  if iptables -C INPUT -j "$chain" >/dev/null 2>&1; then
+    jump_existed=1
+  fi
+
+  discard_iptables_connlimit_staging "$staging"
+  if ! iptables -N "$staging"; then
+    echo "[错误] 无法准备 iptables 限流临时链，已有规则保持原样。" >&2
+    return 1
+  fi
+  if ! iptables_append_connlimit "$staging"; then
+    discard_iptables_connlimit_staging "$staging"
+    echo "[错误] iptables 限流规则未能装入临时链，已有规则保持原样。" >&2
+    return 1
+  fi
+
+  if [[ "$chain_existed" -eq 0 ]]; then
+    if ! iptables -N "$chain"; then
+      discard_iptables_connlimit_staging "$staging"
+      echo "[错误] 无法创建 iptables 限流链，已有规则保持原样。" >&2
+      return 1
+    fi
+  elif ! iptables -F "$chain"; then
+    discard_iptables_connlimit_staging "$staging"
+    echo "[错误] 无法更新 iptables 限流链，已有规则保持原样。" >&2
+    return 1
+  fi
+
+  if ! iptables_append_connlimit "$chain"; then
+    if ! restore_iptables_connlimit_snapshot "$chain" "$snapshot" "$chain_existed"; then
+      discard_iptables_connlimit_staging "$staging"
+      echo "[错误] iptables 限流规则安装失败，且旧规则恢复失败，当前保护不完整。" >&2
+      return 1
+    fi
+    discard_iptables_connlimit_staging "$staging"
+    echo "[错误] iptables 限流规则安装失败，已恢复旧规则。" >&2
+    return 1
+  fi
+
+  if [[ "$jump_existed" -eq 0 ]]; then
+    if ! iptables -C INPUT -j "$chain" >/dev/null 2>&1; then
+      if ! iptables -I INPUT -j "$chain"; then
+        if ! restore_iptables_connlimit_snapshot "$chain" "$snapshot" "$chain_existed"; then
+          discard_iptables_connlimit_staging "$staging"
+          echo "[错误] iptables 限流跳转安装失败，且旧规则恢复失败，当前保护不完整。" >&2
+          return 1
+        fi
+        discard_iptables_connlimit_staging "$staging"
+        echo "[错误] iptables 限流跳转安装失败，已恢复旧规则。" >&2
+        return 1
+      fi
+    fi
+  fi
+
+  discard_iptables_connlimit_staging "$staging"
+  return 0
 }
 
 apply_tls_connlimit() {
@@ -2893,9 +3165,9 @@ apply_tls_connlimit() {
   if _decimal_ge "${TLS_CONNLIMIT:-0}" 1; then
     echo "[步骤] 安装单 IP TLS 连接上限：${TLS_CONNLIMIT}"
     if command -v nft >/dev/null 2>&1; then
-      apply_tls_connlimit_nft
+      apply_tls_connlimit_nft || return 1
     elif command -v iptables >/dev/null 2>&1; then
-      apply_tls_connlimit_iptables
+      apply_tls_connlimit_iptables || return 1
     else
       echo "[错误] --tls-connlimit 需要 nft 或 iptables。" >&2
       return 1
@@ -2904,20 +3176,84 @@ apply_tls_connlimit() {
   fi
   if [[ "${TLS_CONNLIMIT_EXPLICIT:-0}" -eq 1 ]]; then
     echo "[步骤] --tls-connlimit 0：移除已安装的 TLS 连接上限规则"
-    remove_tls_connlimit
+    remove_tls_connlimit || return 1
     return 0
   fi
 }
 
 remove_tls_connlimit() {
+  local attempted=0 failed=0 err_file rc=0
+  err_file=$(mktemp 2>/dev/null || true)
   if command -v nft >/dev/null 2>&1; then
-    nft delete table inet "${NFT_CONNLIMIT_TABLE}" 2>/dev/null || true
-    remove_legacy_nft_derper_connlimit_rules
+    attempted=$((attempted + 1))
+    rc=0
+    if [[ -n "$err_file" ]]; then
+      nft delete table inet "${NFT_CONNLIMIT_TABLE}" >/dev/null 2>"$err_file" || rc=$?
+    else
+      nft delete table inet "${NFT_CONNLIMIT_TABLE}" >/dev/null 2>&1 || rc=$?
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+      local err=""
+      [[ -n "$err_file" && -f "$err_file" ]] && err=$(cat "$err_file")
+      if [[ "$err" != *"No such file or directory"* && "$err" != *"no such table"* ]]; then
+        failed=$((failed + 1))
+      fi
+    fi
+    remove_legacy_nft_derper_connlimit_rules || true
   fi
   if command -v iptables >/dev/null 2>&1; then
-    iptables -D INPUT -j DERPER-CONNLIMIT 2>/dev/null || true
-    iptables -F DERPER-CONNLIMIT 2>/dev/null || true
-    iptables -X DERPER-CONNLIMIT 2>/dev/null || true
+    attempted=$((attempted + 1))
+    local ipt_fail=0
+    rc=0
+    if [[ -n "$err_file" ]]; then
+      iptables -D INPUT -j DERPER-CONNLIMIT >/dev/null 2>"$err_file" || rc=$?
+    else
+      iptables -D INPUT -j DERPER-CONNLIMIT >/dev/null 2>&1 || rc=$?
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+      local err=""
+      [[ -n "$err_file" && -f "$err_file" ]] && err=$(cat "$err_file")
+      if [[ "$err" != *"Bad rule"* && "$err" != *"No chain"* ]]; then
+        ipt_fail=$((ipt_fail + 1))
+      fi
+    fi
+
+    rc=0
+    if [[ -n "$err_file" ]]; then
+      iptables -F DERPER-CONNLIMIT >/dev/null 2>"$err_file" || rc=$?
+    else
+      iptables -F DERPER-CONNLIMIT >/dev/null 2>&1 || rc=$?
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+      local err=""
+      [[ -n "$err_file" && -f "$err_file" ]] && err=$(cat "$err_file")
+      if [[ "$err" != *"No chain"* ]]; then
+        ipt_fail=$((ipt_fail + 1))
+      fi
+    fi
+
+    rc=0
+    if [[ -n "$err_file" ]]; then
+      iptables -X DERPER-CONNLIMIT >/dev/null 2>"$err_file" || rc=$?
+    else
+      iptables -X DERPER-CONNLIMIT >/dev/null 2>&1 || rc=$?
+    fi
+    if [[ "$rc" -ne 0 ]]; then
+      local err=""
+      [[ -n "$err_file" && -f "$err_file" ]] && err=$(cat "$err_file")
+      if [[ "$err" != *"No chain"* ]]; then
+        ipt_fail=$((ipt_fail + 1))
+      fi
+    fi
+
+    if [[ "$ipt_fail" -gt 0 ]]; then
+      failed=$((failed + 1))
+    fi
+  fi
+  [[ -n "$err_file" ]] && rm -f "$err_file"
+  if [[ "$failed" -gt 0 ]]; then
+    echo "[错误] 移除 TLS 限流规则失败，可能残留部分防护规则。" >&2
+    return 1
   fi
   return 0
 }
@@ -2939,22 +3275,23 @@ script_self_path() {
   (cd "$(dirname "$src")" && printf '%s/%s\n' "$(pwd -P)" "$(basename "$src")")
 }
 
-install_healthcheck_cron() {
-  local self ip metrics
-  self=$(script_self_path)
-  if [[ ! -f "$self" ]]; then
-    echo "[错误] 无法定位可重复执行的脚本文件（当前路径：${self}）。curl | bash 无法写入可靠 cron，请先把脚本保存到磁盘后再使用 --install-healthcheck-cron。" >&2
-    return 1
+systemd_escape_arg() {
+  local arg="$1"
+  if [[ "$arg" =~ ^[a-zA-Z0-9_./:-]+$ ]]; then
+    printf '%s' "$arg"
+  else
+    local escaped="${arg//\\/\\\\}"
+    escaped="${escaped//\"/\\\"}"
+    printf '"%s"' "$escaped"
   fi
-  ip="${IP_ADDR:-}"
-  [[ -n "$ip" ]] || { echo "[错误] 安装健康检查 cron 需要 --ip 或已探测到公网 IP。" >&2; return 1; }
-  metrics="${METRICS_TEXTFILE:-${HEALTHCHECK_CRON_METRICS_DEFAULT}}"
-  mkdir -p "$(dirname "$HEALTHCHECK_CRON_PATH")"
-  local cron_self cron_ip cron_metrics
-  cron_self=$(printf '%q' "$self")
+}
+
+render_healthcheck_commands() {
+  local prog="$1" ip="$2" metrics="$3"
+  local cron_prog cron_ip cron_metrics cron_port cron_stun cron_level cron_verify
+  cron_prog=$(printf '%q' "$prog")
   cron_ip=$(printf '%q' "$ip")
   cron_metrics=$(printf '%q' "$metrics")
-  local cron_port cron_stun cron_level cron_verify
   cron_port=$(printf '%q' "${DERP_PORT}")
   cron_stun=$(printf '%q' "${STUN_PORT}")
   cron_level=$(printf '%q' "${SECURITY_LEVEL}")
@@ -2963,20 +3300,333 @@ install_healthcheck_cron() {
   else
     cron_verify="--force-verify-clients"
   fi
-  cat >"$HEALTHCHECK_CRON_PATH" <<EOF
+  BASH_HEALTHCHECK_CMD="bash ${cron_prog} --health-check --ip ${cron_ip} --derp-port ${cron_port} --stun-port ${cron_stun} --security-level ${cron_level} ${cron_verify} --metrics-textfile ${cron_metrics}"
+
+  local sys_prog sys_ip sys_metrics sys_port sys_stun sys_level
+  sys_prog=$(systemd_escape_arg "$prog")
+  sys_ip=$(systemd_escape_arg "$ip")
+  sys_metrics=$(systemd_escape_arg "$metrics")
+  sys_port=$(systemd_escape_arg "${DERP_PORT}")
+  sys_stun=$(systemd_escape_arg "${STUN_PORT}")
+  sys_level=$(systemd_escape_arg "${SECURITY_LEVEL}")
+  SYSTEMD_HEALTHCHECK_EXEC="/bin/bash ${sys_prog} --health-check --ip ${sys_ip} --derp-port ${sys_port} --stun-port ${sys_stun} --security-level ${sys_level} ${cron_verify} --metrics-textfile ${sys_metrics}"
+}
+
+render_healthcheck_units() {
+  local svc_path="$1" timer_path="$2" sys_exec="$3"
+  cat >"$svc_path" <<EOF
+[Unit]
+Description=DERP health check
+[Service]
+Type=oneshot
+ExecStart=${sys_exec}
+EOF
+
+  cat >"$timer_path" <<EOF
+[Unit]
+Description=Run DERP health check every 5 minutes
+[Timer]
+OnCalendar=*:0/5
+Persistent=true
+Unit=derper-healthcheck.service
+[Install]
+WantedBy=timers.target
+EOF
+}
+
+render_healthcheck_cron_file() {
+  local cron_path="$1" bash_cmd="$2"
+  cat >"$cron_path" <<EOF
 # Managed by deploy_derper_ip_selfsigned.sh. Re-run --install-healthcheck-cron to refresh.
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-*/5 * * * * root ${cron_self} --health-check --ip ${cron_ip} --derp-port ${cron_port} --stun-port ${cron_stun} --security-level ${cron_level} ${cron_verify} --metrics-textfile ${cron_metrics} >/dev/null 2>&1
+*/5 * * * * root ${bash_cmd} >/dev/null 2>&1
 EOF
-  chmod 644 "$HEALTHCHECK_CRON_PATH"
-  echo "[信息] 已安装健康检查 cron：${HEALTHCHECK_CRON_PATH}（每 5 分钟，--ip ${ip}）"
+}
+
+# 备份必须区分「原文件不存在」和「复制失败」。复制失败时不得进入会删原文件的回滚。
+snapshot_healthcheck_file() {
+  local src="$1" bak="$2" missing="$3"
+  rm -f "$bak" "$missing" 2>/dev/null || true
+  if [[ ! -e "$src" ]]; then
+    : >"$missing" || return 1
+    return 0
+  fi
+  if ! cp -f "$src" "$bak" || ! [[ -f "$bak" ]]; then
+    echo "[错误] 无法备份已有调度文件：${src}。已中止更新，原文件保持不变。" >&2
+    return 1
+  fi
+  if command -v cmp >/dev/null 2>&1; then
+    if ! cmp -s "$src" "$bak"; then
+      echo "[错误] 无法备份已有调度文件：${src}。已中止更新，原文件保持不变。" >&2
+      return 1
+    fi
+  elif [[ "$(wc -c <"$src")" != "$(wc -c <"$bak")" ]]; then
+    echo "[错误] 无法备份已有调度文件：${src}。已中止更新，原文件保持不变。" >&2
+    return 1
+  fi
+  return 0
+}
+
+restore_healthcheck_snapshot() {
+  local path="$1" bak="$2" missing="$3" mode="${4:-}"
+  if [[ -f "$bak" ]]; then
+    if ! cp -f "$bak" "$path"; then
+      echo "[错误] 无法从备份恢复 ${path}，已保留快照 ${bak}。" >&2
+      return 1
+    fi
+    if [[ -n "$mode" ]] && ! chmod "$mode" "$path"; then
+      echo "[错误] 无法恢复 ${path} 的权限，已保留快照 ${bak}。" >&2
+      return 1
+    fi
+    return 0
+  fi
+  if [[ -f "$missing" && -e "$path" ]] && ! rm -f "$path"; then
+    echo "[错误] 无法删除本次新增的 ${path}，已保留快照。" >&2
+    return 1
+  fi
+  return 0
+}
+
+# 在修改调度前记录两个独立状态，更新已有 timer 和迁移到 cron 共用。
+snapshot_timer_runtime() {
+  local tx_dir="$1"
+  if systemctl is-active --quiet derper-healthcheck.timer 2>/dev/null; then
+    : >"${tx_dir}/timer.was-active" || return 1
+  fi
+  if systemctl is-enabled --quiet derper-healthcheck.timer 2>/dev/null; then
+    : >"${tx_dir}/timer.was-enabled" || return 1
+  fi
+  : >"${tx_dir}/timer.runtime-recorded" || return 1
+}
+
+# active 与 enabled 分别恢复，原本停止或禁用的 timer 不会被回滚拉起。
+restore_recorded_timer_runtime() {
+  local tx_dir="$1"
+  [[ -f "${tx_dir}/timer.runtime-recorded" ]] || return 0
+  command -v systemctl >/dev/null 2>&1 || return 1
+  if [[ -f "${tx_dir}/timer.was-enabled" ]]; then
+    systemctl enable derper-healthcheck.timer >/dev/null 2>&1 || return 1
+  else
+    systemctl disable derper-healthcheck.timer >/dev/null 2>&1 || return 1
+  fi
+  if [[ -f "${tx_dir}/timer.was-active" ]]; then
+    systemctl start derper-healthcheck.timer >/dev/null 2>&1 || return 1
+  else
+    systemctl stop derper-healthcheck.timer >/dev/null 2>&1 || return 1
+  fi
+}
+
+rollback_healthcheck_transaction() {
+  local tx_dir="$1" dest="$2" stable="$3" svc_file="$4" timer_file="$5" cron_file="$6"
+  local failed=0 units_changed=0
+  if [[ -z "$tx_dir" || ! -d "$tx_dir" ]]; then
+    return 0
+  fi
+  if [[ -f "${tx_dir}/timer.activation-attempted" && ( -f "${tx_dir}/timer.missing" || -f "${tx_dir}/svc.missing" ) ]] && command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now derper-healthcheck.timer >/dev/null 2>&1 || failed=1
+  fi
+  restore_healthcheck_snapshot "$svc_file" "${tx_dir}/svc.bak" "${tx_dir}/svc.missing" || failed=1
+  restore_healthcheck_snapshot "$timer_file" "${tx_dir}/timer.bak" "${tx_dir}/timer.missing" || failed=1
+  if [[ -f "${tx_dir}/svc.bak" || -f "${tx_dir}/timer.bak" || -f "${tx_dir}/svc.missing" || -f "${tx_dir}/timer.missing" ]]; then
+    units_changed=1
+  fi
+  if [[ "$units_changed" -eq 1 ]] && command -v systemctl >/dev/null 2>&1; then
+    if ! systemctl daemon-reload >/dev/null 2>&1; then
+      echo "[错误] 回滚后 systemctl daemon-reload 失败，已保留快照：${tx_dir}" >&2
+      failed=1
+    fi
+  fi
+
+  restore_healthcheck_snapshot "$dest" "${tx_dir}/dest.bak" "${tx_dir}/dest.missing" 755 || failed=1
+  restore_healthcheck_snapshot "$cron_file" "${tx_dir}/cron.bak" "${tx_dir}/cron.missing" 644 || failed=1
+  restore_healthcheck_snapshot "${stable}/status" "${tx_dir}/status.bak" "${tx_dir}/status.missing" || failed=1
+  if [[ "$failed" -eq 0 ]] && ! restore_recorded_timer_runtime "$tx_dir"; then
+    echo "[错误] 无法恢复原 timer 运行状态，已保留快照：${tx_dir}" >&2
+    failed=1
+  fi
+  if [[ "$failed" -ne 0 ]]; then
+    echo "[错误] 调度回滚不完整，已保留快照目录：${tx_dir}" >&2
+    return 1
+  fi
+  rm -rf "$tx_dir" 2>/dev/null || true
+  return 0
+}
+
+finish_healthcheck_rollback() {
+  local reason="$1"
+  shift
+  if rollback_healthcheck_transaction "$@"; then
+    echo "[错误] ${reason}，已有调度保持原样。" >&2
+  else
+    echo "[错误] ${reason}，回滚不完整，已保留快照，请手工恢复。" >&2
+  fi
+  return 1
+}
+
+install_healthcheck_cron() {
+  local self ip metrics stable dest
+  self=$(script_self_path)
+  if [[ ! -f "$self" ]]; then
+    echo "[错误] 无法定位可重复执行的脚本文件（当前路径：${self}）。curl | bash 无法写入可靠 cron，请先把脚本保存到磁盘后再使用 --install-healthcheck-cron。" >&2
+    return 1
+  fi
+  ip="${IP_ADDR:-}"
+  [[ -n "$ip" ]] || { echo "[错误] 安装健康检查 cron 需要 --ip 或已探测到公网 IP。" >&2; return 1; }
+  metrics="${METRICS_TEXTFILE:-${HEALTHCHECK_CRON_METRICS_DEFAULT}}"
+  if [[ -n "${HEALTHCHECK_PROGRAM_DIR:-}" ]]; then
+    stable="${HEALTHCHECK_PROGRAM_DIR}"
+  elif mkdir -p /usr/local/lib/derper-deploy 2>/dev/null && [[ -w /usr/local/lib/derper-deploy ]]; then
+    stable=/usr/local/lib/derper-deploy
+  else
+    stable="$(dirname "$HEALTHCHECK_CRON_PATH")/derper-healthcheck-program"
+  fi
+  mkdir -p "$stable" || return 1
+  dest="${stable}/deploy_derper_ip_selfsigned.sh"
+
+  local BASH_HEALTHCHECK_CMD="" SYSTEMD_HEALTHCHECK_EXEC=""
+  render_healthcheck_commands "$dest" "$ip" "$metrics"
+
+  local unit_dir="${HEALTHCHECK_UNIT_DIR:-/etc/systemd/system}"
+  local svc_file="${unit_dir}/derper-healthcheck.service"
+  local timer_file="${unit_dir}/derper-healthcheck.timer"
+  local cron_file="${HEALTHCHECK_CRON_PATH}"
+
+  local use_timer=0
+  if command -v systemctl >/dev/null 2>&1 && mkdir -p "$unit_dir" 2>/dev/null && [[ -w "$unit_dir" ]]; then
+    use_timer=1
+  fi
+
+  local tx_dir=""
+  tx_dir=$(mktemp -d "${stable}/.healthcheck-tx.XXXXXX" 2>/dev/null || mktemp -d 2>/dev/null || true)
+  if [[ -z "$tx_dir" || ! -d "$tx_dir" ]]; then
+    echo "[错误] 无法创建调度备份目录，已中止更新，原文件保持不变。" >&2
+    return 1
+  fi
+  if [[ -n "$tx_dir" && -d "$tx_dir" ]]; then
+    if ! snapshot_healthcheck_file "$dest" "${tx_dir}/dest.bak" "${tx_dir}/dest.missing" \
+      || ! snapshot_healthcheck_file "${stable}/status" "${tx_dir}/status.bak" "${tx_dir}/status.missing" \
+      || ! snapshot_healthcheck_file "$cron_file" "${tx_dir}/cron.bak" "${tx_dir}/cron.missing"; then
+      rm -rf "$tx_dir" 2>/dev/null || true
+      return 1
+    fi
+    if [[ "$use_timer" -eq 1 || -e "$svc_file" || -e "$timer_file" ]]; then
+      if ! snapshot_healthcheck_file "$svc_file" "${tx_dir}/svc.bak" "${tx_dir}/svc.missing" \
+        || ! snapshot_healthcheck_file "$timer_file" "${tx_dir}/timer.bak" "${tx_dir}/timer.missing"; then
+        rm -rf "$tx_dir" 2>/dev/null || true
+        return 1
+      fi
+    fi
+  fi
+
+  if [[ -n "$tx_dir" && ( -e "$svc_file" || -e "$timer_file" ) ]] && command -v systemctl >/dev/null 2>&1; then
+    if ! snapshot_timer_runtime "$tx_dir"; then
+      echo "[错误] 无法记录原 timer 状态，已中止更新，原文件保持不变。" >&2
+      rm -rf "$tx_dir" 2>/dev/null || true
+      return 1
+    fi
+  fi
+
+  # 写入稳定运行程序副本
+  local dest_tmp
+  dest_tmp=$(mktemp "${stable}/.deploy_derper_ip_selfsigned.XXXXXX" 2>/dev/null || true)
+  [[ -z "$dest_tmp" ]] && dest_tmp="${dest}.tmp.$$"
+  if ! cp -f "$self" "$dest_tmp" 2>/dev/null || ! chmod 755 "$dest_tmp" 2>/dev/null || ! mv -f "$dest_tmp" "$dest" 2>/dev/null; then
+    rm -f "$dest_tmp" 2>/dev/null || true
+    finish_healthcheck_rollback "无法安装健康检查稳定副本程序" "$tx_dir" "$dest" "$stable" "$svc_file" "$timer_file" "$cron_file" || return 1
+  fi
+
+  if [[ "$use_timer" -eq 1 ]]; then
+    if [[ -d "$svc_file" || -d "$timer_file" ]]; then
+      finish_healthcheck_rollback "无法安装 healthcheck unit：路径是目录（${svc_file}）" "$tx_dir" "$dest" "$stable" "$svc_file" "$timer_file" "$cron_file" || return 1
+    fi
+
+    local svc_tmp timer_tmp
+    svc_tmp=$(mktemp "${unit_dir}/.derper-healthcheck.service.XXXXXX" 2>/dev/null) || {
+      finish_healthcheck_rollback "无法写入 healthcheck service 临时文件" "$tx_dir" "$dest" "$stable" "$svc_file" "$timer_file" "$cron_file" || return 1
+    }
+    timer_tmp=$(mktemp "${unit_dir}/.derper-healthcheck.timer.XXXXXX" 2>/dev/null) || {
+      rm -f "$svc_tmp"
+      finish_healthcheck_rollback "无法写入 healthcheck timer 临时文件" "$tx_dir" "$dest" "$stable" "$svc_file" "$timer_file" "$cron_file" || return 1
+    }
+
+    render_healthcheck_units "$svc_tmp" "$timer_tmp" "$SYSTEMD_HEALTHCHECK_EXEC"
+
+    if ! mv -f "$svc_tmp" "$svc_file" 2>/dev/null; then
+      rm -f "$svc_tmp" "$timer_tmp"
+      finish_healthcheck_rollback "无法安装 healthcheck service unit 文件" "$tx_dir" "$dest" "$stable" "$svc_file" "$timer_file" "$cron_file" || return 1
+    fi
+    if ! mv -f "$timer_tmp" "$timer_file" 2>/dev/null; then
+      rm -f "$timer_tmp"
+      finish_healthcheck_rollback "无法安装 healthcheck timer unit 文件" "$tx_dir" "$dest" "$stable" "$svc_file" "$timer_file" "$cron_file" || return 1
+    fi
+
+    if ! systemctl daemon-reload; then
+      finish_healthcheck_rollback "systemctl daemon-reload 失败，已撤销 timer 文件" "$tx_dir" "$dest" "$stable" "$svc_file" "$timer_file" "$cron_file" || return 1
+    fi
+
+    if ! : >"${tx_dir}/timer.activation-attempted"; then
+      finish_healthcheck_rollback "无法记录新 timer 的启用尝试" "$tx_dir" "$dest" "$stable" "$svc_file" "$timer_file" "$cron_file" || return 1
+    fi
+    if ! systemctl enable --now derper-healthcheck.timer; then
+      finish_healthcheck_rollback "无法启用 derper-healthcheck.timer，已尝试撤销 timer 文件" "$tx_dir" "$dest" "$stable" "$svc_file" "$timer_file" "$cron_file" || return 1
+    fi
+
+    if [[ -e "${cron_file}" ]]; then
+      rm -f "${cron_file}" 2>/dev/null || true
+      if [[ -e "${cron_file}" ]]; then
+        finish_healthcheck_rollback "无法删除旧 cron（${cron_file}），已尝试撤销新 timer，避免双重调度" "$tx_dir" "$dest" "$stable" "$svc_file" "$timer_file" "$cron_file" || return 1
+      fi
+    fi
+    printf 'scheduler=timer\nprogram=%s\ncommand=%s\n' "$dest" "$BASH_HEALTHCHECK_CMD" >"${stable}/status"
+    [[ -n "$tx_dir" ]] && rm -rf "$tx_dir" 2>/dev/null || true
+    echo "[信息] 已安装健康检查 timer：${unit_dir}/derper-healthcheck.timer（每 5 分钟，显式 bash 调用稳定副本）"
+    return 0
+  fi
+
+  # cron 分支
+  if [[ -d "$cron_file" ]]; then
+    finish_healthcheck_rollback "无法安装 healthcheck cron：路径是目录（${cron_file}）" "$tx_dir" "$dest" "$stable" "$svc_file" "$timer_file" "$cron_file" || return 1
+  fi
+  local cron_dir cron_tmp
+  cron_dir="$(dirname "$cron_file")"
+  mkdir -p "$cron_dir" || {
+    finish_healthcheck_rollback "无法创建 healthcheck cron 目录" "$tx_dir" "$dest" "$stable" "$svc_file" "$timer_file" "$cron_file" || return 1
+  }
+  cron_tmp=$(mktemp "${cron_dir}/.derper-healthcheck.cron.XXXXXX" 2>/dev/null || true)
+  [[ -z "$cron_tmp" ]] && cron_tmp="${cron_file}.tmp.$$"
+  render_healthcheck_cron_file "$cron_tmp" "$BASH_HEALTHCHECK_CMD"
+  chmod 644 "$cron_tmp" 2>/dev/null || true
+  if ! mv -f "$cron_tmp" "$cron_file" 2>/dev/null; then
+    rm -f "$cron_tmp" 2>/dev/null || true
+    finish_healthcheck_rollback "无法写入 healthcheck cron 文件" "$tx_dir" "$dest" "$stable" "$svc_file" "$timer_file" "$cron_file" || return 1
+  fi
+  printf 'scheduler=cron\nprogram=%s\ncommand=%s\n' "$dest" "$BASH_HEALTHCHECK_CMD" >"${stable}/status"
+  if [[ -e "$timer_file" || -e "$svc_file" ]]; then
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl disable --now derper-healthcheck.timer >/dev/null 2>&1 || true
+    fi
+    rm -f "$timer_file" "$svc_file" 2>/dev/null || true
+    if [[ -e "$timer_file" || -e "$svc_file" ]]; then
+      finish_healthcheck_rollback "无法删除旧 timer/service（${timer_file}），已尝试撤销新 cron，避免双重调度" "$tx_dir" "$dest" "$stable" "$svc_file" "$timer_file" "$cron_file" || return 1
+    fi
+  fi
+  [[ -n "$tx_dir" ]] && rm -rf "$tx_dir" 2>/dev/null || true
+  echo "[信息] 已安装健康检查 cron：${cron_file}（每 5 分钟，--ip ${ip}，显式 bash 调用稳定副本）"
 }
 
 remove_healthcheck_cron() {
   if [[ -f "${HEALTHCHECK_CRON_PATH}" ]]; then
     rm -f "${HEALTHCHECK_CRON_PATH}"
     echo "[信息] 已删除健康检查 cron：${HEALTHCHECK_CRON_PATH}"
+  fi
+  local unit_dir="${HEALTHCHECK_UNIT_DIR:-/etc/systemd/system}"
+  if [[ -f "${unit_dir}/derper-healthcheck.timer" || -f "${unit_dir}/derper-healthcheck.service" ]]; then
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl disable --now derper-healthcheck.timer >/dev/null 2>&1 || true
+    fi
+    rm -f "${unit_dir}/derper-healthcheck.timer" "${unit_dir}/derper-healthcheck.service"
+    echo "[信息] 已删除健康检查 timer：${unit_dir}/derper-healthcheck.timer"
   fi
 }
 
@@ -3092,17 +3742,40 @@ runtime_checks() {
   fi
 }
 
-# 判断 ss/netstat 输出中某端口是否由 derper 占用（旧部署可能只听 TLS、没有 STUN）。
+# 从 ss -tulnp 或 netstat -tulnp 的混合输出中取出一种协议上的一个端口。
+# tcp6/udp6 分别归入 tcp/udp；端口在比较前去掉前导零。同行的另一种协议不参与判断。
+listening_port_lines_stdin() {
+  local proto="$1" canon
+  case "$proto" in
+    tcp|udp) ;;
+    *) return 1 ;;
+  esac
+  canon=$(_decimal_norm "$2")
+  grep -E "^${proto}6?[[:space:]].*:${canon}([^0-9]|$)" || true
+}
+
+listening_port_lines() {
+  printf '%s\n' "$1" | listening_port_lines_stdin "$2" "$3"
+}
+
+# 只认 ss 的 pid=<PID> 或 netstat 的 <PID>/程序名，不把 Recv-Q/Send-Q 当成 PID。
+listener_pid_field_matches() {
+  local pid="$1"
+  [[ -n "$pid" && "$pid" != "0" ]] || return 1
+  grep -Eq "(^|[^[:alnum:]])pid=${pid}([^0-9]|$)|[[:space:]]${pid}/[^[:space:]/]+"
+}
+
+# 判断指定协议上的端口是否由 derper 占用（旧部署可能只听 TLS、没有 STUN）。
 port_listening_owned_by_derper() {
-  local listening="$1" port="$2" main_pid="${3:-}"
+  local listening="$1" proto="$2" port="$3" main_pid="${4:-}"
   local lines
-  lines=$(printf '%s\n' "$listening" | grep -E ":${port}([^0-9]|$)" || true)
+  lines=$(listening_port_lines "$listening" "$proto" "$port")
   [[ -n "$lines" ]] || return 1
-  printf '%s\n' "$lines" | grep -Fq '"derper"' && return 0
-  if [[ -n "$main_pid" && "$main_pid" != "0" ]] &&
-     printf '%s\n' "$lines" | grep -Eq "(pid[=,]|^|,)${main_pid}([^0-9]|$)"; then
-    return 0
+  if [[ -n "$main_pid" && "$main_pid" != "0" ]]; then
+    printf '%s\n' "$lines" | listener_pid_field_matches "$main_pid" && return 0
+    return 1
   fi
+  printf '%s\n' "$lines" | grep -Eq '("derper"|/derper([[:space:]]|$))' && return 0
   return 1
 }
 
@@ -3121,24 +3794,26 @@ check_port_conflicts_from_listening() {
   fi
 
   local conflict=0
-  local derp_lines stun_lines
-  derp_lines=$(printf '%s\n' "$listening" | grep -E ":${DERP_PORT}([^0-9]|$)" || true)
-  stun_lines=$(printf '%s\n' "$listening" | grep -E ":${STUN_PORT}([^0-9]|$)" || true)
+  local derp_lines stun_lines derp_port stun_port
+  derp_port=$(_decimal_norm "${DERP_PORT}")
+  stun_port=$(_decimal_norm "${STUN_PORT}")
+  derp_lines=$(listening_port_lines "$listening" tcp "$derp_port")
+  stun_lines=$(listening_port_lines "$listening" udp "$stun_port")
 
   if [[ -n "$derp_lines" ]]; then
-    if port_listening_owned_by_derper "$listening" "${DERP_PORT}" "$main_pid"; then
-      echo "[信息] TCP 端口 ${DERP_PORT} 当前由 derper 占用，允许修复/重启流程继续。"
+    if port_listening_owned_by_derper "$listening" tcp "$derp_port" "$main_pid"; then
+      echo "[信息] TCP 端口 ${derp_port} 当前由 derper 占用，允许修复/重启流程继续。"
     else
-      echo "[错误] 检测到 TCP 端口 ${DERP_PORT} 已被占用。请更换 --derp-port 或释放占用进程：" >&2
+      echo "[错误] 检测到 TCP 端口 ${derp_port} 已被占用。请更换 --derp-port 或释放占用进程：" >&2
       printf '%s\n' "$derp_lines" | sed -n '1,200p' >&2 || true
       conflict=1
     fi
   fi
   if [[ -n "$stun_lines" ]]; then
-    if port_listening_owned_by_derper "$listening" "${STUN_PORT}" "$main_pid"; then
-      echo "[信息] UDP 端口 ${STUN_PORT} 当前由 derper 占用，允许修复/重启流程继续。"
+    if port_listening_owned_by_derper "$listening" udp "$stun_port" "$main_pid"; then
+      echo "[信息] UDP 端口 ${stun_port} 当前由 derper 占用，允许修复/重启流程继续。"
     else
-      echo "[错误] 检测到 UDP 端口 ${STUN_PORT} 已被占用。请更换 --stun-port 或释放占用进程：" >&2
+      echo "[错误] 检测到 UDP 端口 ${stun_port} 已被占用。请更换 --stun-port 或释放占用进程：" >&2
       printf '%s\n' "$stun_lines" | sed -n '1,200p' >&2 || true
       conflict=1
     fi
@@ -3172,12 +3847,12 @@ check_extra_attack_surface() {
   if command -v ss >/dev/null 2>&1; then
     listening=$(ss -ltn 2>/dev/null | awk 'NR>1 {print $4}' \
       | grep -E ':[0-9]+$' \
-      | grep -vE '^127\.0\.0\.1:|^\[::1\]:|^::1:' \
+      | grep -vE '^127(\.[0-9]{1,3}){3}:|^\[::1\]:|^::1:' \
       | grep -vE ":${DERP_PORT}$" || true)
   elif command -v netstat >/dev/null 2>&1; then
     listening=$(netstat -ltn 2>/dev/null | awk 'NR>2 && $1 ~ /^tcp6?/ {print $4}' \
       | grep -E ':[0-9]+$' \
-      | grep -vE '^127\.0\.0\.1:|^\[::1\]:|^::1:' \
+      | grep -vE '^127(\.[0-9]{1,3}){3}:|^\[::1\]:|^::1:' \
       | grep -vE ":${DERP_PORT}$" || true)
   fi
   EXTRA_LISTENERS=$(printf '%s\n' "$listening" | sort -u | grep -v '^$' || true)
@@ -3289,8 +3964,9 @@ print_server_node_acl_advice() {
 Tailscale 默认 ACL 是全通的：如果这台公网机器被攻破，攻击者会获得一个
 可访问整个 Tailnet 的节点身份。建议给服务器打 tag 并最小授权：
 
-1) 在本机执行（或在管理后台 Machines 页给该节点打 tag）：
-     sudo tailscale set --tags=tag:derper-server
+1) 在管理后台 Machines 页给该节点打 tag，或在首次登录时使用：
+     sudo tailscale up --advertise-tags=tag:derper-server
+   已登录的 Linux CLI 没有 tailscale set --tags。
 
 2) 在管理后台 Access Controls 中声明 tag 所有者：
      "tagOwners": {
@@ -3299,6 +3975,8 @@ Tailscale 默认 ACL 是全通的：如果这台公网机器被攻破，攻击�
 
 3) 不要在任何放行规则里把 "tag:derper-server" 写成 "src"；
    确需从服务器访问内网资源时，再加最小规则（如仅允许访问特定设备/端口）。
+   verify-clients 还要求这台服务器能看到合法客户端。只打 tag 并删掉所有可见性，
+   中继会拒绝连接。同一 Tailnet 不等于校验已经通过，变更后要用合法客户端实测。
 ====================================================================================
 EOF
 }
@@ -3317,10 +3995,47 @@ health_is_ok() {
   if [[ "${LIVE_CERT_CHECKED:-0}" -eq 1 ]]; then
     [[ "${CERT_LIVE_MATCH:-0}" -eq 1 ]] || return 1
   fi
+  [[ "${CERT_KEY_MATCH:-1}" -eq 1 ]] || return 1
+  [[ "${CERT_CHECK_UNKNOWN:-0}" -eq 0 ]] || return 1
+  if [[ "${DERPER_VERIFY_CLIENTS_EFFECTIVE:-0}" -eq 1 ]]; then
+    [[ "${TS_AUTH_UNKNOWN:-0}" -eq 0 ]] || return 1
+    [[ "${TS_RUNNING:-0}" -eq 1 ]] || return 1
+    [[ "${TS_LOCALAPI_OK:-0}" -eq 1 ]] || return 1
+  fi
   return 0
 }
 
-health_check_report() {
+# 健康检查退出码。旧 cron 丢弃退出码；`if ! --health-check` 把任意非 0 当成未通过。
+# 0 健康；1 已确认故障；2 未知（无权限或无法采集）。未知不能返回 0。
+health_check_exit_code() {
+  local validate_failed="${1:-0}" unknown="${2:-0}"
+  if [[ "$unknown" -eq 1 || "${CERT_CHECK_UNKNOWN:-0}" -eq 1 || "${TS_AUTH_UNKNOWN:-0}" -eq 1 ]]; then
+    printf '2\n'
+    return 0
+  fi
+  if [[ "${METRICS_WRITE_FAILED:-0}" -eq 1 || "$validate_failed" -ne 0 ]] || ! health_is_ok; then
+    printf '1\n'
+    return 0
+  fi
+  printf '0\n'
+}
+
+cert_expiry_alarm() {
+  local days="$1"
+  if (( days < 0 )); then
+    printf 'expired\n'
+  elif (( days < 7 )); then
+    printf 'warn-7\n'
+  elif (( days < 30 )); then
+    printf 'warn-30\n'
+  elif (( days < 90 )); then
+    printf 'warn-90\n'
+  else
+    printf 'ok\n'
+  fi
+}
+
+collect_health_status() {
   # 检查关键依赖工具
   local missing_tools=()
   command -v timeout >/dev/null 2>&1 || missing_tools+=(timeout)
@@ -3336,9 +4051,10 @@ health_check_report() {
   check_derper_status
   check_cert_status
   check_live_cert_status
-  local days_left
-  days_left=$(cert_days_remaining || true)
+}
 
+render_health_summary_text() {
+  local days_left="$1" rss_kb="${2:-0}"
   echo "[健康检查] DERP 服务健康状态摘要："
   if command -v systemctl >/dev/null 2>&1; then
     if systemctl is-active --quiet derper 2>/dev/null; then
@@ -3353,32 +4069,42 @@ health_check_report() {
   [[ $PORT_STUN_OK -eq 1 ]] && echo "✅ 端口：STUN ${STUN_PORT}/udp 正在监听" || echo "❌ 端口：STUN ${STUN_PORT}/udp 未监听"
   [[ $PURE_IP_OK -eq 1 ]] && echo "✅ 配置：当前 unit 为纯 IP 模式" || echo "❌ 配置：当前 unit 不是纯 IP 模式"
   [[ $DESIRED_CONFIG_OK -eq 1 ]] && echo "✅ 配置：当前 unit 与本次目标参数一致" || echo "❌ 配置：当前 unit 与本次目标参数不一致，建议执行 --repair"
-  [[ $CERT_LIVE_MATCH -eq 1 ]] && echo "✅ 证书：在线服务与磁盘证书一致" || echo "❌ 证书：在线服务未提供当前磁盘证书（或握手失败）"
-  [[ ${CERT_NAMING_OK:-0} -eq 1 ]] && echo "✅ 证书：命名兼容 derper manual（<hostname>.crt/.key）" || echo "❌ 证书：命名不兼容（缺少 <IP>.crt/.key，derper 可能自签另一套）"
-  if [[ $DERPER_VERIFY_CLIENTS_EFFECTIVE -eq 1 ]]; then
-    echo "ℹ️  客户端校验：当前 unit 已启用 -verify-clients"
+  if [[ "${CERT_CHECK_UNKNOWN:-0}" -eq 1 ]]; then
+    echo "⚠️  证书：无权限确认，不能判断证书是否匹配或命名是否兼容"
+  else
+    [[ $CERT_LIVE_MATCH -eq 1 ]] && echo "✅ 证书：在线服务与磁盘证书一致" || echo "❌ 证书：在线服务未提供当前磁盘证书（或握手失败）"
+    [[ ${CERT_NAMING_OK:-0} -eq 1 ]] && echo "✅ 证书：命名兼容 derper manual（<hostname>.crt/.key）" || echo "❌ 证书：命名不兼容（缺少 <IP>.crt/.key，derper 可能自签另一套）"
+    if [[ "${CERT_KEY_MATCH:-1}" -eq 0 ]]; then
+      echo "❌ 证书：证书与私钥不匹配，已阻止重启"
+    fi
+  fi
+  if [[ "${DERPER_VERIFY_CLIENTS_EFFECTIVE:-0}" -eq 1 ]]; then
+    if [[ "${TS_AUTH_UNKNOWN:-0}" -eq 1 ]]; then
+      echo "⚠️  客户端校验：已启用，但当前身份无法确认 tailscaled LocalAPI"
+    elif [[ "${TS_RUNNING:-0}" -eq 1 ]]; then
+      echo "✅ 客户端校验：tailscaled 正在运行"
+    else
+      echo "❌ 客户端校验：已启用，但 tailscaled 未运行"
+    fi
   else
     echo "ℹ️  客户端校验：当前 unit 未启用 -verify-clients"
   fi
 
   if [[ -n "$days_left" ]]; then
-    if (( days_left >= 30 )); then
-      echo "✅ 证书：有效期剩余 ${days_left} 天"
-    elif (( days_left >= 0 )); then
-      echo "⚠️  证书：有效期仅剩 ${days_left} 天（建议尽快重签）"
-    else
-      echo "❌ 证书：已过期（请重签）"
-    fi
+    case "$(cert_expiry_alarm "$days_left")" in
+      ok) echo "✅ 证书：有效期剩余 ${days_left} 天" ;;
+      warn-90) echo "⚠️  证书：有效期剩余 ${days_left} 天（90 天预警，此时不换证）" ;;
+      warn-30) echo "⚠️  证书：有效期剩余 ${days_left} 天（30 天预警，此时不因预警天数换证）" ;;
+      warn-7) echo "⚠️  证书：有效期剩余 ${days_left} 天（7 天预警）" ;;
+      *) echo "❌ 证书：已过期（请重签）" ;;
+    esac
   else
     echo "⚠️  证书：未能计算有效期（可能缺少 openssl 或证书文件）"
   fi
 
   # 进程内存占用（RSS）
-  local rss_kb rss_mb pidlist
-  rss_kb=0
-  pidlist=$(pgrep -x derper 2>/dev/null | xargs || true)
-  if [[ -n "$pidlist" ]]; then
-    rss_kb=$(ps -o rss= -p $pidlist 2>/dev/null | awk '{s+=$1} END{print s+0}')
+  local rss_mb
+  if [[ "$rss_kb" -gt 0 ]]; then
     rss_mb=$(( (rss_kb + 1023) / 1024 ))
     echo "ℹ️  资源：derper 内存 RSS 约 ${rss_mb} MiB"
   else
@@ -3392,13 +4118,29 @@ health_check_report() {
   fi
   check_automatic_updates || true
   warn_world_writable_socket "$(expected_tailscaled_socket)"
+}
+
+health_check_report() {
+  collect_health_status
+  local days_left
+  days_left=$(cert_days_remaining || true)
+
+  local rss_kb=0 pidlist
+  pidlist=$(pgrep -x derper 2>/dev/null | xargs || true)
+  if [[ -n "$pidlist" ]]; then
+    rss_kb=$(ps -o rss= -p $pidlist 2>/dev/null | awk '{s+=$1} END{print s+0}')
+  fi
+
+  render_health_summary_text "$days_left" "$rss_kb"
 
   # 导出 Prometheus 文本（可被 node_exporter textfile collector 收集）
   if [[ -n "${METRICS_TEXTFILE}" ]]; then
     if write_prometheus_metrics "${METRICS_TEXTFILE}" "$days_left" "$rss_kb"; then
+      METRICS_WRITE_FAILED=0
       echo "[信息] 已写入 Prometheus 指标：${METRICS_TEXTFILE}"
     else
-      echo "[警告] Prometheus 指标写入失败：${METRICS_TEXTFILE}（建议使用 sudo 或选择可写路径）" >&2
+      METRICS_WRITE_FAILED=1
+      echo "[错误] Prometheus 指标写入失败：${METRICS_TEXTFILE}。旧指标文件保持不变，可按 derper_metrics_unixtime 识别为过期。" >&2
     fi
   fi
 }
@@ -3410,7 +4152,8 @@ write_prometheus_metrics() {
   base=$(basename "$path")
   mkdir -p "$dir" 2>/dev/null || true
   if ! tmp=$(mktemp "${dir}/.${base}.tmp.XXXXXX" 2>/dev/null); then
-    echo "[警告] 无法在指标目录创建安全临时文件：${dir}" >&2
+    echo "[错误] 无法在指标目录创建安全临时文件：${dir}" >&2
+    METRICS_WRITE_FAILED=1
     return 1
   fi
   local overall=0 cert_live=0
@@ -3457,6 +4200,18 @@ write_prometheus_metrics() {
     echo "# TYPE derper_cert_live_match gauge"
     echo "derper_cert_live_match $cert_live"
 
+    echo "# HELP derper_metrics_unixtime Unix time when this metrics file was written"
+    echo "# TYPE derper_metrics_unixtime gauge"
+    echo "derper_metrics_unixtime $(date +%s)"
+
+    echo "# HELP derper_check_unknown Whether the health result is unknown rather than a confirmed fault"
+    echo "# TYPE derper_check_unknown gauge"
+    if [[ "${CERT_CHECK_UNKNOWN:-0}" -eq 1 || "${TS_AUTH_UNKNOWN:-0}" -eq 1 ]]; then
+      echo "derper_check_unknown 1"
+    else
+      echo "derper_check_unknown 0"
+    fi
+
     echo "# HELP derper_process_rss_bytes Total RSS of derper process in bytes"
     echo "# TYPE derper_process_rss_bytes gauge"
     if [[ -n "$rss_kb" ]]; then
@@ -3465,15 +4220,16 @@ write_prometheus_metrics() {
       echo "derper_process_rss_bytes 0"
     fi
   } >"$tmp"; then
-    echo "[警告] Prometheus 指标写入临时文件失败：$tmp（权限或路径问题）" >&2
+    echo "[错误] Prometheus 指标写入临时文件失败：$tmp（权限或路径问题）" >&2
     rm -f "$tmp" 2>/dev/null || true
+    METRICS_WRITE_FAILED=1
     return 1
   fi
   chmod 644 "$tmp" 2>/dev/null || true
   if ! mv -f "$tmp" "$path" 2>/dev/null; then
-    echo "[警告] Prometheus 指标写入成功但无法移动到目标路径：$path" >&2
-    echo "  可能原因：跨文件系统、目录权限不足。请确保路径可写。" >&2
+    echo "[错误] Prometheus 指标未能替换目标文件，旧内容保持不变：$path" >&2
     rm -f "$tmp" 2>/dev/null || true
+    METRICS_WRITE_FAILED=1
     return 1
   fi
 }
@@ -3876,20 +4632,18 @@ main() {
     echo "[警告] 参数校验失败；检查模式将继续输出状态，但最终退出码为失败。" >&2
   fi
 
+  # 健康检查模式（仅输出状态/指标，不变更系统；单次采集）
+  if [[ "${HEALTH_CHECK}" -eq 1 ]]; then
+    health_check_report
+    # 0 健康，1 已确认故障，2 未知。旧调用把任意非 0 视为未通过。
+    exit "$(health_check_exit_code "$check_validate_failed")"
+  fi
+
   # 收集当前状态
   check_tailscale_status
   check_derper_status
   check_cert_status
   check_live_cert_status
-
-  # 健康检查模式（仅输出状态/指标，不变更系统）
-  if [[ "${HEALTH_CHECK}" -eq 1 ]]; then
-    health_check_report
-    # 根据关键项给出退出码：全部健康返回 0，否则 1
-    local ok=1
-    if [[ "$check_validate_failed" -eq 0 ]] && health_is_ok; then ok=0; fi
-    exit $ok
-  fi
 
   if [[ "${DRY_RUN}" -eq 1 || "${CHECK_ONLY}" -eq 1 ]]; then
     local ip_show="<未探测到>"

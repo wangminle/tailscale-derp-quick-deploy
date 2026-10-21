@@ -308,6 +308,7 @@ test_metrics_writer_avoids_predictable_tmp_path() {
     printf 'sentinel\n' >"${metrics}.tmp"
     DERPER_RUNNING=1 PORT_TLS_OK=1 PORT_STUN_OK=1
     DERPER_VERIFY_CLIENTS_EFFECTIVE=1 PURE_IP_OK=1 DESIRED_CONFIG_OK=1
+    TS_RUNNING=1 TS_AUTH_UNKNOWN=0 TS_LOCALAPI_OK=1
     CERT_PRESENT=1 CERT_NAMING_OK=1 CERT_SAN_MATCH=1 CERT_EXPIRY_OK=1
     LIVE_CERT_CHECKED=1 CERT_LIVE_MATCH=1
     write_prometheus_metrics "$metrics" "100" "256"
@@ -1062,6 +1063,7 @@ os.path.exists(p) and os.unlink(p);s.bind(p);os.chmod(p,0o666);s.close()" 2>/dev
   local out
   out=$(warn_world_writable_socket "$sock" 2>&1)
   echo "$out" | grep -q '0666' || fail "health warning must mention 0666, got: $out"
+  echo "$out" | grep -q '这是应急状态' && fail "0666 must not be described as an emergency state, got: $out"
   ok "world-writable tailscaled socket is warned"
 }
 
@@ -1125,6 +1127,11 @@ test_install_healthcheck_cron_writes_job() {
     METRICS_TEXTFILE="${local_tmp}/derper.prom"
     SCRIPT_SELF="${local_tmp}/deploy_derper_ip_selfsigned.sh"
     printf '#!/bin/bash\n' >"$SCRIPT_SELF"
+    # 1) cron 后备分支（无 systemctl）
+    command() {
+      if [[ "$1" == -v && "$2" == systemctl ]]; then return 1; fi
+      builtin command "$@"
+    }
     install_healthcheck_cron || fail "cron install should succeed"
     [[ -f "$HEALTHCHECK_CRON_PATH" ]] || fail "cron file missing"
     grep -q -- '--health-check' "$HEALTHCHECK_CRON_PATH" || fail "cron must call --health-check"
@@ -1132,8 +1139,19 @@ test_install_healthcheck_cron_writes_job() {
     grep -q -- '--derp-port' "$HEALTHCHECK_CRON_PATH" || fail "cron must pin --derp-port"
     grep -q -- '--stun-port' "$HEALTHCHECK_CRON_PATH" || fail "cron must pin --stun-port"
     grep -q -- '--metrics-textfile' "$HEALTHCHECK_CRON_PATH" || fail "cron must write metrics textfile"
+
+    # 2) systemd timer 分支（有 systemctl + 可写 HEALTHCHECK_UNIT_DIR）
+    unset -f command
+    systemctl() { return 0; }
+    HEALTHCHECK_UNIT_DIR="${local_tmp}/units"
+    install_healthcheck_cron || fail "timer install should succeed"
+    [[ -f "${HEALTHCHECK_UNIT_DIR}/derper-healthcheck.service" ]] || fail "timer service unit missing"
+    [[ -f "${HEALTHCHECK_UNIT_DIR}/derper-healthcheck.timer" ]] || fail "timer unit missing"
+    [[ ! -e "$HEALTHCHECK_CRON_PATH" ]] || fail "timer install must remove legacy cron file"
+    grep -q -- '--health-check' "${HEALTHCHECK_UNIT_DIR}/derper-healthcheck.service" || fail "timer service must call --health-check"
+    grep -q -- '--ip 203.0.113.10' "${HEALTHCHECK_UNIT_DIR}/derper-healthcheck.service" || fail "timer service must pin --ip"
   )
-  ok "healthcheck cron file is installed"
+  ok "healthcheck cron and systemd timer files are installed"
 }
 
 test_uninstall_removes_healthcheck_cron() {
@@ -1292,16 +1310,22 @@ test_install_healthcheck_cron_quotes_paths() {
     local_tmp=$(mktemp -d)
     trap 'rm -rf "$local_tmp"' EXIT
     HEALTHCHECK_CRON_PATH="${local_tmp}/derper-healthcheck"
+    HEALTHCHECK_PROGRAM_DIR="${local_tmp}/program dir"
     IP_ADDR="203.0.113.10"
     mkdir -p "${local_tmp}/metrics dir"
     METRICS_TEXTFILE="${local_tmp}/metrics dir/derper.prom"
     SCRIPT_SELF="${local_tmp}/deploy derper.sh"
     printf '#!/bin/bash\n' >"$SCRIPT_SELF"
+    command() {
+      if [[ "$1" == -v && "$2" == systemctl ]]; then return 1; fi
+      builtin command "$@"
+    }
     install_healthcheck_cron || fail "cron install should succeed with spaces in paths"
-    local expected_self expected_metrics
-    expected_self=$(printf '%q' "$SCRIPT_SELF")
+    local expected_prog expected_metrics
+    expected_prog=$(printf '%q' "${HEALTHCHECK_PROGRAM_DIR}/deploy_derper_ip_selfsigned.sh")
     expected_metrics=$(printf '%q' "$METRICS_TEXTFILE")
-    grep -qF -- "$expected_self" "$HEALTHCHECK_CRON_PATH" || fail "script path with spaces must be quoted, cron=$(cat "$HEALTHCHECK_CRON_PATH")"
+    grep -q 'bash ' "$HEALTHCHECK_CRON_PATH" || fail "cron must invoke bash explicitly, cron=$(cat "$HEALTHCHECK_CRON_PATH")"
+    grep -qF -- "$expected_prog" "$HEALTHCHECK_CRON_PATH" || fail "stable program path with spaces must be quoted, cron=$(cat "$HEALTHCHECK_CRON_PATH")"
     grep -qF -- "$expected_metrics" "$HEALTHCHECK_CRON_PATH" || fail "metrics path with spaces must be quoted, cron=$(cat "$HEALTHCHECK_CRON_PATH")"
   )
   ok "healthcheck cron quotes paths that contain spaces"
@@ -1358,13 +1382,27 @@ test_healthcheck_cron_preserves_custom_deploy_flags() {
     METRICS_TEXTFILE="${local_tmp}/derper.prom"
     SCRIPT_SELF="${local_tmp}/deploy_derper_ip_selfsigned.sh"
     printf '#!/bin/bash\n' >"$SCRIPT_SELF"
+    command() {
+      if [[ "$1" == -v && "$2" == systemctl ]]; then return 1; fi
+      builtin command "$@"
+    }
     install_healthcheck_cron || fail "cron install should succeed"
     grep -q -- '--derp-port 443' "$HEALTHCHECK_CRON_PATH" || fail "cron must pin custom DERP port"
     grep -q -- '--stun-port 40000' "$HEALTHCHECK_CRON_PATH" || fail "cron must pin custom STUN port"
     grep -q -- '--no-verify-clients' "$HEALTHCHECK_CRON_PATH" || fail "cron must pin --no-verify-clients"
     grep -q -- '--security-level paranoid' "$HEALTHCHECK_CRON_PATH" || fail "cron must pin security level"
+
+    # systemd timer 分支同样保留自定义部署参数
+    unset -f command
+    systemctl() { return 0; }
+    HEALTHCHECK_UNIT_DIR="${local_tmp}/units"
+    install_healthcheck_cron || fail "timer install should succeed"
+    grep -q -- '--derp-port 443' "${HEALTHCHECK_UNIT_DIR}/derper-healthcheck.service" || fail "timer service must pin custom DERP port"
+    grep -q -- '--stun-port 40000' "${HEALTHCHECK_UNIT_DIR}/derper-healthcheck.service" || fail "timer service must pin custom STUN port"
+    grep -q -- '--no-verify-clients' "${HEALTHCHECK_UNIT_DIR}/derper-healthcheck.service" || fail "timer service must pin --no-verify-clients"
+    grep -q -- '--security-level paranoid' "${HEALTHCHECK_UNIT_DIR}/derper-healthcheck.service" || fail "timer service must pin security level"
   )
-  ok "healthcheck cron preserves custom ports and security flags"
+  ok "healthcheck cron and timer preserve custom ports and security flags"
 }
 
 test_healthcheck_infers_settings_from_unit() {
@@ -1636,86 +1674,1255 @@ test_wizard_read_choice_rejects_invalid() {
   ok "wizard choice prompt rejects invalid input"
 }
 
-test_no_crlf_and_syntax
-test_source_does_not_run_main
-test_source_survives_unset_user
-test_unit_matching_detects_config_drift
-test_unit_matching_rejects_wrong_socket_path
-test_validate_settings_rejects_invalid_user
-test_port_conflict_ignores_current_derper_service
-test_service_reconcile_detects_runtime_failures_and_cert_regen
-test_reconcile_detects_stale_live_cert
-test_nonempty_config_uses_separate_c_argument
-test_unsupported_custom_stun_port_is_rejected
-test_empty_derper_config_is_migrated_for_auto_key_generation
-test_verify_clients_passes_socket_flag
-test_verify_clients_aligns_derper_version
-test_ts_commit_parses_real_tailscale_output
-test_manual_cert_uses_upstream_filenames
-test_cert_fallback_temp_failure_is_handled
-test_derper_binary_needs_reinstall_on_version_mismatch
-test_paranoid_degraded_unit_is_accepted
-test_start_limit_lives_in_unit_section
-test_socket_access_skips_when_world_writable
-test_health_requires_upstream_cert_naming
-test_script_version_is_declared_and_consistent
-test_acl_cert_snippet_uses_requested_region_endpoint_and_stun
-test_missing_fingerprint_fails_instead_of_insecure_fallback
-test_non_global_ips_rejected_unless_explicitly_allowed
-test_region_id_safe_integer_range
-test_argument_combinations_are_validated
-test_cert_generation_refuses_symlinked_paths
-test_acl_failure_never_emits_insecure_flag
-test_extra_listener_detection_flags_attack_surface
-test_automatic_updates_detection_runs
-test_server_node_acl_advice_includes_tag
-test_go_toolchain_rejects_pre_1_21
-test_get_installed_derper_version_ignores_go_toolchain
-test_port_conflict_allows_derper_tls_without_stun
-test_port_conflict_rejects_foreign_stun
-test_ensure_compatible_certs_migrates_legacy_names
-test_ssh_session_via_tailscale_detects_cgnat
-test_restart_tailscaled_socket_skips_over_tailscale_ssh
-test_release_tmpdir_clears_deploy_temp
-test_infer_ip_from_existing_unit
-test_health_check_skips_external_ip_probe_when_ip_set
-test_wizard_handles_eof_cleanly
-test_cert_san_matches_literal_ip_only
-test_live_certificate_mismatch_fails_health_check
-test_metrics_writer_avoids_predictable_tmp_path
-test_goproxy_probe_targets_skip_direct
-test_precheck_go_network_fails_fast_with_hint
-test_precheck_go_network_succeeds_when_reachable
-test_get_installed_derper_version_without_strings
-test_relax_socket_perms_restored_on_cleanup
-test_cleanup_restores_relaxed_socket
-test_world_writable_socket_is_warned
-test_tls_connlimit_zero_is_noop
-test_tls_connlimit_iptables_rule
-test_tls_connlimit_removed_on_uninstall
-test_install_healthcheck_cron_writes_job
-test_uninstall_removes_healthcheck_cron
-test_healthcheck_cron_conflicts_with_uninstall
-test_tls_connlimit_parse_and_reject
-test_module_query_survives_missing_timeout
-test_install_derper_survives_missing_timeout
-test_healthcheck_cron_conflicts_with_health_check
-test_tls_connlimit_conflicts_with_readonly_modes
-test_tls_connlimit_explicit_zero_removes_rules
-test_install_healthcheck_cron_quotes_paths
-test_precheck_go_network_allows_direct_fallback
-test_overflow_numeric_args_are_rejected
-test_healthcheck_cron_preserves_custom_deploy_flags
-test_healthcheck_infers_settings_from_unit
-test_tls_connlimit_nft_uses_script_owned_table
-test_readme_documents_missing_flags_and_runnable_examples
-test_unit_atomic_write_refuses_symlink
-test_sha256_hex_rejects_empty_input
-test_install_healthcheck_cron_rejects_missing_script
-test_resolve_run_user_survives_unreadable_unit
-test_commit_cert_update_clears_active_transaction
-test_run_post_deploy_extras_keeps_verified_deploy
-test_service_verified_skips_missing_probe_tools
-test_timeout_run_fallback_does_not_block_command_substitution
-test_main_commits_certs_before_post_deploy_extras
-test_wizard_read_choice_rejects_invalid
+test_sudo_user_validation_and_fallback() {
+  (
+    export SUDO_USER="deploy_admin-01"
+    export USER="fallback_user"
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    [[ "$RUN_USER" == "deploy_admin-01" ]] || fail "valid SUDO_USER should be used as RUN_USER, got: $RUN_USER"
+  )
+  (
+    export SUDO_USER="bad;user"
+    export USER="safe_user"
+    local warn_out
+    warn_out=$(DERPER_TEST_MODE=1 source "$SCRIPT" 2>&1 >/dev/null)
+    echo "$warn_out" | grep -q 'SUDO_USER 包含非法字符' || fail "invalid SUDO_USER must emit warning, got: $warn_out"
+    DERPER_TEST_MODE=1 source "$SCRIPT" 2>/dev/null
+    [[ "$RUN_USER" == "safe_user" ]] || fail "invalid SUDO_USER must fall back to USER, got: $RUN_USER"
+  )
+  ok "SUDO_USER validation accepts POSIX names and rejects injection characters"
+}
+
+test_help_and_unknown_or_missing_value_args() {
+  (
+    local help_out rc=0
+    help_out=$(bash "$SCRIPT" --help 2>&1) || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "--help should exit 0"
+    echo "$help_out" | grep -q '用法：' || fail "--help should print usage"
+    help_out=$(bash "$SCRIPT" -h 2>&1) || rc=$?
+    [[ "$rc" -eq 0 ]] || fail "-h should exit 0"
+
+    rc=0
+    help_out=$(bash "$SCRIPT" --unknown-flag-xyz 2>&1) || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "unknown flag should exit non-zero"
+    echo "$help_out" | grep -q '未知参数' || fail "unknown flag should report 未知参数"
+
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local opt
+    for opt in --ip --derp-port --stun-port --cert-days --goproxy --gosumdb --gotoolchain \
+               --region-id --region-code --region-name --user --security-level \
+               --tls-connlimit --derper-version --metrics-textfile; do
+      rc=0
+      ( parse_args "$opt" >/dev/null 2>&1 ) || rc=$?
+      [[ "$rc" -ne 0 ]] || fail "$opt without value must fail"
+      rc=0
+      ( parse_args "$opt" --force >/dev/null 2>&1 ) || rc=$?
+      [[ "$rc" -ne 0 ]] || fail "$opt followed by another flag must fail"
+    done
+
+    parse_args --ip 8.8.8.8 --derp-port 8443 --stun-port 3479 --cert-days 90 --auto-ufw \
+      --goproxy https://goproxy.cn,direct --gosumdb sum.golang.google.cn --gotoolchain local \
+      --no-verify-clients --force-verify-clients --region-id 901 --region-code hk-derp \
+      --region-name "HK DERP" --accept-cert-rotation --dedicated-user --allow-non-global-ip \
+      --security-level paranoid --relax-socket-perms --yes --derper-version v1.80.0 \
+      --uninstall --purge-all
+    [[ "$IP_ADDR" == "8.8.8.8" && "$DERP_PORT" == "8443" && "$DERP_PORT_EXPLICIT" -eq 1 ]] || fail "derp-port parse failed"
+    [[ "$STUN_PORT" == "3479" && "$STUN_PORT_EXPLICIT" -eq 1 && "$CERT_DAYS" == "90" ]] || fail "stun/cert-days parse failed"
+    [[ "$AUTO_UFW" -eq 1 && "$GOPROXY_ARG" == "https://goproxy.cn,direct" ]] || fail "ufw/goproxy parse failed"
+    [[ "$GOSUMDB_ARG" == "sum.golang.google.cn" && "$GOTOOLCHAIN_ARG" == "local" ]] || fail "gosumdb/gotoolchain parse failed"
+    [[ "$VERIFY_CLIENTS_MODE" == "on" && "$VERIFY_CLIENTS_EXPLICIT" -eq 1 ]] || fail "verify-clients parse failed"
+    [[ "$REGION_ID" == "901" && "$REGION_CODE" == "hk-derp" && "$REGION_NAME" == "HK DERP" ]] || fail "region parse failed"
+    [[ "$ACCEPT_CERT_ROTATION" -eq 1 && "$CREATE_DEDICATED_USER" -eq 1 && "$RUN_USER" == "derper" ]] || fail "dedicated-user parse failed"
+    [[ "$ALLOW_NON_GLOBAL_IP" -eq 1 && "$SECURITY_LEVEL" == "paranoid" && "$RELAX_SOCKET_PERMS" -eq 1 ]] || fail "security flags parse failed"
+    [[ "$NON_INTERACTIVE" -eq 1 && "$DERPER_VERSION" == "v1.80.0" ]] || fail "non-interactive/derper-version parse failed"
+    [[ "$UNINSTALL" -eq 1 && "$PURGE_ALL" -eq 1 && "$PURGE" -eq 1 ]] || fail "--purge-all must set both PURGE_ALL and PURGE"
+
+    UNINSTALL=0 PURGE=0 PURGE_ALL=1
+    if validate_arg_combos 2>/dev/null; then fail "--purge-all without --uninstall must fail"; fi
+    PURGE_ALL=0 INSTALL_HEALTHCHECK_CRON=1 DRY_RUN=1
+    if validate_arg_combos 2>/dev/null; then fail "--install-healthcheck-cron with --dry-run must fail"; fi
+  )
+  ok "help, unknown flags, missing option values, and full option parsing work as expected"
+}
+
+test_require_root_and_check_os_environment() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    id() { echo 1000; }
+    local out rc=0
+    out=$(require_root 2>&1) || rc=$?
+    [[ "$rc" -ne 0 && "$out" == *"需要 root 权限"* ]] || fail "non-root must be rejected by require_root"
+    id() { echo 0; }
+    require_root || fail "root should pass require_root"
+
+    # 若宿主机无 /proc/version（如 macOS），通过 uname 与环境变量即可覆盖所有分支
+    if [[ ! -f /proc/version ]]; then
+      uname() { echo "Darwin"; }
+      rc=0
+      out=$(check_os_environment 2>&1) || rc=$?
+      [[ "$rc" -ne 0 && "$out" == *"不支持的操作系统：macOS"* ]] || fail "macOS must be blocked"
+
+      uname() { echo "Linux"; }
+      WSL_DISTRO_NAME="Ubuntu"
+      uname() { echo "Unknown"; }
+      rc=0
+      out=$(check_os_environment 2>&1) || rc=$?
+      [[ "$rc" -ne 0 && "$out" == *"不支持的运行环境：WSL"* ]] || fail "WSL must be blocked"
+      unset WSL_DISTRO_NAME
+
+      uname() { echo "FreeBSD"; }
+      rc=0
+      out=$(check_os_environment 2>&1) || rc=$?
+      [[ "$rc" -ne 0 && "$out" == *"不支持的操作系统"* ]] || fail "unknown OS must be blocked"
+
+      uname() { echo "Linux"; }
+      command() {
+        if [[ "$1" == -v && "$2" == systemctl ]]; then return 1; fi
+        builtin command "$@"
+      }
+      out=$(check_os_environment 2>&1) || fail "Linux without systemctl should pass with warning"
+      [[ "$out" == *"未检测到 systemd"* && "$out" == *"环境检测通过：Linux 系统"* ]] ||
+        fail "Linux check should warn about missing systemd and succeed"
+    fi
+  )
+  ok "require_root and check_os_environment enforce root and Linux requirements"
+}
+
+test_precheck_verify_clients_all_branches() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    VERIFY_CLIENTS_MODE="off"
+    local out rc=0
+    out=$(precheck_verify_clients 2>&1) || fail "verify-clients off should return 0"
+    [[ "$out" == *"--no-verify-clients"* ]] || fail "verify-clients off should warn"
+
+    VERIFY_CLIENTS_MODE="on"
+    pgrep() { return 1; }
+    # 分支：tailscaled 未运行 + 有 systemctl -> exit 2
+    command() {
+      if [[ "$1" == -v && "$2" == systemctl ]]; then return 0; fi
+      builtin command "$@"
+    }
+    systemctl() { return 1; }
+    if [[ ! -S /run/tailscale/tailscaled.sock && ! -S /var/run/tailscale/tailscaled.sock ]]; then
+      rc=0
+      out=$(precheck_verify_clients 2>&1) || rc=$?
+      [[ "$rc" -eq 2 && "$out" == *"systemctl enable --now tailscaled"* ]] ||
+        fail "inactive tailscaled with systemctl must exit 2, rc=$rc"
+
+      # 分支：tailscaled 未运行 + 无 systemctl -> exit 2
+      command() {
+        if [[ "$1" == -v && "$2" == systemctl ]]; then return 1; fi
+        builtin command "$@"
+      }
+      rc=0
+      out=$(precheck_verify_clients 2>&1) || rc=$?
+      [[ "$rc" -eq 2 && "$out" == *"OpenRC/Alpine"* ]] ||
+        fail "inactive tailscaled without systemctl must exit 2 with OpenRC hint, rc=$rc"
+    fi
+
+    # 分支：tailscaled 运行中，但未登录（tailscale ip -4 为空）-> exit 2
+    pgrep() { return 0; }
+    command() {
+      if [[ "$1" == -v && "$2" == tailscale ]]; then return 0; fi
+      builtin command "$@"
+    }
+    tailscale() { echo ""; }
+    rc=0
+    out=$(precheck_verify_clients 2>&1) || rc=$?
+    [[ "$rc" -eq 2 && "$out" == *"未检测到已登录的 Tailnet IP"* ]] ||
+      fail "unauthenticated tailscaled must exit 2, rc=$rc"
+
+    # 分支：tailscaled 运行中且已登录 -> return 0
+    tailscale() { echo "100.64.0.42"; }
+    out=$(precheck_verify_clients 2>&1) || fail "logged-in tailscaled should pass"
+    [[ "$out" == *"100.64.0.42"* ]] || fail "logged-in message should include Tailnet IP"
+
+    # 分支：tailscaled 运行中但无 tailscale CLI -> return 0
+    command() {
+      if [[ "$1" == -v && "$2" == tailscale ]]; then return 1; fi
+      builtin command "$@"
+    }
+    out=$(precheck_verify_clients 2>&1) || fail "missing tailscale CLI with active daemon should pass"
+    [[ "$out" == *"未找到 tailscale CLI"* ]] || fail "should mention missing tailscale CLI"
+  )
+  ok "precheck_verify_clients covers off, inactive, logged-out, logged-in, and no-CLI branches"
+}
+
+test_ipv4_address_class_and_validate_settings_edge_cases() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    [[ "$(ipv4_address_class "0.0.0.1")" == *"保留（0.0.0.0/8）"* ]] || fail "0/8 class failed"
+    [[ "$(ipv4_address_class "10.1.2.3")" == *"私有（10.0.0.0/8）"* ]] || fail "10/8 class failed"
+    [[ "$(ipv4_address_class "100.64.0.1")" == *"CGNAT"* ]] || fail "100.64/10 class failed"
+    [[ "$(ipv4_address_class "127.0.0.1")" == *"回环"* ]] || fail "127/8 class failed"
+    [[ "$(ipv4_address_class "169.254.1.1")" == *"链路本地"* ]] || fail "169.254/16 class failed"
+    [[ "$(ipv4_address_class "172.16.0.1")" == *"私有（172.16.0.0/12）"* ]] || fail "172.16/12 class failed"
+    [[ "$(ipv4_address_class "192.0.0.1")" == *"192.0.0.0/24"* ]] || fail "192.0.0/24 class failed"
+    [[ "$(ipv4_address_class "192.0.2.1")" == *"TEST-NET-1"* ]] || fail "192.0.2/24 class failed"
+    [[ "$(ipv4_address_class "192.88.99.1")" == *"6to4"* ]] || fail "192.88.99/24 class failed"
+    [[ "$(ipv4_address_class "192.168.1.1")" == *"192.168.0.0/16"* ]] || fail "192.168/16 class failed"
+    [[ "$(ipv4_address_class "198.18.0.1")" == *"198.18.0.0/15"* ]] || fail "198.18/15 class failed"
+    [[ "$(ipv4_address_class "198.51.100.1")" == *"TEST-NET-2"* ]] || fail "198.51.100/24 class failed"
+    [[ "$(ipv4_address_class "203.0.113.1")" == *"TEST-NET-3"* ]] || fail "203.0.113/24 class failed"
+    [[ "$(ipv4_address_class "224.0.0.1")" == *"组播"* ]] || fail "224/4 class failed"
+    [[ "$(ipv4_address_class "240.0.0.1")" == *"240.0.0.0/4"* ]] || fail "240/4 class failed"
+    [[ "$(ipv4_address_class "255.255.255.255")" == *"240.0.0.0/4"* || "$(ipv4_address_class "255.255.255.255")" == *"广播"* ]] || fail "255.255.255.255 must be non-global"
+    [[ "$(ipv4_address_class "999.1.1.1")" == "invalid" ]] || fail "octet > 255 must be invalid"
+    [[ "$(ipv4_address_class "1.2.3")" == "invalid" ]] || fail "short IP must be invalid"
+    [[ "$(ipv4_address_class "8.8.8.8")" == "global" ]] || fail "8.8.8.8 must be global"
+
+    RUN_USER="$(id -un)"
+    IP_ADDR="08.08.08.08"
+    validate_settings >/dev/null 2>&1 || fail "leading-zero octets 08.08.08.08 must parse as decimal"
+
+    IP_ADDR="8.8.8.8"
+    REGION_CODE='bad"code'
+    validate_settings >/dev/null 2>&1 && fail "region-code with quote must be rejected"
+    REGION_CODE="my-derp"
+
+    REGION_NAME='Bad;Name'
+    validate_settings >/dev/null 2>&1 && fail "region-name with semicolon must be rejected"
+    REGION_NAME="My IP DERP"
+
+    REGION_ID="100"
+    local warn_out
+    warn_out=$(validate_settings 2>&1) || fail "region-id 100 should pass with warning"
+    [[ "$warn_out" == *"900-999"* ]] || fail "region-id outside 900-999 should emit warning"
+    REGION_ID="900"
+
+    SECURITY_LEVEL="ultra"
+    validate_settings >/dev/null 2>&1 && fail "invalid security-level must be rejected"
+    SECURITY_LEVEL="standard"
+
+    DERP_PORT="0"
+    validate_settings >/dev/null 2>&1 && fail "port 0 must be rejected"
+    DERP_PORT="65536"
+    validate_settings >/dev/null 2>&1 && fail "port 65536 must be rejected"
+    DERP_PORT="30399"
+
+    CERT_DAYS="0"
+    if validate_settings >/dev/null 2>&1; then fail "cert-days 0 must be rejected"; fi
+    CERT_DAYS="365001"
+    if validate_settings >/dev/null 2>&1; then fail "cert-days > 365000 must be rejected"; fi
+  )
+  ok "ipv4_address_class and validate_settings cover all address classes and parameter boundaries"
+}
+
+test_detect_public_ip_fallback_chain() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    IP_ADDR=""
+    # 第 1 源成功（1.1.1.1/cdn-cgi/trace）
+    curl() {
+      if [[ "$*" == *"1.1.1.1/cdn-cgi/trace"* ]]; then
+        printf 'fl=1\nip=1.2.3.4\n'
+        return 0
+      fi
+      return 1
+    }
+    dig() { return 1; }
+    detect_public_ip >/dev/null
+    [[ "$IP_ADDR" == "1.2.3.4" ]] || fail "should detect IP from first source, got: $IP_ADDR"
+
+    # 前面源失败，回退到 api.ipify.org
+    IP_ADDR=""
+    curl() {
+      if [[ "$*" == *"api.ipify.org"* ]]; then
+        printf '5.6.7.8\n'
+        return 0
+      fi
+      return 1
+    }
+    detect_public_ip >/dev/null
+    [[ "$IP_ADDR" == "5.6.7.8" ]] || fail "should fall back to ipify, got: $IP_ADDR"
+
+    # 全部探测源失败
+    IP_ADDR=""
+    curl() { return 1; }
+    dig() { return 1; }
+    if detect_public_ip >/dev/null 2>&1; then
+      fail "detect_public_ip must return 1 when all sources fail"
+    fi
+  )
+  ok "detect_public_ip falls back across probe endpoints and fails when none respond"
+}
+
+test_ver_ge_pure_bash_fallback_and_tailscale_status() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    # 屏蔽 sort -V，专门走纯 Bash 版本比较回退分支
+    sort() {
+      if [[ "${1:-}" == "-V" ]]; then return 1; fi
+      command sort "$@"
+    }
+    ver_ge "1.10.0" "1.9.9" || fail "pure bash ver_ge: 1.10.0 >= 1.9.9 must be true"
+    ver_ge "1.66.3" "1.66.3" || fail "pure bash ver_ge: 1.66.3 >= 1.66.3 must be true"
+    ver_ge "2.0" "1.99.9" || fail "pure bash ver_ge: 2.0 >= 1.99.9 must be true"
+    if ver_ge "1.66.2" "1.66.3"; then
+      fail "pure bash ver_ge: 1.66.2 >= 1.66.3 must be false"
+    fi
+
+    # 测试 check_tailscale_status（含旧版本升级提示）
+    sleep() { :; }
+    command() {
+      if [[ "$1" == -v && "$2" == tailscale ]]; then return 0; fi
+      if [[ "$1" == -v && "$2" == systemctl ]]; then return 0; fi
+      builtin command "$@"
+    }
+    systemctl() { return 0; }
+    tailscale() { printf '1.50.0\n  tailscale commit: abcdef1\n'; }
+    local out
+    check_tailscale_status 2>/dev/null
+    [[ "$TS_INSTALLED" -eq 1 && "$TS_RUNNING" -eq 1 && "$TS_VER_OK" -eq 0 ]] ||
+      fail "old tailscale should set TS_INSTALLED=1 TS_RUNNING=1 TS_VER_OK=0"
+    out=$(check_tailscale_status 2>&1)
+    [[ "$out" == *"检测到 Tailscale 版本较旧"* ]] || fail "old tailscale should emit upgrade hint"
+
+    tailscale() { printf '1.80.0\n'; }
+    check_tailscale_status 2>/dev/null
+    [[ "$TS_VER_OK" -eq 1 && "$TS_VERSION" == "1.80.0" ]] || fail "new tailscale should satisfy version check"
+  )
+  ok "ver_ge pure-bash fallback and check_tailscale_status work accurately"
+}
+
+test_check_pure_ip_ports_ownership_and_cert_days() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local u_new u_old u_bad
+    u_new="ExecStart=/usr/local/bin/derper -hostname 8.8.8.8 -certmode manual -certdir /opt/derper/certs -http-port -1 -a :30399 -stun"
+    check_pure_ip_from_unit "$u_new"
+    [[ "$PURE_IP_OK" -eq 1 ]] || fail "valid -a unit should set PURE_IP_OK=1"
+
+    u_old="ExecStart=/usr/local/bin/derper -hostname 8.8.8.8 -certmode manual -certdir /opt/derper/certs -http-port -1 -https-port 30399 -stun"
+    check_pure_ip_from_unit "$u_old"
+    [[ "$PURE_IP_OK" -eq 1 ]] || fail "valid -https-port unit should set PURE_IP_OK=1"
+
+    u_bad="ExecStart=/usr/local/bin/derper -hostname example.com -certmode letsencrypt -a :30399 -stun"
+    check_pure_ip_from_unit "$u_bad"
+    [[ "$PURE_IP_OK" -eq 0 ]] || fail "domain unit must set PURE_IP_OK=0"
+
+    # check_ports_status: ss 分支与 netstat 回退分支
+    DERP_PORT="30399" STUN_PORT="3478"
+    command() {
+      if [[ "$1" == -v && "$2" == ss ]]; then return 1; fi
+      if [[ "$1" == -v && "$2" == netstat ]]; then return 0; fi
+      builtin command "$@"
+    }
+    netstat() {
+      if [[ "$1" == "-ltnp" ]]; then echo "tcp 0 0 0.0.0.0:30399 0.0.0.0:* LISTEN 999/derper"; fi
+      if [[ "$1" == "-lunp" ]]; then echo "udp 0 0 0.0.0.0:3478 0.0.0.0:* 999/derper"; fi
+    }
+    check_ports_status
+    [[ "$PORT_TLS_OK" -eq 1 && "$PORT_STUN_OK" -eq 1 ]] || fail "netstat fallback should detect TLS and STUN listeners"
+
+    # current_derper_owns_ports: MainPID 核对
+    CURRENT_DERPER_OWNS_PORTS=0
+    command() {
+      if [[ "$1" == -v && ( "$2" == systemctl || "$2" == ss ) ]]; then return 0; fi
+      builtin command "$@"
+    }
+    systemctl() {
+      if [[ "$1" == "is-active" ]]; then return 0; fi
+      if [[ "$1" == "show" ]]; then echo "4321"; return 0; fi
+      return 1
+    }
+    ss() {
+      printf 'tcp LISTEN 0 128 *:30399 *:* users:(("derper",pid=4321,fd=3))\nudp UNCONN 0 0 *:3478 *:* users:(("derper",pid=4321,fd=4))\n'
+    }
+    current_derper_owns_ports || fail "matching MainPID should own ports"
+    [[ "$CURRENT_DERPER_OWNS_PORTS" -eq 1 ]] || fail "CURRENT_DERPER_OWNS_PORTS should be 1"
+
+    CURRENT_DERPER_OWNS_PORTS=0
+    ss() {
+      printf 'tcp LISTEN 0 128 *:30399 *:* users:(("nginx",pid=1111,fd=3))\nudp UNCONN 0 0 *:3478 *:* users:(("unbound",pid=2222,fd=4))\n'
+    }
+    current_derper_owns_ports && fail "foreign process must not be treated as derper owning ports"
+
+    # cert_days_remaining 实测
+    if builtin command -v openssl >/dev/null 2>&1; then
+      local_tmp=$(mktemp -d)
+      trap 'rm -rf "$local_tmp"' EXIT
+      INSTALL_DIR="$local_tmp"
+      IP_ADDR="203.0.113.10"
+      mkdir -p "${INSTALL_DIR}/certs"
+      openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
+        -keyout "${INSTALL_DIR}/certs/203.0.113.10.key" \
+        -out "${INSTALL_DIR}/certs/203.0.113.10.crt" \
+        -days 30 -subj "/CN=203.0.113.10" >/dev/null 2>&1
+      local days
+      days=$(cert_days_remaining)
+      [[ -n "$days" && "$days" -ge 28 && "$days" -le 30 ]] ||
+        fail "30-day certificate should report ~29-30 days remaining, got: ${days:-empty}"
+    fi
+  )
+  ok "check_pure_ip_from_unit, check_ports_status, current_derper_owns_ports, and cert_days_remaining work"
+}
+
+test_install_deps_and_ensure_go_sha256_verification() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local_tmp=$(mktemp -d)
+    trap 'rm -rf "$local_tmp"' EXIT
+    _tmpdir="$local_tmp"
+
+    # 1) 所有依赖存在时跳过包管理器
+    command() {
+      if [[ "$1" == -v ]]; then return 0; fi
+      builtin command "$@"
+    }
+    apt() { fail "apt must not run when all deps are present"; }
+    install_deps >/dev/null
+
+    # 2) 缺少 nc 与 ss 时通过 apt 按需安装 netcat-openbsd 与 iproute2
+    local installed_pkgs=""
+    command() {
+      if [[ "$1" == -v ]]; then
+        case "$2" in
+          nc|ss) return 1 ;;
+          apt|curl|openssl|git|tar) return 0 ;;
+          *) return 1 ;;
+        esac
+      fi
+      builtin command "$@"
+    }
+    apt() {
+      if [[ "$1" == "install" ]]; then
+        installed_pkgs="$*"
+      fi
+      return 0
+    }
+    install_deps >/dev/null 2>&1
+    [[ "$installed_pkgs" == *"netcat-openbsd"* && "$installed_pkgs" == *"iproute2"* ]] ||
+      fail "install_deps on apt should install netcat-openbsd and iproute2, got: $installed_pkgs"
+
+    # 3) ensure_go: 不支持的架构报错退出
+    go_toolchain_meets_min() { return 1; }
+    command() {
+      if [[ "$1" == -v && "$2" == go ]]; then return 0; fi
+      if [[ "$1" == -v && "$2" == curl ]]; then return 0; fi
+      if [[ "$1" == -v && "$2" == sha256sum ]]; then return 0; fi
+      builtin command "$@"
+    }
+    go() { echo "go version go1.18.1 linux/amd64"; }
+    uname() { echo "riscv64"; }
+    local out rc=0
+    out=$(ensure_go 2>&1) || rc=$?
+    [[ "$rc" -ne 0 && "$out" == *"未支持的架构"* ]] || fail "unsupported arch must fail ensure_go"
+
+    # 4) ensure_go: SHA256 校验不匹配时必须拒绝并删除损坏包
+    uname() { echo "x86_64"; }
+    precheck_go_download() { return 0; }
+    curl() {
+      # 将伪造内容写入 -o 指定的 tarball
+      while [[ $# -gt 0 ]]; do
+        if [[ "$1" == "-o" ]]; then
+          printf 'corrupted-tarball\n' >"$2"
+          return 0
+        fi
+        shift
+      done
+      return 0
+    }
+    sha256sum() { echo "0000000000000000000000000000000000000000000000000000000000000000  $1"; }
+    rc=0
+    out=$(ensure_go 2>&1) || rc=$?
+    [[ "$rc" -ne 0 && "$out" == *"SHA256 校验失败"* ]] ||
+      fail "mismatched Go tarball SHA256 must abort ensure_go, got rc=$rc out=$out"
+    [[ ! -e "${_tmpdir}/go${GO_VERSION}.linux-amd64.tar.gz" ]] ||
+      fail "corrupted tarball must be removed after SHA256 failure"
+  )
+  ok "install_deps and ensure_go SHA256/architecture checks work properly"
+}
+
+test_derper_flag_detection_with_exit_code_2() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local_tmp=$(mktemp -d)
+    trap 'rm -rf "$local_tmp"' EXIT
+    BIN_PATH="${local_tmp}/derper"
+
+    # 新版 derper -h：输出含 -a、-stun-port、-socket，并以 exit 2 退出
+    cat >"$BIN_PATH" <<'EOF'
+#!/usr/bin/env bash
+cat >&2 <<'HELP'
+Usage of derper:
+  -a string
+        server address (default ":443")
+  -stun-port int
+        The UDP port on which to serve STUN. (default 3478)
+  -socket string
+        path to tailscaled unix socket
+HELP
+exit 2
+EOF
+    chmod +x "$BIN_PATH"
+    derper_supports_listen_a || fail "should detect -a even when derper -h exits 2"
+    derper_supports_stun_port || fail "should detect -stun-port"
+    derper_supports_socket_flag || fail "should detect -socket"
+    derper_supports_https_port && fail "should not detect -https-port when absent"
+
+    # 旧版 derper -h：仅含 -https-port，无 -a/-stun-port/-socket
+    cat >"$BIN_PATH" <<'EOF'
+#!/usr/bin/env bash
+cat >&2 <<'HELP'
+Usage of derper:
+  -https-port int
+        The port on which to serve HTTPS. (default 443)
+HELP
+exit 2
+EOF
+    chmod +x "$BIN_PATH"
+    derper_supports_https_port || fail "should detect legacy -https-port"
+    if derper_supports_listen_a; then fail "legacy derper should not report -a"; fi
+    if derper_supports_stun_port; then fail "legacy derper should not report -stun-port"; fi
+    if derper_supports_socket_flag; then fail "legacy derper should not report -socket"; fi
+  )
+  ok "derper flag detection functions handle exit code 2 under pipefail"
+}
+
+test_harden_cert_dir_layout_check_and_finalize_report_fallbacks() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local_tmp=$(mktemp -d)
+    trap 'rm -rf "$local_tmp"' EXIT
+    INSTALL_DIR="${local_tmp}/install"
+    SERVICE_PATH="${local_tmp}/derper.service"
+    IP_ADDR="203.0.113.10"
+    DERP_PORT="30399"
+    mkdir -p "$INSTALL_DIR"
+
+    # 1) certs 目录本身为符号链接时，harden_cert_dir 必须拒绝
+    mkdir -p "${local_tmp}/real_certs"
+    ln -s "${local_tmp}/real_certs" "${INSTALL_DIR}/certs"
+    if harden_cert_dir >/dev/null 2>&1; then
+      fail "harden_cert_dir must refuse symlinked certs directory"
+    fi
+    rm -f "${INSTALL_DIR}/certs"
+
+    # 2) journal_certname_raw 解析 journalctl 输出
+    command() {
+      if [[ "$1" == -v && "$2" == journalctl ]]; then return 0; fi
+      builtin command "$@"
+    }
+    journalctl() {
+      printf 'derper[100]: listening on :30399\nderper[100]: cert fingerprint sha256-raw:11223344aabbccdd\n'
+    }
+    [[ "$(journal_certname_raw)" == "11223344aabbccdd" ]] ||
+      fail "journal_certname_raw should extract hex fingerprint from journalctl"
+
+    # 3) finalize_deployment_report 三级回退：live -> journal -> disk
+    live_cert_sha256_raw() { echo "livefp1234"; }
+    local rep
+    rep=$(finalize_deployment_report) || fail "finalize should succeed with live fingerprint"
+    [[ "$rep" == *'"CertName": "sha256-raw:livefp1234"'* ]] || fail "should use live fingerprint first"
+
+    live_cert_sha256_raw() { return 1; }
+    journal_certname_raw() { echo "journalfp5678"; }
+    rep=$(finalize_deployment_report) || fail "finalize should fall back to journal fingerprint"
+    [[ "$rep" == *'"CertName": "sha256-raw:journalfp5678"'* ]] || fail "should use journal fingerprint second"
+
+    journal_certname_raw() { return 1; }
+    cert_file_sha256_raw() { echo "diskfp9999"; }
+    rep=$(finalize_deployment_report) || fail "finalize should fall back to disk cert fingerprint"
+    [[ "$rep" == *'"CertName": "sha256-raw:diskfp9999"'* ]] || fail "should use disk fingerprint third"
+  )
+  ok "harden_cert_dir symlink check, journal_certname_raw, and finalize_deployment_report fallback chain work"
+}
+
+test_socket_access_owner_group_and_setup_service_user() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local_tmp=$(mktemp -d)
+    trap 'rm -rf "$local_tmp"' EXIT
+    local sock="${local_tmp}/tailscaled.sock"
+    if command -v python3 >/dev/null 2>&1; then
+      python3 -c "import socket,os;p=r'''${sock}''';
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM);
+os.path.exists(p) and os.unlink(p);s.bind(p);os.chmod(p,0o600);s.close()" 2>/dev/null || true
+    fi
+    if [[ -S "$sock" ]]; then
+      # 1) 属主匹配时返回 0
+      stat() {
+        case "$2" in
+          "%a") echo "600" ;;
+          "%U") echo "derper" ;;
+          "%G") echo "root" ;;
+        esac
+      }
+      user_can_access_socket "derper" "$sock" || fail "socket owner should have access"
+
+      # 2) 属组匹配且组权限 rw（660）且用户在组内时返回 0
+      stat() {
+        case "$2" in
+          "%a") echo "660" ;;
+          "%U") echo "root" ;;
+          "%G") echo "tailscale" ;;
+        esac
+      }
+      id() {
+        if [[ "$1" == "-nG" ]]; then echo "derper tailscale"; return 0; fi
+        builtin command id "$@"
+      }
+      user_can_access_socket "derper" "$sock" || fail "user in socket group with 0660 should have access"
+
+      # 3) 属主/属组均不匹配且 0600，且 runuser/sudo 失败 -> 返回 1
+      stat() {
+        case "$2" in
+          "%a") echo "600" ;;
+          "%U") echo "root" ;;
+          "%G") echo "root" ;;
+        esac
+      }
+      command() {
+        if [[ "$1" == -v && ( "$2" == runuser || "$2" == sudo ) ]]; then return 1; fi
+        builtin command "$@"
+      }
+      user_can_access_socket "derper" "$sock" && fail "0600 root socket must not be accessible to derper"
+      unset -f stat id command
+    fi
+
+    # 4) setup_service_user：新用户创建（首选失败回退 useradd --system）
+    INSTALL_DIR="${local_tmp}/install"
+    mkdir -p "${INSTALL_DIR}/certs"
+    RUN_USER="derper_new"
+    local user_created=0 useradd_calls=0
+    id() {
+      if [[ "${1:-}" == "derper_new" || "${2:-}" == "derper_new" || "${3:-}" == "derper_new" ]]; then
+        [[ "$user_created" -eq 1 ]] && { echo "derper_new"; return 0; } || return 1
+      fi
+      builtin command id "$@"
+    }
+    getent() { return 1; }
+    groupadd() { return 0; }
+    useradd() {
+      useradd_calls=$((useradd_calls + 1))
+      if [[ "$useradd_calls" -eq 1 ]]; then
+        return 1  # 模拟第一次 useradd -r -M 失败，触发 --system 回退
+      fi
+      user_created=1
+      return 0
+    }
+    chown() { return 0; }
+    harden_cert_dir() { return 0; }
+    setup_service_user >/dev/null
+    [[ "$user_created" -eq 1 && "$useradd_calls" -eq 2 ]] ||
+      fail "setup_service_user should create user via fallback useradd --system"
+
+    # 5) setup_service_user：useradd 全部失败时退出 1
+    user_created=0
+    useradd() { return 1; }
+    if ( setup_service_user >/dev/null 2>&1 ); then
+      fail "setup_service_user must exit non-zero when useradd completely fails"
+    fi
+  )
+  ok "user_can_access_socket and setup_service_user cover owner/group/fallback/failure paths"
+}
+
+test_write_systemd_service_branches_paranoid_fallback_and_rollback() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local_tmp=$(mktemp -d)
+    trap 'rm -rf "$local_tmp"' EXIT
+    INSTALL_DIR="${local_tmp}/install"
+    SERVICE_PATH="${local_tmp}/derper.service"
+    BIN_PATH="/usr/local/bin/derper"
+    IP_ADDR="203.0.113.10"
+    DERP_PORT="30399"
+    STUN_PORT="3478"
+    RUN_USER="$(id -un)"
+    VERIFY_CLIENTS_MODE="off"
+    SECURITY_LEVEL="basic"
+    mkdir -p "$INSTALL_DIR"
+    setup_service_user() { return 0; }
+
+    # 1) 旧版 derper：无 -a、有 -https-port 时生成 -https-port
+    derper_supports_stun_port() { return 1; }
+    derper_supports_listen_a() { return 1; }
+    derper_supports_https_port() { return 0; }
+    service_verified_running() { return 0; }
+    systemctl() { return 0; }
+    write_systemd_service >/dev/null
+    grep -qF -- "-https-port 30399" "$SERVICE_PATH" || fail "legacy derper should use -https-port 30399"
+
+    # 2) 无 systemctl 环境：阻断并打印手动前台运行命令
+    command() {
+      if [[ "$1" == -v && "$2" == systemctl ]]; then return 1; fi
+      builtin command "$@"
+    }
+    local out rc=0
+    out=$(write_systemd_service 2>&1) || rc=$?
+    [[ "$rc" -ne 0 && "$out" == *"未检测到 systemd"* && "$out" == *"手动前台运行 derper"* ]] ||
+      fail "missing systemctl must block write_systemd_service and print manual command"
+    unset -f command
+
+    # 3) paranoid 首次启动验证失败 -> 自动降级禁用 MemoryDenyWriteExecute 并重试成功
+    SECURITY_LEVEL="paranoid"
+    derper_supports_listen_a() { return 0; }
+    derper_supports_stun_port() { return 0; }
+    local verify_attempt=0
+    service_verified_running() {
+      verify_attempt=$((verify_attempt + 1))
+      [[ "$verify_attempt" -ge 2 ]]
+    }
+    write_systemd_service >/dev/null 2>&1
+    grep -qF "# 安全加固（级别：paranoid；已禁用 MemoryDenyWriteExecute）" "$SERVICE_PATH" ||
+      fail "paranoid fallback must mark unit with degraded comment"
+    ! grep -qE '^MemoryDenyWriteExecute=' "$SERVICE_PATH" ||
+      fail "paranoid fallback must remove MemoryDenyWriteExecute directive"
+
+    # 4) 启动失败回滚：恢复旧备份 unit 并重启验证旧服务
+    SECURITY_LEVEL="standard"
+    printf '[Service]\nExecStart=/usr/local/bin/derper -hostname 203.0.113.10 -a :30399 -stun-port 3478\n' >"$SERVICE_PATH"
+    service_verified_running() { return 1; }
+    local restored_verified=0
+    verify_restored_service() { restored_verified=1; return 0; }
+    systemctl() { return 0; }
+    rc=0
+    out=$(write_systemd_service 2>&1) || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "failed service start must exit non-zero"
+    grep -qF "ExecStart=/usr/local/bin/derper -hostname 203.0.113.10 -a :30399 -stun-port 3478" "$SERVICE_PATH" ||
+      fail "failed service start must restore the backed-up unit file"
+  )
+  ok "write_systemd_service covers -https-port, no-systemd, paranoid degradation, and unit rollback"
+}
+
+test_legacy_nft_rule_cleanup_firewall_tips_and_runtime_checks() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    DERP_PORT="30399"
+    STUN_PORT="3478"
+    IP_ADDR="8.8.8.8"
+
+    # 1) remove_legacy_nft_derper_connlimit_rules 仅按 handle 删除 derper-tls-connlimit 规则
+    local nft_deleted=""
+    nft() {
+      if [[ "$1" == "-a" && "$2" == "list" ]]; then
+        cat <<'EOF'
+table inet derper {
+  chain input {
+    tcp dport 22 accept # handle 10
+    tcp dport 30399 ct state new comment "derper-tls-connlimit" drop # handle 42
+  }
+}
+EOF
+        return 0
+      fi
+      if [[ "$1" == "delete" && "$2" == "rule" ]]; then
+        nft_deleted+="$*"$'\n'
+        return 0
+      fi
+      return 0
+    }
+    remove_legacy_nft_derper_connlimit_rules
+    [[ "$nft_deleted" == *"delete rule inet derper input handle 42"* ]] ||
+      fail "must delete legacy nft rule handle 42, got: $nft_deleted"
+    [[ "$nft_deleted" != *"handle 10"* ]] ||
+      fail "must not delete unrelated handle 10"
+
+    # 2) print_firewall_tips：AUTO_UFW=1 自动执行 ufw allow
+    local_tmp=$(mktemp -d)
+    trap 'rm -rf "$local_tmp"' EXIT
+    AUTO_UFW=1
+    command() {
+      if [[ "$1" == -v && ( "$2" == ufw || "$2" == firewall-cmd ) ]]; then return 0; fi
+      builtin command "$@"
+    }
+    ufw() { printf '%s\n' "$*" >>"${local_tmp}/ufw.log"; return 0; }
+    check_extra_attack_surface() { return 0; }
+    check_automatic_updates() { return 0; }
+    local fw_out ufw_cmds
+    fw_out=$(print_firewall_tips 2>&1)
+    ufw_cmds=$(cat "${local_tmp}/ufw.log" 2>/dev/null || true)
+    [[ "$ufw_cmds" == *"allow 30399/tcp"* && "$ufw_cmds" == *"allow 3478/udp"* ]] ||
+      fail "AUTO_UFW=1 should run ufw allow for DERP and STUN ports, got: $ufw_cmds"
+    [[ "$fw_out" == *"firewall-cmd --permanent --add-port=30399/tcp"* ]] ||
+      fail "firewall-cmd hint should be printed when firewall-cmd is present"
+
+    # 3) runtime_checks：覆盖 ss、openssl 握手、nc 探测与 tailscale debug derp
+    command() {
+      if [[ "$1" == -v && ( "$2" == ss || "$2" == openssl || "$2" == nc || "$2" == tailscale ) ]]; then return 0; fi
+      builtin command "$@"
+    }
+    ss() { echo "LISTEN 0 128 *:30399 *:*"; }
+    _timeout_run() { shift; "$@"; }
+    openssl() { return 0; }
+    nc() { return 0; }
+    tailscale() {
+      if [[ "$1" == "debug" && "$2" == "derp" ]]; then
+        echo "DERP debug probe ok"
+        return 0
+      fi
+      return 1
+    }
+    local rt_out
+    rt_out=$(runtime_checks 2>&1)
+    [[ "$rt_out" == *"TLS 握手成功"* && "$rt_out" == *"DERP debug probe ok"* ]] ||
+      fail "runtime_checks should report TLS success and tailscale debug derp output"
+  )
+  ok "legacy nft handle cleanup, print_firewall_tips, and runtime_checks work"
+}
+
+test_health_check_report_expiry_tiers_and_uninstall_purge_modes() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local_tmp=$(mktemp -d)
+    trap 'rm -rf "$local_tmp"' EXIT
+    IP_ADDR="8.8.8.8"
+    METRICS_TEXTFILE="${local_tmp}/derper.prom"
+    infer_ip_from_existing_deployment() { :; }
+    infer_healthcheck_settings_from_unit() { :; }
+    validate_settings() { return 0; }
+    check_tailscale_status() { :; }
+    check_derper_status() {
+      DERPER_RUNNING=1 PORT_TLS_OK=1 PORT_STUN_OK=1 PURE_IP_OK=1 DESIRED_CONFIG_OK=1
+      DERPER_VERIFY_CLIENTS_EFFECTIVE=1
+    }
+    check_cert_status() {
+      CERT_PRESENT=1 CERT_NAMING_OK=1 CERT_SAN_MATCH=1 CERT_EXPIRY_OK=1
+    }
+    check_live_cert_status() { LIVE_CERT_CHECKED=1 CERT_LIVE_MATCH=1; }
+    check_extra_attack_surface() { EXTRA_LISTENERS=""; }
+    check_automatic_updates() { :; }
+
+    # 1) 证书有效期 >= 90 天（正常 ok 档）及 30~89 天（90 天预警档）
+    cert_days_remaining() { echo "120"; }
+    local h_out
+    h_out=$(health_check_report 2>&1)
+    [[ "$h_out" == *"✅ 证书：有效期剩余 120 天"* && -f "$METRICS_TEXTFILE" ]] ||
+      fail "health_check_report should report >=90 days as ok and write metrics file"
+
+    cert_days_remaining() { echo "45"; }
+    h_out=$(health_check_report 2>&1)
+    [[ "$h_out" == *"有效期剩余 45 天（90 天预警"* ]] ||
+      fail "health_check_report should report 90-day warning tier for 45 days"
+
+    # 2) 证书有效期 7~29 天（30 天预警）与 0~6 天（7 天预警）
+    cert_days_remaining() { echo "10"; }
+    h_out=$(health_check_report 2>&1)
+    [[ "$h_out" == *"有效期剩余 10 天（30 天预警"* ]] || fail "health_check_report should warn when <30 days left"
+
+    cert_days_remaining() { echo "3"; }
+    h_out=$(health_check_report 2>&1)
+    [[ "$h_out" == *"有效期剩余 3 天（7 天预警"* ]] || fail "health_check_report should warn when <7 days left"
+
+    # 3) 证书已过期（< 0 天）
+    cert_days_remaining() { echo "-5"; }
+    h_out=$(health_check_report 2>&1)
+    [[ "$h_out" == *"已过期"* ]] || fail "health_check_report should flag expired cert"
+
+    # 4) uninstall_derper: --purge 与 --purge-all
+    require_root() { :; }
+    remove_healthcheck_cron() { :; }
+    remove_tls_connlimit() { :; }
+    systemctl() { return 0; }
+    SERVICE_PATH="${local_tmp}/derper.service"
+    INSTALL_DIR="${local_tmp}/install"
+    BIN_PATH="${local_tmp}/derper"
+    mkdir -p "$INSTALL_DIR"
+    printf '[Service]\nUser=derper_custom\n' >"$SERVICE_PATH"
+    printf '#!/bin/sh\n' >"$BIN_PATH"
+    chmod +x "$BIN_PATH"
+
+    UNINSTALL=1 PURGE=1 PURGE_ALL=0
+    uninstall_derper >/dev/null 2>&1
+    [[ ! -d "$INSTALL_DIR" && -x "$BIN_PATH" ]] ||
+      fail "--uninstall --purge must remove INSTALL_DIR but keep BIN_PATH"
+
+    mkdir -p "$INSTALL_DIR"
+    printf '[Service]\nUser=derper_custom\n' >"$SERVICE_PATH"
+    UNINSTALL=1 PURGE=1 PURGE_ALL=1
+    local u_out
+    u_out=$(uninstall_derper 2>&1)
+    [[ ! -d "$INSTALL_DIR" && ! -e "$BIN_PATH" ]] ||
+      fail "--uninstall --purge-all must remove both INSTALL_DIR and BIN_PATH"
+    [[ "$u_out" == *"userdel derper_custom"* ]] ||
+      fail "--purge-all should suggest userdel for detected non-root service user"
+  )
+  ok "health_check_report expiry tiers and uninstall --purge/--purge-all work"
+}
+
+test_deployment_wizard_full_flow_and_validation() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local_tmp=$(mktemp -d)
+    trap 'rm -rf "$local_tmp"' EXIT
+    cd "$local_tmp"
+
+    # 1) --non-interactive 与 wizard 冲突必须退出 1
+    NON_INTERACTIVE=1
+    local out rc=0
+    out=$(deployment_wizard 2>&1) || rc=$?
+    [[ "$rc" -ne 0 && "$out" == *"与 --non-interactive/--yes 冲突"* ]] ||
+      fail "wizard must reject NON_INTERACTIVE=1"
+    NON_INTERACTIVE=0
+
+    # 2) 完整交互生成命令并保存 derper_deploy_cmd.sh（选 c 生产 / b 专用账户 / a 443 / b 不验证 / a 大陆代理 / n 不立即执行）
+    id() { echo 0; }
+    out=$(printf 'c\nb\na\nb\na\nn\n' | deployment_wizard 2>&1) || fail "wizard command generation should succeed"
+    [[ -x "${local_tmp}/derper_deploy_cmd.sh" ]] || fail "wizard must create executable derper_deploy_cmd.sh"
+    local cmd_file
+    cmd_file=$(cat "${local_tmp}/derper_deploy_cmd.sh")
+    [[ "$cmd_file" == *"--dedicated-user"* && "$cmd_file" == *"--derp-port 443"* ]] ||
+      fail "wizard command missing user/port flags: $cmd_file"
+    [[ "$cmd_file" == *"--no-verify-clients"* && "$cmd_file" == *"--security-level paranoid"* ]] ||
+      fail "wizard command missing verify/security flags: $cmd_file"
+    [[ "$cmd_file" == *"--goproxy"* && "$cmd_file" == *"goproxy.cn"* ]] ||
+      fail "wizard command missing goproxy flag: $cmd_file"
+
+    # 3) 选择立即执行（y）但输入非法 IP（如 999.1.1.1）时报错退出 1
+    rc=0
+    out=$(printf 'a\na\nb\na\nb\ny\n999.1.1.1\n' | deployment_wizard 2>&1) || rc=$?
+    [[ "$rc" -ne 0 && "$out" == *"超出范围"* ]] ||
+      fail "wizard must reject out-of-range IP octets, rc=$rc"
+
+    # 4) 选择立即执行（y）、输入合法 IP、但在最终确认输入 no 时安全取消
+    out=$(printf 'a\na\nb\na\nb\ny\n8.8.8.8\nno\n' | deployment_wizard 2>&1) ||
+      fail "wizard final confirmation 'no' should cancel cleanly"
+    [[ "$out" == *"已取消执行"* ]] || fail "wizard should report cancellation when final confirm is no"
+  )
+  ok "deployment_wizard covers non-interactive conflict, command generation, IP validation, and cancel"
+}
+
+test_main_modes_end_to_end_orchestration() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    check_os_environment() { :; }
+    require_root() { :; }
+    recover_cert_update() { return 0; }
+    check_tailscale_status() { TS_INSTALLED=1 TS_RUNNING=1 TS_VERSION="1.80.0" TS_VER_OK=1; }
+    check_derper_status() {
+      DERPER_BIN=1 DERPER_SERVICE_PRESENT=1 DERPER_RUNNING=1 PURE_IP_OK=1
+      DESIRED_CONFIG_OK=1 DERPER_VERIFY_CLIENTS_EFFECTIVE=1
+      PORT_TLS_OK=1 PORT_STUN_OK=1
+      TS_LOCALAPI_OK=1 TS_AUTH_UNKNOWN=0
+    }
+    check_cert_status() {
+      CERT_PRESENT=1 CERT_NAMING_OK=1 CERT_SAN_MATCH=1 CERT_EXPIRY_OK=1
+    }
+    check_live_cert_status() { LIVE_CERT_CHECKED=1 CERT_LIVE_MATCH=1; }
+    cert_layout_is_ok() { return 0; }
+    check_extra_attack_surface() { EXTRA_LISTENERS=""; }
+    check_automatic_updates() { AUTO_UPDATES_OK=1; }
+
+    # 1) main --check：合法参数返回 0；非法参数仍输出总结但返回 1
+    local out rc=0
+    out=$(main --check --ip 8.8.8.8 2>&1) || rc=$?
+    [[ "$rc" -eq 0 && "$out" == *"[检查] 参数与环境状态总结："* && "$out" == *"<已就绪：可直接跳过>"* ]] ||
+      fail "main --check with healthy state should return 0 and suggest skip"
+
+    rc=0
+    out=$(main --check --ip 8.8.8.8 --derp-port 70000 2>&1) || rc=$?
+    [[ "$rc" -ne 0 && "$out" == *"[检查结束]"* ]] ||
+      fail "main --check with invalid port must print summary and return non-zero"
+
+    # 2) main --health-check：健康退出 0，不健康退出 1
+    cert_days_remaining() { echo "120"; }
+    out=$(main --health-check --ip 8.8.8.8 2>&1) || fail "healthy main --health-check must exit 0"
+    check_live_cert_status() { LIVE_CERT_CHECKED=1 CERT_LIVE_MATCH=0; }
+    rc=0
+    out=$(main --health-check --ip 8.8.8.8 2>&1) || rc=$?
+    [[ "$rc" -ne 0 ]] || fail "unhealthy main --health-check must exit non-zero"
+    check_live_cert_status() { LIVE_CERT_CHECKED=1 CERT_LIVE_MATCH=1; }
+
+    # 3) main 默认幂等模式：一切就绪时直接跳过安装退出 0
+    precheck_verify_clients() { return 0; }
+    align_derper_version_with_tailscale() { :; }
+    derper_binary_needs_install() { return 1; }
+    ensure_compatible_certs() { CERTS_CHANGED=0; return 0; }
+    commit_cert_update() { return 0; }
+    run_post_deploy_extras() { return 0; }
+    write_systemd_service() { fail "idempotent ready state must not rewrite systemd service"; }
+    out=$(main --ip 8.8.8.8 2>&1) || fail "idempotent main should exit 0 when already healthy"
+    [[ "$out" == *"已就绪：检测到 derper 正在以纯 IP 模式运行，跳过安装"* ]] ||
+      fail "idempotent main should print ready message"
+
+    # 4) main --repair：执行修复与收尾报告
+    local steps=""
+    install_deps() { steps+="deps,"; }
+    install_derper() { steps+="derper,"; }
+    ensure_compatible_certs() { steps+="certs,"; return 0; }
+    check_port_conflicts() { steps+="ports,"; }
+    write_systemd_service() { steps+="unit,"; }
+    print_firewall_tips() { steps+="fw,"; }
+    runtime_checks() { steps+="rt,"; }
+    commit_cert_update() { steps+="commit,"; return 0; }
+    run_post_deploy_extras() { steps+="extras,"; return 0; }
+    finalize_deployment_report() { steps+="report"; return 0; }
+    (
+      main --repair --ip 8.8.8.8 >/dev/null 2>&1
+      [[ "$steps" == "deps,certs,ports,unit,fw,rt,commit,extras,report" ]] || exit 1
+    ) || fail "main --repair must execute expected pipeline steps in order"
+
+    # 5) main --force：全量重装编排
+    steps=""
+    generate_selfsigned_cert() { steps+="gencert,"; }
+    (
+      main --force --ip 8.8.8.8 >/dev/null 2>&1
+      [[ "$steps" == "deps,derper,gencert,ports,unit,fw,rt,commit,extras,report" ]] || exit 1
+    ) || fail "main --force must execute full reinstall pipeline steps in order"
+  )
+  ok "main end-to-end orchestration covers --check, --health-check, idempotent, --repair, and --force"
+}
+
+test_helper_primitives_cert_resolve_atomic_copy_and_auth_visibility() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local tmp py_pid=""
+    tmp=$(mktemp -d)
+    trap 'if [[ -n "$py_pid" ]]; then kill "$py_pid" 2>/dev/null || true; wait "$py_pid" 2>/dev/null || true; fi; rm -rf "$tmp"' EXIT
+    INSTALL_DIR="$tmp/derper"
+    mkdir -p "$INSTALL_DIR/certs"
+    IP_ADDR="8.8.8.8"
+
+    # 1) derper_manual_cert_basename 过滤非安全字符（与上游 unsafeHostnameCharacters 对齐）
+    [[ "$(derper_manual_cert_basename "8.8.8.8:8443/evil")" == "8.8.8.88443evil" ]] ||
+      fail "derper_manual_cert_basename must strip unsafe hostname characters"
+
+    # 2) resolve_disk_cert_pem / resolve_disk_key_pem 优先级：上游命名 -> cert.pem/key.pem -> fullchain.pem/privkey.pem
+    if resolve_disk_cert_pem >/dev/null 2>&1; then
+      fail "resolve_disk_cert_pem must fail when no cert exists"
+    fi
+    echo "fullchain" >"$INSTALL_DIR/certs/fullchain.pem"
+    echo "privkey" >"$INSTALL_DIR/certs/privkey.pem"
+    [[ "$(resolve_disk_cert_pem)" == "$INSTALL_DIR/certs/fullchain.pem" ]] ||
+      fail "resolve_disk_cert_pem should fall back to fullchain.pem"
+    [[ "$(resolve_disk_key_pem)" == "$INSTALL_DIR/certs/privkey.pem" ]] ||
+      fail "resolve_disk_key_pem should fall back to privkey.pem"
+
+    echo "cert" >"$INSTALL_DIR/certs/cert.pem"
+    echo "key" >"$INSTALL_DIR/certs/key.pem"
+    [[ "$(resolve_disk_cert_pem)" == "$INSTALL_DIR/certs/cert.pem" ]] ||
+      fail "resolve_disk_cert_pem should prefer cert.pem over fullchain.pem"
+    [[ "$(resolve_disk_key_pem)" == "$INSTALL_DIR/certs/key.pem" ]] ||
+      fail "resolve_disk_key_pem should prefer key.pem over privkey.pem"
+
+    echo "upstream-crt" >"$INSTALL_DIR/certs/8.8.8.8.crt"
+    echo "upstream-key" >"$INSTALL_DIR/certs/8.8.8.8.key"
+    [[ "$(resolve_disk_cert_pem)" == "$INSTALL_DIR/certs/8.8.8.8.crt" ]] ||
+      fail "resolve_disk_cert_pem should prefer upstream <IP>.crt"
+    [[ "$(resolve_disk_key_pem)" == "$INSTALL_DIR/certs/8.8.8.8.key" ]] ||
+      fail "resolve_disk_key_pem should prefer upstream <IP>.key"
+
+    # 3) atomic_copy_file：正常复制、源文件不存在失败、目标为符号链接拒绝
+    echo "unit-backup" >"$tmp/src.unit"
+    atomic_copy_file "$tmp/src.unit" "$tmp/dest.unit" || fail "atomic_copy_file should succeed on regular files"
+    [[ "$(cat "$tmp/dest.unit")" == "unit-backup" ]] || fail "atomic_copy_file content mismatch"
+    if atomic_copy_file "$tmp/nonexistent.unit" "$tmp/dest.unit" 2>/dev/null; then
+      fail "atomic_copy_file must fail when source file does not exist"
+    fi
+    ln -s "$tmp/src.unit" "$tmp/symlink.unit"
+    if atomic_copy_file "$tmp/src.unit" "$tmp/symlink.unit" 2>/dev/null; then
+      fail "atomic_copy_file must refuse symlink destination"
+    fi
+
+    # 4) note_tailscaled_auth_visibility：区分未开启 verify-clients、tailscaled 未运行、socket 不可读写（unknown）与正常可读（ok）
+    DERPER_VERIFY_CLIENTS_EFFECTIVE=0
+    TS_RUNNING=1
+    note_tailscaled_auth_visibility
+    [[ "$TS_AUTH_UNKNOWN" -eq 0 && "$TS_LOCALAPI_OK" -eq 0 ]] ||
+      fail "note_tailscaled_auth_visibility should be noop when verify-clients is off"
+
+    DERPER_VERIFY_CLIENTS_EFFECTIVE=1
+    TS_RUNNING=0
+    note_tailscaled_auth_visibility
+    [[ "$TS_AUTH_UNKNOWN" -eq 0 && "$TS_LOCALAPI_OK" -eq 0 ]] ||
+      fail "note_tailscaled_auth_visibility should leave unknown=0 when tailscaled is stopped"
+
+    TS_RUNNING=1
+    expected_tailscaled_socket() { echo "$tmp/missing.sock"; }
+    note_tailscaled_auth_visibility
+    [[ "$TS_AUTH_UNKNOWN" -eq 1 && "$TS_LOCALAPI_OK" -eq 0 ]] ||
+      fail "note_tailscaled_auth_visibility must mark TS_AUTH_UNKNOWN=1 when socket is missing/unaccessible"
+
+    local probe_sock="$tmp/probe.sock" live_sock="$tmp/live.sock" ready_file="$tmp/live.ready"
+    rm -f "$probe_sock" "$live_sock" "$ready_file"
+    if command -v python3 >/dev/null 2>&1 \
+      && python3 -c 'import socket,sys,os
+p=sys.argv[1]
+s=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+os.path.exists(p) and os.unlink(p)
+s.bind(p)
+s.close()
+os.unlink(p)
+' "$probe_sock" 2>/dev/null; then
+      python3 - "$live_sock" "$ready_file" <<'PY' &
+import os, socket, sys, time
+# 故意晚于旧的 sleep 0.1，覆盖服务启动慢时的就绪等待。
+time.sleep(0.2)
+p, ready = sys.argv[1], sys.argv[2]
+if os.path.exists(p):
+    os.unlink(p)
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.bind(p)
+s.listen(1)
+s.settimeout(5)
+with open(ready, "w", encoding="ascii") as handle:
+    handle.write("listening\n")
+try:
+    conn, _ = s.accept()
+except socket.timeout:
+    s.close()
+    sys.exit(0)
+conn.settimeout(5)
+try:
+    conn.recv(1024)
+    conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+finally:
+    conn.close()
+    s.close()
+PY
+      py_pid=$!
+      local ready=0 waited=0
+      while [[ "$waited" -lt 30 ]]; do
+        if [[ -s "$ready_file" && -S "$live_sock" ]]; then
+          ready=1
+          break
+        fi
+        if ! kill -0 "$py_pid" 2>/dev/null; then
+          break
+        fi
+        sleep 0.1
+        waited=$((waited + 1))
+      done
+      if [[ "$ready" -eq 1 ]]; then
+        chmod 666 "$live_sock"
+        expected_tailscaled_socket() { echo "$live_sock"; }
+        note_tailscaled_auth_visibility
+        waited=0
+        while kill -0 "$py_pid" 2>/dev/null; do
+          sleep 0.1
+          waited=$((waited + 1))
+          if [[ "$waited" -ge 30 ]]; then
+            kill "$py_pid" 2>/dev/null || true
+            break
+          fi
+        done
+        wait "$py_pid" 2>/dev/null || true
+        py_pid=""
+        [[ "$TS_AUTH_UNKNOWN" -eq 0 && "$TS_LOCALAPI_OK" -eq 1 ]] ||
+          fail "note_tailscaled_auth_visibility must mark TS_LOCALAPI_OK=1 when LocalAPI responds 200"
+      else
+        kill "$py_pid" 2>/dev/null || true
+        wait "$py_pid" 2>/dev/null || true
+        py_pid=""
+        fail "LocalAPI test server did not become ready within 3 seconds"
+      fi
+    else
+      echo "# SKIP LocalAPI 200 probe (python3 or Unix socket bind unavailable)"
+    fi
+
+    # 5) tls_probe_endpoints：包含 127.0.0.1、localhost 与 IP_ADDR
+    local eps
+    eps=$(tls_probe_endpoints | tr '\n' ',')
+    [[ "$eps" == "127.0.0.1,localhost,8.8.8.8," ]] ||
+      fail "tls_probe_endpoints unexpected output: $eps"
+  )
+  ok "helper primitives (cert resolve, atomic_copy_file, auth visibility, tls_probe_endpoints) work as expected"
+}
+
+run_case() {
+  ( "$1" )
+}
+
+run_case test_no_crlf_and_syntax
+run_case test_source_does_not_run_main
+run_case test_source_survives_unset_user
+run_case test_unit_matching_detects_config_drift
+run_case test_unit_matching_rejects_wrong_socket_path
+run_case test_validate_settings_rejects_invalid_user
+run_case test_port_conflict_ignores_current_derper_service
+run_case test_service_reconcile_detects_runtime_failures_and_cert_regen
+run_case test_reconcile_detects_stale_live_cert
+run_case test_nonempty_config_uses_separate_c_argument
+run_case test_unsupported_custom_stun_port_is_rejected
+run_case test_empty_derper_config_is_migrated_for_auto_key_generation
+run_case test_verify_clients_passes_socket_flag
+run_case test_verify_clients_aligns_derper_version
+run_case test_ts_commit_parses_real_tailscale_output
+run_case test_manual_cert_uses_upstream_filenames
+run_case test_cert_fallback_temp_failure_is_handled
+run_case test_derper_binary_needs_reinstall_on_version_mismatch
+run_case test_paranoid_degraded_unit_is_accepted
+run_case test_start_limit_lives_in_unit_section
+run_case test_socket_access_skips_when_world_writable
+run_case test_health_requires_upstream_cert_naming
+run_case test_script_version_is_declared_and_consistent
+run_case test_acl_cert_snippet_uses_requested_region_endpoint_and_stun
+run_case test_missing_fingerprint_fails_instead_of_insecure_fallback
+run_case test_non_global_ips_rejected_unless_explicitly_allowed
+run_case test_region_id_safe_integer_range
+run_case test_argument_combinations_are_validated
+run_case test_cert_generation_refuses_symlinked_paths
+run_case test_acl_failure_never_emits_insecure_flag
+run_case test_extra_listener_detection_flags_attack_surface
+run_case test_automatic_updates_detection_runs
+run_case test_server_node_acl_advice_includes_tag
+run_case test_go_toolchain_rejects_pre_1_21
+run_case test_get_installed_derper_version_ignores_go_toolchain
+run_case test_port_conflict_allows_derper_tls_without_stun
+run_case test_port_conflict_rejects_foreign_stun
+run_case test_ensure_compatible_certs_migrates_legacy_names
+run_case test_ssh_session_via_tailscale_detects_cgnat
+run_case test_restart_tailscaled_socket_skips_over_tailscale_ssh
+run_case test_release_tmpdir_clears_deploy_temp
+run_case test_infer_ip_from_existing_unit
+run_case test_health_check_skips_external_ip_probe_when_ip_set
+run_case test_wizard_handles_eof_cleanly
+run_case test_cert_san_matches_literal_ip_only
+run_case test_live_certificate_mismatch_fails_health_check
+run_case test_metrics_writer_avoids_predictable_tmp_path
+run_case test_goproxy_probe_targets_skip_direct
+run_case test_precheck_go_network_fails_fast_with_hint
+run_case test_precheck_go_network_succeeds_when_reachable
+run_case test_get_installed_derper_version_without_strings
+run_case test_relax_socket_perms_restored_on_cleanup
+run_case test_cleanup_restores_relaxed_socket
+run_case test_world_writable_socket_is_warned
+run_case test_tls_connlimit_zero_is_noop
+run_case test_tls_connlimit_iptables_rule
+run_case test_tls_connlimit_removed_on_uninstall
+run_case test_install_healthcheck_cron_writes_job
+run_case test_uninstall_removes_healthcheck_cron
+run_case test_healthcheck_cron_conflicts_with_uninstall
+run_case test_tls_connlimit_parse_and_reject
+run_case test_module_query_survives_missing_timeout
+run_case test_install_derper_survives_missing_timeout
+run_case test_healthcheck_cron_conflicts_with_health_check
+run_case test_tls_connlimit_conflicts_with_readonly_modes
+run_case test_tls_connlimit_explicit_zero_removes_rules
+run_case test_install_healthcheck_cron_quotes_paths
+run_case test_precheck_go_network_allows_direct_fallback
+run_case test_overflow_numeric_args_are_rejected
+run_case test_healthcheck_cron_preserves_custom_deploy_flags
+run_case test_healthcheck_infers_settings_from_unit
+run_case test_tls_connlimit_nft_uses_script_owned_table
+run_case test_readme_documents_missing_flags_and_runnable_examples
+run_case test_unit_atomic_write_refuses_symlink
+run_case test_sha256_hex_rejects_empty_input
+run_case test_install_healthcheck_cron_rejects_missing_script
+run_case test_resolve_run_user_survives_unreadable_unit
+run_case test_commit_cert_update_clears_active_transaction
+run_case test_run_post_deploy_extras_keeps_verified_deploy
+run_case test_service_verified_skips_missing_probe_tools
+run_case test_timeout_run_fallback_does_not_block_command_substitution
+run_case test_main_commits_certs_before_post_deploy_extras
+run_case test_wizard_read_choice_rejects_invalid
+run_case test_sudo_user_validation_and_fallback
+run_case test_help_and_unknown_or_missing_value_args
+run_case test_require_root_and_check_os_environment
+run_case test_precheck_verify_clients_all_branches
+run_case test_ipv4_address_class_and_validate_settings_edge_cases
+run_case test_detect_public_ip_fallback_chain
+run_case test_ver_ge_pure_bash_fallback_and_tailscale_status
+run_case test_check_pure_ip_ports_ownership_and_cert_days
+run_case test_install_deps_and_ensure_go_sha256_verification
+run_case test_derper_flag_detection_with_exit_code_2
+run_case test_harden_cert_dir_layout_check_and_finalize_report_fallbacks
+run_case test_socket_access_owner_group_and_setup_service_user
+run_case test_write_systemd_service_branches_paranoid_fallback_and_rollback
+run_case test_legacy_nft_rule_cleanup_firewall_tips_and_runtime_checks
+run_case test_health_check_report_expiry_tiers_and_uninstall_purge_modes
+run_case test_deployment_wizard_full_flow_and_validation
+run_case test_main_modes_end_to_end_orchestration
+run_case test_helper_primitives_cert_resolve_atomic_copy_and_auth_visibility

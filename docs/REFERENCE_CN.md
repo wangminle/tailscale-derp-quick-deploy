@@ -3,7 +3,7 @@
 > 本文是中文的详细技术参考。主仓库首页 `README.md` 为精简版中文快速上手；英文详细参考见同目录的 `REFERENCE_EN.md`。
 
 > **脚本文件**：`deploy_derper_ip_selfsigned.sh`  
-> **当前版本**：0.2.13（2026-10-20）  
+> **当前版本**：0.2.14（2026-10-21）\
 > **查看版本**：`bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
@@ -276,8 +276,10 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 --relax-socket-perms      临时放宽 tailscaled socket 到 0666（不推荐，仅紧急情况；脚本退出时恢复）
 --tls-connlimit N         单 IP 并发 DERP TLS 连接上限（nft/iptables connlimit）
                           显式传 0 移除已装规则；省略该选项则不改动已有规则
+                          规则安装失败时保留原有规则并返回非 0；显式 0 移除失败或有残留同样返回非 0
                           不能与 --health-check/--check/--dry-run 同用
---install-healthcheck-cron  写入 /etc/cron.d/derper-healthcheck（每 5 分钟 --health-check）
+--install-healthcheck-cron  安装每 5 分钟的健康检查。有 systemd 时写 oneshot timer 并去掉旧 cron；否则用显式 bash 调用稳定副本写入 cron
+                          任一步失败回滚到原有调度并返回非 0；可在部署或 --repair 时附带，也可对已部署服务单独执行（幂等）
                           不能与 --uninstall/--health-check/--check/--dry-run 同用
 --yes, --non-interactive  非交互模式；不能代替证书指纹轮换确认
 --derper-version VER      指定 derper 版本（默认 latest），也接受 Git commit
@@ -294,10 +296,14 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
                           正式部署默认拒绝非全局可路由地址）
 
 # 运行与维护
---health-check            仅输出健康检查摘要（不更改系统，可用于 cron/监控；配置漂移/证书异常会返回非 0）
+--health-check            仅输出健康检查摘要（不更改系统，可用于 cron/监控）
+                          退出码：0 健康，1 已确认故障；2 保留给未知且不会被当成健康。任意非 0 都表示未通过
+                          --metrics-textfile 写入失败时仍输出摘要，但退出码为 1，旧指标文件保持不变
+                          不能与 --check/--dry-run/--repair/--force/--uninstall 同用
 --metrics-textfile <P>    将健康检查导出为 Prometheus 文本指标到路径 P
                           （必须与 --health-check 或 --install-healthcheck-cron 一起使用；结合 node_exporter 使用）
---uninstall               停止并卸载 derper 的 systemd 服务（保留二进制与证书；同时删除健康检查 cron 与 --tls-connlimit 规则）
+--uninstall               停止并卸载 derper 的 systemd 服务（保留二进制与证书；同时删除健康检查 timer/cron 与 --tls-connlimit 规则，
+                          /usr/local/lib/derper-deploy 下的健康检查稳定副本保留，可手动删除）
 --purge                   搭配 --uninstall：额外删除安装目录（/opt/derper）
 --purge-all               搭配 --uninstall：在 --purge 基础上同时删除二进制、/etc/derper/derper.env 和脚本创建的 tailscaled socket drop-in；防火墙规则和用户/组账户需手动确认
 ```
@@ -561,7 +567,7 @@ openssl x509 -in /opt/derper/certs/fullchain.pem -outform DER | sha256sum | awk 
 
 ## 监控与告警（健康检查 + Prometheus）
 
-### 健康检查（适合 cron 周期执行）
+### 健康检查（适合 cron/timer 周期执行）
 
 ```bash
 # 仅输出健康摘要（不更改系统）
@@ -577,13 +583,18 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 退出码语义（可用于 shell/监控判定）：
 
 ```text
-0  表示关键健康项正常（服务、端口、目标配置和证书均正常，在线证书与磁盘证书一致）
-1  表示至少一项关键健康检查失败
+0  关键健康项全部正常（服务、端口、目标配置和证书均正常，在线证书与磁盘证书一致；启用 -verify-clients 时 tailscaled 运行且 LocalAPI 可用）
+1  至少一项关键健康检查已确认失败，或 --metrics-textfile 写入失败
+2  结果未知：当前身份无权限读取证书目录，或无法确认 tailscaled LocalAPI 状态；未知不会被当成健康
 ```
+
+任意非 0 都表示未通过，旧的 `if ! --health-check` 写法无需修改。
 
 > 💡 **v0.2.2 改进**：`--metrics-textfile` 写入失败时不再导致脚本中止，会输出警告并继续执行。
 >
 > 💡 **v0.2.5 改进**：健康检查会实际连接 DERP TLS 端口，对比在线证书与磁盘证书指纹，避免续签后服务仍提供旧证书时误报健康。
+>
+> 💡 **v0.2.14 改进**：退出码区分已确认故障（1）与未知（2）；启用 `-verify-clients` 时把 tailscaled 运行状态与 LocalAPI 鉴权纳入判定；证书与私钥错配会被识别并阻止重启；新增 `derper_check_unknown` 与 `derper_metrics_unixtime` 指标。
 
 示例（仅在异常时报警）：
 
@@ -603,30 +614,51 @@ fi
 ✅ 配置：当前 unit 为纯 IP 模式
 ✅ 配置：当前 unit 与本次目标参数一致
 ✅ 证书：在线服务与磁盘证书一致
-ℹ️  客户端校验：当前 unit 已启用 -verify-clients
+✅ 证书：命名兼容 derper manual（<hostname>.crt/.key）
+✅ 客户端校验：tailscaled 正在运行
 ✅ 证书：有效期剩余 287 天
 ℹ️  资源：derper 内存 RSS 约 3 MiB
 ```
+
+未知结果会以 ⚠️ 行提示（例如"证书：无权限确认"或"客户端校验：已启用，但当前身份无法确认 tailscaled LocalAPI"），并返回退出码 2。
 
 Prometheus 指标样例（文本文件内容）：
 
 ```text
 derper_up 1
+derper_healthy 1
 derper_tls_listen 1
 derper_stun_listen 1
 derper_cert_days_remaining 287
 derper_verify_clients 1
 derper_pure_ip_config_ok 1
 derper_desired_config_ok 1
+derper_cert_live_match 1
+derper_metrics_unixtime 1792540800
+derper_check_unknown 0
 derper_process_rss_bytes 3145728
 ```
 
 说明：
-- 本脚本内置的是“textfile 导出”方式，推荐与 `node_exporter` 的 `--collector.textfile` 配合；
+- 本脚本内置的是"textfile 导出"方式，推荐与 `node_exporter` 的 `--collector.textfile` 配合；
 - 若你已部署 `node_exporter`（默认监听 9100），Prometheus 直接抓取其 9100 端口，同时开启 textfile 收集上述文件；
-- 如需更换文件路径，请对应调整 `node_exporter` 的 `--collector.textfile.directory` 参数。
+- 如需更换文件路径，请对应调整 `node_exporter` 的 `--collector.textfile.directory` 参数；
+- `derper_healthy` 在任一检查失败或结果未知时为 0；`derper_check_unknown` 为 1 表示结果未知而非已确认故障；`derper_metrics_unixtime` 长期不变说明调度没有在跑。
 
-crontab 示例（每 1 分钟刷新指标）：
+无人值守调度（推荐）：
+
+```bash
+# 部署或 --repair 时附带安装；对已部署且健康的服务器单独执行也只会更新调度（幂等）
+sudo bash scripts/deploy_derper_ip_selfsigned.sh --ip <你的公网IP> --install-healthcheck-cron \
+  --metrics-textfile /var/lib/node_exporter/textfile_collector/derper.prom
+```
+
+- 有 systemd 时写入 `derper-healthcheck.timer` + `derper-healthcheck.service`（每 5 分钟），并删除旧的 `/etc/cron.d/derper-healthcheck`；没有 systemd 时写入该 cron 文件。
+- 调度以 `bash` 显式调用 root 管理的稳定副本（默认 `/usr/local/lib/derper-deploy/deploy_derper_ip_selfsigned.sh`），源脚本没有可执行位或之后被移走都不影响；重复执行只更新这一套调度，不会出现 cron 与 timer 并存。
+- 安装或迁移任一步失败都会回滚到原有调度并返回非 0；原本停止或禁用的 timer 不会被拉起。
+- 查看：`systemctl list-timers derper-healthcheck.timer`、`journalctl -u derper-healthcheck.service`。
+
+手工 crontab 示例（每 1 分钟刷新指标）：
 
 ```cron
 * * * * * root bash /路径/scripts/deploy_derper_ip_selfsigned.sh --ip <你的公网IP> --health-check --metrics-textfile /var/lib/node_exporter/textfile_collector/derper.prom >/var/log/derper_health.log 2>&1
@@ -651,7 +683,7 @@ sudo tailscale up
 ## 卸载
 
 ```bash
-# 停止并卸载 systemd 服务（保留二进制与证书）
+# 停止并卸载 systemd 服务（保留二进制与证书；同时删除健康检查 timer/cron 与 --tls-connlimit 规则）
 sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall
 
 # 卸载并清理安装目录（证书等）
@@ -661,7 +693,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall --purge
 sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall --purge-all
 ```
 
-注意：卸载不影响 Tailscale 本体（tailscaled、客户端等）。若需一起移除，请按发行版常规方式操作。
+注意：卸载不影响 Tailscale 本体（tailscaled、客户端等）。若需一起移除，请按发行版常规方式操作。健康检查稳定副本目录（默认 `/usr/local/lib/derper-deploy/`）任一卸载级别都不会删除，不再需要时可手动 `rm -rf`。
 
 ---
 

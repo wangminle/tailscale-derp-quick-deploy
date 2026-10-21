@@ -1,7 +1,7 @@
 # Tailscale DERP Quick Deploy Script
 
 > **Language / 语言**: [English](#english) | [中文](#中文)  
-> **Version / 版本**: `0.2.13` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
+> **Version / 版本**: `0.2.14` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ---
 
@@ -51,7 +51,7 @@ This project provides a **fully automated Tailscale DERP relay service deploymen
 - 🔧 **Multi-Mode Operation**: check/repair/force modes for different scenarios
 - 🗑️ **Scoped Uninstall**: `--uninstall` supports three-level cleanup for service, install directory, binary, and script-created config
 
-> Note: Health checks cover systemd status, listeners, TLS handshake and certificate fingerprint consistency. They are **not** a full DERP/STUN/Tailnet connectivity proof; use `tailscale debug derp` / `netcheck` / `derpprobe` for that.
+> Note: Health checks cover systemd status, listeners, TLS handshake and certificate fingerprint consistency, plus the tailscaled LocalAPI dependency when `-verify-clients` is on. They are **not** a full DERP/STUN/Tailnet connectivity proof; use `tailscale debug derp` / `netcheck` / `derpprobe` for that.
 
 #### 4. Cross-Environment Compatibility
 
@@ -225,24 +225,27 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # Use current login user
 
 | Parameter | Description | Output | Use Case |
 |-----------|-------------|--------|----------|
-| `--health-check` | Output health status summary | Text + exit code | cron periodic checks, alerting |
+| `--health-check` | Output health status summary. Exit 0 means healthy; any other status is not healthy (1 confirmed fault, 2 reserved for unknown and never reported as healthy). Not combined with `--check`, `--repair`, `--force`, or `--uninstall` | Text + exit code | cron periodic checks, alerting |
 | `--metrics-textfile <path>` | Export Prometheus metrics (requires `--health-check` or `--install-healthcheck-cron`) | `.prom` file | With node_exporter monitoring |
-| `--install-healthcheck-cron` | Install `/etc/cron.d/derper-healthcheck` (every 5 minutes) | Cron file | Hands-off health + metrics; not with `--health-check`/`--check` |
+| `--install-healthcheck-cron` | Install a 5-minute health check: with systemd a `derper-healthcheck.timer` (oneshot service that calls a root-owned stable copy via `bash`; the old cron is removed), otherwise `/etc/cron.d/derper-healthcheck`. A failed install rolls back and keeps the existing schedule | systemd timer or cron file | Hands-off health + metrics; not with `--health-check`/`--check` |
 | `--tls-connlimit <N>` | Cap concurrent DERP TLS connections per source IP (explicit `0` removes installed rules; omit to leave them) | nftables/iptables rule | Soften TLS handshake floods; not with `--health-check`/`--check` |
 
-`--uninstall` also removes the health-check cron and `--tls-connlimit` rules. `--relax-socket-perms` restores the original socket mode when the script exits.
+`--uninstall` also removes the health-check timer/cron and `--tls-connlimit` rules (the stable copy under `/usr/local/lib/derper-deploy` is kept). `--relax-socket-perms` restores the original socket mode when the script exits.
 
 **Prometheus Metrics Example:**
 
 ```prometheus
 derper_up 1                          # Service running status
-derper_healthy 1                     # All health checks pass (0 on any failure)
+derper_healthy 1                     # All health checks pass (0 on any failure or unknown result)
 derper_tls_listen 1                  # TLS port listening
 derper_stun_listen 1                 # STUN port listening
 derper_cert_days_remaining 287       # Certificate remaining days
 derper_cert_live_match 1             # Live certificate matches disk certificate
 derper_verify_clients 1              # Client verification enabled in deployed unit
+derper_pure_ip_config_ok 1           # Deployed unit runs in pure IP mode
 derper_desired_config_ok 1           # Deployed unit matches requested parameters
+derper_check_unknown 0               # 1 when the result is unknown (no permission / cannot collect) rather than a confirmed fault
+derper_metrics_unixtime 1792540800   # Unix time the file was written; a stale value means the exporter is not running
 derper_process_rss_bytes 3145728     # Process memory usage (bytes)
 ```
 
@@ -250,9 +253,9 @@ derper_process_rss_bytes 3145728     # Process memory usage (bytes)
 
 | Parameter | Description | Deleted Content | Retained Content |
 |-----------|-------------|-----------------|------------------|
-| `--uninstall` | Stop and remove service | systemd unit, health-check cron, `--tls-connlimit` rules | Binary, certificates |
+| `--uninstall` | Stop and remove service | systemd unit, health-check timer/cron, `--tls-connlimit` rules | Binary, certificates, health-check stable copy |
 | `--uninstall --purge` | + Remove installation directory | + `/opt/derper` | Binary |
-| `--uninstall --purge-all` | + Remove binary and script-created config | + `/usr/local/bin/derper`, `/etc/derper/derper.env`, DERP tailscaled socket drop-in | Firewall rules, user/group accounts |
+| `--uninstall --purge-all` | + Remove binary and script-created config | + `/usr/local/bin/derper`, `/etc/derper/derper.env`, DERP tailscaled socket drop-in | Firewall rules, user/group accounts, `/usr/local/lib/derper-deploy` |
 
 ---
 
@@ -566,7 +569,7 @@ Whether you're an **individual user quickly setting up a testing environment** o
 - 🔧 **多模式运行**：check/repair/force 三种模式满足不同场景
 - 🗑️ **分级卸载**：`--uninstall` 支持服务、安装目录、二进制和脚本生成配置的三级清理
 
-> 说明：健康检查覆盖服务状态、端口监听、TLS 握手与证书指纹一致性，**不等于**完整 DERP/STUN/Tailnet 连通性证明；请使用 `tailscale debug derp` / `netcheck` / `derpprobe` 做协议级验证。
+> 说明：健康检查覆盖服务状态、端口监听、TLS 握手与证书指纹一致性，以及启用 `-verify-clients` 时的 tailscaled LocalAPI 依赖，**不等于**完整 DERP/STUN/Tailnet 连通性证明；请使用 `tailscale debug derp` / `netcheck` / `derpprobe` 做协议级验证。
 
 #### 4. 跨环境兼容
 
@@ -740,24 +743,27 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # 使用当前登录用户
 
 | 参数 | 说明 | 输出 | 适用场景 |
 |------|------|------|----------|
-| `--health-check` | 输出健康状态摘要 | 文本 + 退出码 | cron 定时检查、告警脚本 |
+| `--health-check` | 输出健康状态摘要。退出码 0 为健康，其他值都表示未通过（1 已确认故障，2 保留给未知且不会报健康）。不能与 `--check`、`--repair`、`--force`、`--uninstall` 同用 | 文本 + 退出码 | cron 定时检查、告警脚本 |
 | `--metrics-textfile <path>` | 导出 Prometheus 指标（必须与 `--health-check` 或 `--install-healthcheck-cron` 一起使用） | `.prom` 文件 | 配合 node_exporter 监控 |
-| `--install-healthcheck-cron` | 安装 `/etc/cron.d/derper-healthcheck`（每 5 分钟） | cron 文件 | 无人值守健康检查与指标；不能与 `--health-check`/`--check` 同用 |
+| `--install-healthcheck-cron` | 安装每 5 分钟的健康检查：有 systemd 时写 `derper-healthcheck.timer`（oneshot 服务以 `bash` 调用 root 管理的稳定副本，并删除旧 cron），否则写 `/etc/cron.d/derper-healthcheck`。安装失败会回滚并保留原调度 | systemd timer 或 cron 文件 | 无人值守健康检查与指标；不能与 `--health-check`/`--check` 同用 |
 | `--tls-connlimit <N>` | 限制单 IP 并发 DERP TLS 连接（显式 `0` 移除已装规则；省略则不改动） | nftables/iptables 规则 | 缓解 TLS 握手洪水；不能与 `--health-check`/`--check` 同用 |
 
-`--uninstall` 会同时删除健康检查 cron 与 `--tls-connlimit` 规则。`--relax-socket-perms` 在脚本退出时恢复 socket 原权限。
+`--uninstall` 会同时删除健康检查 timer/cron 与 `--tls-connlimit` 规则（`/usr/local/lib/derper-deploy` 下的稳定副本保留）。`--relax-socket-perms` 在脚本退出时恢复 socket 原权限。
 
 **Prometheus 指标示例：**
 
 ```prometheus
 derper_up 1                          # 服务是否运行
-derper_healthy 1                     # 全部健康检查是否通过（任一失败为 0）
+derper_healthy 1                     # 全部健康检查是否通过（任一失败或结果未知为 0）
 derper_tls_listen 1                  # TLS 端口是否监听
 derper_stun_listen 1                 # STUN 端口是否监听
 derper_cert_days_remaining 287       # 证书剩余天数
 derper_cert_live_match 1             # 在线证书与磁盘证书是否一致
 derper_verify_clients 1              # 已部署 unit 是否启用客户端校验
+derper_pure_ip_config_ok 1           # 已部署 unit 是否为纯 IP 模式
 derper_desired_config_ok 1           # 已部署 unit 是否与本次目标参数一致
+derper_check_unknown 0               # 结果为未知（无权限/无法采集）而非已确认故障时为 1
+derper_metrics_unixtime 1792540800   # 指标文件写入时间；长期不变说明采集没有在跑
 derper_process_rss_bytes 3145728     # 进程内存占用（字节）
 ```
 
@@ -765,9 +771,9 @@ derper_process_rss_bytes 3145728     # 进程内存占用（字节）
 
 | 参数 | 说明 | 删除内容 | 保留内容 |
 |------|------|----------|----------|
-| `--uninstall` | 停止并删除服务 | systemd 单元、健康检查 cron、`--tls-connlimit` 规则 | 二进制、证书 |
+| `--uninstall` | 停止并删除服务 | systemd 单元、健康检查 timer/cron、`--tls-connlimit` 规则 | 二进制、证书、健康检查稳定副本 |
 | `--uninstall --purge` | + 删除安装目录 | + `/opt/derper` | 二进制 |
-| `--uninstall --purge-all` | + 删除二进制和脚本生成配置 | + `/usr/local/bin/derper`、`/etc/derper/derper.env`、DERP 创建的 tailscaled socket drop-in | 防火墙规则、用户/组账户 |
+| `--uninstall --purge-all` | + 删除二进制和脚本生成配置 | + `/usr/local/bin/derper`、`/etc/derper/derper.env`、DERP 创建的 tailscaled socket drop-in | 防火墙规则、用户/组账户、`/usr/local/lib/derper-deploy` |
 
 ---
 
