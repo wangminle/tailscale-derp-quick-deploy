@@ -1,9 +1,11 @@
-# DERP Deployment Guide with IP-based Self-signed Certificate (Detailed Reference)
+# DERP Deployment Guide with IP-based Self-signed Certificate (User Guide · Detailed Reference)
 
-> This is the detailed English reference. For the simplified Chinese quickstart now used as the main README, go to `../README.md`. For the detailed Chinese reference, see `REFERENCE_CN.md` in this folder.
+> For configuration, compatible CLI, local import, JSON and H0–H3, see [the maintenance guide](MAINTENANCE_EN.md).
+
+> This is the detailed English user guide (technical reference). For the simplified Chinese quickstart now used as the main README, go to `../README.md`. For the Chinese user guide, see `REFERENCE_CN.md` in this folder.
 
 > **Script File**: `deploy_derper_ip_selfsigned.sh`  
-> **Current Version**: 0.2.15 (2026-10-21)\
+> **Current Version**: 0.2.16 (2026-10-22)\
 > **Show version**: `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)

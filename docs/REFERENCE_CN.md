@@ -1,9 +1,11 @@
-# DERP 基于 IP 的自签名部署指南（技术参考文档）
+# DERP 基于 IP 的自签名部署指南（用户指南 · 技术参考）
 
-> 本文是中文的详细技术参考。主仓库首页 `README.md` 为精简版中文快速上手；英文详细参考见同目录的 `REFERENCE_EN.md`。
+> 配置、兼容CLI、本地导入、JSON与H0～H3用法见[维护指南](MAINTENANCE_CN.md)。
+
+> 本文是中文的详细用户指南（技术参考）。主仓库首页 `README.md` 为精简版中文快速上手；英文用户指南见同目录的 `REFERENCE_EN.md`。
 
 > **脚本文件**：`deploy_derper_ip_selfsigned.sh`  
-> **当前版本**：0.2.15（2026-10-21）\
+> **当前版本**：0.2.16（2026-10-22）\
 > **查看版本**：`bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)

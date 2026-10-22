@@ -1,7 +1,9 @@
 # Tailscale DERP Quick Deploy Script
 
 > **Language / 语言**: [English](#english) | [中文](#中文)  
-> **Version / 版本**: `0.2.15` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
+> **Version / 版本**: `0.2.16` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
+
+维护入口 / Maintenance: [配置、CLI、本地导入、JSON 与 H0～H3](docs/MAINTENANCE_CN.md) · [English guide](docs/MAINTENANCE_EN.md)。测试套件分工与命名约定见 [tests/README.md](tests/README.md)；生产迁移和真实外部客户端验收单独记录。
 
 ---
 
@@ -512,15 +514,15 @@ Whether you're an **individual user quickly setting up a testing environment** o
 ### 📚 Further Reading
 
 - **Detailed Technical Documentation**:
-  - [Changelog (English)](CHANGELOG_EN.md) | [更新日志（中文）](CHANGELOG_CN.md)
-  - [Technical Reference (English)](docs/REFERENCE_EN.md) | [技术参考（中文）](docs/REFERENCE_CN.md)
+  - [User Guide (English)](docs/REFERENCE_EN.md) | [用户指南（中文）](docs/REFERENCE_CN.md)
+  - [Changelog (English)](docs/CHANGELOG_EN.md) | [更新日志（中文）](docs/CHANGELOG_CN.md)
 
 ### Documentation Layout
 
-- `docs/`: product usage guides for installation, configuration, operations, and troubleshooting.
+- `docs/`: all product usage documents — the detailed user guides (`REFERENCE_EN.md` / `REFERENCE_CN.md`), maintenance guides, and the bilingual changelogs (`CHANGELOG_EN.md` / `CHANGELOG_CN.md`).
 - `plans/`: formal requirements, designs, and development plans (local, not versioned).
 - `checkpoints/`: review, inspection, research, and evaluation reports; execution results, deployment records, and historical snapshots (local, not versioned).
-- Repository root: bilingual `CHANGELOG_CN.md` / `CHANGELOG_EN.md` and the task ledger `task-list.md`.
+- Repository root: this quickstart `README.md`, `VERSION`, and the task ledger `task-list.md`.
 
 ---
 
@@ -1031,16 +1033,16 @@ fi
 ### 📚 进一步阅读
 
 - **详细技术文档**：
-  - [更新日志（中文）](CHANGELOG_CN.md) | [Changelog (English)](CHANGELOG_EN.md)
-  - [技术参考（中文）](docs/REFERENCE_CN.md) | [Technical Reference (English)](docs/REFERENCE_EN.md)
+  - [用户指南（中文）](docs/REFERENCE_CN.md) | [User Guide (English)](docs/REFERENCE_EN.md)
+  - [更新日志（中文）](docs/CHANGELOG_CN.md) | [Changelog (English)](docs/CHANGELOG_EN.md)
   - 审查记录见仓库根目录 `task-list.md`（CHK-004～CHK-007）
 
 ### 文档目录约定
 
-- `docs/`：产品使用文档，包括安装、配置、参数、日常运维和排障指南。
+- `docs/`：全部产品使用文档——详细用户指南（`REFERENCE_CN.md` / `REFERENCE_EN.md`）、维护指南（`MAINTENANCE_CN.md` / `MAINTENANCE_EN.md`）与中英文更新日志（`CHANGELOG_CN.md` / `CHANGELOG_EN.md`）。
 - `plans/`：正式需求、设计和开发实施计划；保留本地，不纳入版本控制。
 - `checkpoints/`：review、检查、调研和评估报告，以及执行结果、部署记录与历史快照；保留本地，不纳入版本控制。
-- 仓库根目录：中英文版本更新日志 `CHANGELOG_CN.md` / `CHANGELOG_EN.md`，以及实际任务台账 `task-list.md`。
+- 仓库根目录：快速上手 `README.md`、`VERSION` 与实际任务台账 `task-list.md`。
 
 ---
 

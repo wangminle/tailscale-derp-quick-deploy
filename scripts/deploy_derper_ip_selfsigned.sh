@@ -8,9 +8,9 @@
 
 set -euo pipefail
 
-# 脚本自身版本（与仓库根目录 CHANGELOG_*.md、VERSION 保持同步）
-SCRIPT_VERSION="0.2.15"
-SCRIPT_VERSION_DATE="2026-10-21"
+# 脚本自身版本（与 docs/CHANGELOG_*.md、仓库根目录 VERSION 保持同步）
+SCRIPT_VERSION="0.2.16"
+SCRIPT_VERSION_DATE="2026-10-22"
 
 # 默认端口
 DERP_PORT="30399"        # DERP TLS 端口
@@ -104,6 +104,92 @@ UNINSTALL=0              # 停止并卸载 systemd 单元
 PURGE=0                  # 与 --uninstall 一起使用：清理安装目录（证书等）
 PURGE_ALL=0              # 与 --uninstall 一起使用：清理安装目录与二进制
 METRICS_TEXTFILE=""      # 将健康检查指标写为 Prometheus textfile（供 node_exporter 收集）
+CONFIG_FILE=""
+SUBCOMMAND=""
+OUTPUT_FORMAT=text
+DERPMAP_ONLY=0
+LOCAL_BINARY=""
+BINARY_SHA256=""
+EXTERNAL_PROBE=""
+PROBE_TIMEOUT=15
+PROBE_TIMEOUT_EXPLICIT=0
+PROBE_MAX_AGE=60
+PROBE_MAX_AGE_EXPLICIT=0
+REQUIRE_H3=0
+METRICS_SOURCE=""
+METRICS_MAX_AGE=900
+METRICS_MAX_AGE_EXPLICIT=0
+HEALTH_STATE_FILE=""
+HEALTH_SNAPSHOT_READY=0
+
+# 配置是数据，不是 shell；无自动搜索，无凭据字段，无操作模式字段。
+load_deploy_config() {
+  local file="$1" line key value seen='|' version='' size uid mode
+  local keys=() values=()
+  [[ -f "$file" && -r "$file" && ! -L "$file" ]] || { echo '[错误] 配置必须为可读普通文件，不能是符号链接。' >&2; return 1; }
+  size=$(wc -c <"$file")
+  (( size <= 65536 )) || { echo '[错误] 配置超过64KiB。' >&2; return 1; }
+  if ! LC_ALL=C tr -d '\000' <"$file" | cmp -s "$file" -; then echo '[错误] 配置含NUL字节。' >&2; return 1; fi
+  if [[ "$(id -u)" == 0 ]]; then
+    uid=$(stat -c %u "$file" 2>/dev/null || stat -f %u "$file") || return 1
+    mode=$(stat -c %a "$file" 2>/dev/null || stat -f %Lp "$file") || return 1
+    [[ "$uid" == 0 ]] && (( (8#$mode & 0022) == 0 )) || { echo '[错误] root使用的配置须归root所有且组/其他用户不可写。' >&2; return 1; }
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line%$'\r'}
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    [[ "$line" == *=* ]] || { echo '[错误] 配置必须为KEY=value。' >&2; return 1; }
+    key=${line%%=*}; value=${line#*=}
+    value="${value%"${value##*[![:space:]]}"}"
+    case "$key" in
+      CONFIG_VERSION|IP_ADDR|DERP_PORT|STUN_PORT|CERT_DAYS|DERPER_VERSION|REGION_ID|REGION_CODE|REGION_NAME|RUN_USER|VERIFY_CLIENTS_MODE|SECURITY_LEVEL|TLS_CONNLIMIT|ALLOW_NON_GLOBAL_IP|EXTERNAL_PROBE|PROBE_TIMEOUT|PROBE_MAX_AGE|REQUIRE_H3|METRICS_MAX_AGE) ;;
+      *) echo '[错误] 配置含未知或不允许的字段。' >&2; return 1 ;;
+    esac
+    [[ "$seen" != *"|$key|"* ]] || { echo '[错误] 配置含重复字段。' >&2; return 1; }
+    case "$value" in *'$'*|*'`'*|*';'*|*'|'*|*'&'*|*'<'*|*'>'*|*'"'*|*"'"*|*'\'*) echo '[错误] 配置值不允许shell语法或引号。' >&2; return 1 ;; esac
+    if printf '%s' "$value" | LC_ALL=C grep -q '[[:cntrl:]]'; then echo '[错误] 配置值含控制字符。' >&2; return 1; fi
+    [[ -n "$value" ]] || return 1
+    case "$key" in
+      CONFIG_VERSION) version=$value ;;
+      VERIFY_CLIENTS_MODE) [[ "$value" == on || "$value" == off ]] || return 1 ;;
+      ALLOW_NON_GLOBAL_IP|REQUIRE_H3) [[ "$value" == 0 || "$value" == 1 ]] || return 1 ;;
+      REGION_ID) decimal_in_closed_range "$value" 1 9007199254740991 || return 1 ;;
+      DERP_PORT|STUN_PORT|CERT_DAYS|TLS_CONNLIMIT|PROBE_TIMEOUT|PROBE_MAX_AGE|METRICS_MAX_AGE) [[ "$value" =~ ^[0-9]{1,9}$ ]] || return 1 ;;
+    esac
+    seen+="$key|"
+    keys+=("$key"); values+=("$value")
+  done <"$file"
+  [[ "$version" == 1 ]] || { echo '[错误] 配置必须声明CONFIG_VERSION=1。' >&2; return 1; }
+  local i
+  for ((i=0; i<${#keys[@]}; i++)); do
+    key=${keys[i]}
+    [[ "$key" != CONFIG_VERSION ]] || continue
+    printf -v "$key" '%s' "${values[i]}"
+    case "$key" in
+      DERP_PORT) DERP_PORT_EXPLICIT=1 ;;
+      STUN_PORT) STUN_PORT_EXPLICIT=1 ;;
+      RUN_USER) RUN_USER_EXPLICIT=1 ;;
+      VERIFY_CLIENTS_MODE) VERIFY_CLIENTS_EXPLICIT=1 ;;
+      SECURITY_LEVEL) SECURITY_LEVEL_EXPLICIT=1 ;;
+    esac
+  done
+}
+
+load_cli_config() {
+  local args=("$@") file='' i count=$#
+  for ((i=0; i<count; i++)); do
+    if [[ "${args[i]}" == --config ]]; then
+      [[ -z "$file" && $((i+1)) -lt $count ]] || return 1
+      file=${args[i+1]}
+      [[ -n "$file" && "$file" != --* ]] || return 1
+      i=$((i+1))
+    fi
+  done
+  [[ -n "$file" ]] || return 0
+  load_deploy_config "$file" || return 1
+  CONFIG_FILE=$file
+}
 
 usage() {
   cat <<EOF
@@ -111,6 +197,20 @@ usage() {
 或者：sudo bash $0 wizard  (启动交互式配置向导)
 
 脚本版本：${SCRIPT_VERSION}（${SCRIPT_VERSION_DATE}）
+
+C阶段入口（旧参数继续支持）：
+  deploy | check | health | status | repair | uninstall | recover | derpmap
+  --config FILE             显式读取CONFIG_VERSION=1白名单配置，CLI优先
+  --format text|json        health/status输出格式；derpmap输出JSON片段
+  --binary FILE             导入本地Linux ELF，须固定--derper-version
+  --binary-sha256 HEX        可选预期摘要；本地摘要不证明发布者身份
+  --external-probe FILE     独立合法客户端探针适配器（详见用户指南）
+  --probe-timeout SEC       探针超时1～120秒，默认15
+  --probe-max-age SEC       探针结果最大年龄，默认60秒
+  --require-h3              缺少真实外部检查结果时返回未知并阻断发布
+  --metrics-source FILE     只读检查旧指标新鲜度
+  --metrics-max-age SEC     旧指标最大年龄，默认900秒
+  --state-file FILE         原子保存本次健康结果和最近成功时间
 
 选项列表：
 用法（向导模式）：sudo bash $0 wizard  [启动交互式配置向导]
@@ -330,6 +430,18 @@ EOT
 }
 
 parse_args() {
+  load_cli_config "$@" || { echo '[错误] 无法解析配置。' >&2; return 1; }
+  case "${1:-}" in
+    deploy|check|health|status|repair|uninstall|recover|derpmap)
+      SUBCOMMAND=$1; shift
+      case "$SUBCOMMAND" in
+        check) DRY_RUN=1; CHECK_ONLY=1 ;;
+        health|status|derpmap) HEALTH_CHECK=1; [[ "$SUBCOMMAND" != derpmap ]] || DERPMAP_ONLY=1 ;;
+        repair) REPAIR=1 ;;
+        uninstall) UNINSTALL=1 ;;
+        recover) RECOVER_INTERRUPTED=1 ;;
+      esac ;;
+  esac
   require_arg_value() {
     local opt="$1"
     local val="${2-}"
@@ -341,6 +453,23 @@ parse_args() {
   }
   while [[ $# -gt 0 ]]; do
     case "$1" in
+      --config)
+        require_arg_value "$1" "${2-}"; shift 2 ;;
+      --format|--binary|--binary-sha256|--external-probe|--probe-timeout|--probe-max-age|--metrics-source|--metrics-max-age|--state-file)
+        require_arg_value "$1" "${2-}"
+        case "$1" in
+          --format) OUTPUT_FORMAT=$2 ;;
+          --binary) LOCAL_BINARY=$2 ;;
+          --binary-sha256) BINARY_SHA256=$2 ;;
+          --external-probe) EXTERNAL_PROBE=$2 ;;
+          --probe-timeout) PROBE_TIMEOUT=$2; PROBE_TIMEOUT_EXPLICIT=1 ;;
+          --probe-max-age) PROBE_MAX_AGE=$2; PROBE_MAX_AGE_EXPLICIT=1 ;;
+          --metrics-source) METRICS_SOURCE=$2 ;;
+          --metrics-max-age) METRICS_MAX_AGE=$2; METRICS_MAX_AGE_EXPLICIT=1 ;;
+          --state-file) HEALTH_STATE_FILE=$2 ;;
+        esac
+        shift 2 ;;
+      --require-h3) REQUIRE_H3=1; shift ;;
       --ip)
         require_arg_value "$1" "${2-}"
         IP_ADDR="$2"
@@ -484,6 +613,83 @@ parse_args() {
 # 参数组合互斥/依赖校验：避免“静默取一个分支”或“选项被忽略”的误用。
 validate_arg_combos() {
   local err=0
+  health_output_paths_are_distinct || err=1
+  case "$SUBCOMMAND" in
+    deploy)
+      if [[ "$FORCE$REPAIR$UNINSTALL$RECOVER_INTERRUPTED$HEALTH_CHECK$CHECK_ONLY" != 000000 ]]; then
+        echo "[错误] deploy 不能与 --force、--repair、--check、--health-check、--uninstall 或 --recover-interrupted 一起使用；这些是互斥主模式。" >&2
+        err=1
+      fi
+      ;;
+    check)
+      if [[ "$FORCE$REPAIR$UNINSTALL$RECOVER_INTERRUPTED$HEALTH_CHECK" != 00000 ]]; then
+        echo "[错误] check 不能与 --force、--repair、--health-check、--uninstall 或 --recover-interrupted 一起使用；这些是互斥主模式。" >&2
+        err=1
+      fi
+      ;;
+  esac
+  if [[ "$OUTPUT_FORMAT" != text && "$OUTPUT_FORMAT" != json ]]; then
+    echo "[错误] --format 只接受 text 或 json，当前：${OUTPUT_FORMAT}" >&2
+    err=1
+  fi
+  if [[ "$OUTPUT_FORMAT" == json && "$HEALTH_CHECK" != 1 ]]; then
+    echo "[错误] --format json 只能与 health、status 或 --health-check 一起使用。" >&2
+    err=1
+  fi
+  if [[ -n "$BINARY_SHA256" && ( -z "$LOCAL_BINARY" || ! "$BINARY_SHA256" =~ ^[0-9a-fA-F]{64}$ ) ]]; then
+    echo "[错误] --binary-sha256 必须是 64 位十六进制，且必须与 --binary 一起使用。" >&2
+    err=1
+  fi
+  if [[ -n "$LOCAL_BINARY" ]]; then
+    if [[ "$HEALTH_CHECK$CHECK_ONLY$UNINSTALL$RECOVER_INTERRUPTED" != 0000 || "$DERPER_VERSION" == latest || -z "$DERPER_VERSION" ]]; then
+      echo "[错误] --binary 只能用于部署或修复，并且必须同时给出明确的 --derper-version（不能是 latest）。" >&2
+      err=1
+    fi
+  fi
+  if [[ -n "$METRICS_SOURCE" ]]; then
+    if [[ "$HEALTH_CHECK" != 1 ]]; then
+      echo "[错误] --metrics-source 只能与健康检查一起使用。" >&2
+      err=1
+    elif [[ -n "$METRICS_TEXTFILE" && "$METRICS_SOURCE" == "$METRICS_TEXTFILE" ]]; then
+      echo "[错误] --metrics-source 与 --metrics-textfile 不能指向同一文件。" >&2
+      err=1
+    fi
+  fi
+  if [[ -n "$HEALTH_STATE_FILE" && "$HEALTH_CHECK" != 1 && "${INSTALL_HEALTHCHECK_CRON:-0}" != 1 ]]; then
+    echo "[错误] --state-file 只能与健康检查或 --install-healthcheck-cron 一起使用。" >&2
+    err=1
+  fi
+  if [[ "$PROBE_TIMEOUT" =~ ^[0-9]{1,6}$ ]]; then PROBE_TIMEOUT=$((10#$PROBE_TIMEOUT)); fi
+  if [[ "$PROBE_MAX_AGE" =~ ^[0-9]{1,6}$ ]]; then PROBE_MAX_AGE=$((10#$PROBE_MAX_AGE)); fi
+  if [[ "$METRICS_MAX_AGE" =~ ^[0-9]{1,6}$ ]]; then METRICS_MAX_AGE=$((10#$METRICS_MAX_AGE)); fi
+  # 先按位数拒绝，避免超大数字进入 Bash 算术比较。
+  if [[ ! "$PROBE_TIMEOUT" =~ ^[0-9]+$ || ${#PROBE_TIMEOUT} -gt 6 || "$PROBE_TIMEOUT" -lt 1 || "$PROBE_TIMEOUT" -gt 120 ]]; then
+    echo "[错误] --probe-timeout 必须在 1 到 120 秒之间，当前：${PROBE_TIMEOUT}" >&2
+    err=1
+  fi
+  if [[ ! "$PROBE_MAX_AGE" =~ ^[0-9]+$ || ${#PROBE_MAX_AGE} -gt 6 || "$PROBE_MAX_AGE" -lt 1 ]]; then
+    echo "[错误] --probe-max-age 必须是 1 到 999999 的整数，当前：${PROBE_MAX_AGE}" >&2
+    err=1
+  fi
+  if [[ ! "$METRICS_MAX_AGE" =~ ^[0-9]+$ || ${#METRICS_MAX_AGE} -gt 6 || "$METRICS_MAX_AGE" -lt 1 ]]; then
+    echo "[错误] --metrics-max-age 必须是 1 到 999999 的整数，当前：${METRICS_MAX_AGE}" >&2
+    err=1
+  fi
+  # 探针和指标年龄只在会采样的模式里被读取。check/uninstall/recover 不采集，静默收下会让人以为门禁已生效。
+  if [[ "$CHECK_ONLY" == 1 || "$UNINSTALL" == 1 || "$RECOVER_INTERRUPTED" == 1 ]]; then
+    if [[ -n "$EXTERNAL_PROBE" || "$REQUIRE_H3" == 1 ]]; then
+      echo "[错误] --external-probe 与 --require-h3 只在健康检查或部署/修复时生效；check、uninstall、recover 会忽略它们，因此直接拒绝。" >&2
+      err=1
+    fi
+    if [[ "${PROBE_TIMEOUT_EXPLICIT:-0}" == 1 || "${PROBE_MAX_AGE_EXPLICIT:-0}" == 1 || "$PROBE_TIMEOUT" != 15 || "$PROBE_MAX_AGE" != 60 ]]; then
+      echo "[错误] --probe-timeout 与 --probe-max-age 只在健康检查或部署/修复时生效；check、uninstall、recover 会忽略它们，因此直接拒绝。" >&2
+      err=1
+    fi
+  fi
+  if [[ "$HEALTH_CHECK" != 1 && ( "${METRICS_MAX_AGE_EXPLICIT:-0}" == 1 || "$METRICS_MAX_AGE" != 900 ) ]]; then
+    echo "[错误] --metrics-max-age 只能与健康检查一起使用。" >&2
+    err=1
+  fi
   if [[ "${PURGE}" -eq 1 || "${PURGE_ALL}" -eq 1 ]]; then
     if [[ "${UNINSTALL}" -ne 1 ]]; then
       echo "[错误] --purge/--purge-all 必须与 --uninstall 一起使用，单独使用不会执行清理。" >&2
@@ -684,27 +890,31 @@ normalize_version_tag() {
   printf '%s' "$v"
 }
 
-# 读取已安装 derper 二进制的 tailscale.com 模块版本（如 1.80.0）；失败返回空。
+# 读取已安装 derper 二进制的 tailscale.com 模块版本。
+# 保留预发布和伪版本后缀；失败返回空。无 Go 时不能把 v1.104.1-rc1 截成 1.104.1。
 get_installed_derper_version() {
   [[ -x "${BIN_PATH}" ]] || { echo ""; return 1; }
-  local ver=""
+  local ver="" module_re version_re
+  module_re='tailscale\.com(/cmd/derper)?[[:space:]]+v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?'
+  version_re='v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?'
   if command -v go >/dev/null 2>&1; then
     ver=$(go version -m "${BIN_PATH}" 2>/dev/null \
       | awk '/^[[:space:]]*mod[[:space:]]+tailscale\.com([[:space:]]|$)/ {print $3; exit}')
   fi
   if [[ -z "$ver" ]]; then
-    # 无 go 或 go version -m 失败时，从二进制字符串抓取模块版本。
+    # 无 go 或 go version -m 失败时，从二进制字符串抓取完整模块版本。
     # strings 在极简环境可能缺失，回退到 grep -a。
     local blob=""
     if command -v strings >/dev/null 2>&1; then
       blob=$(strings "${BIN_PATH}" 2>/dev/null || true)
     fi
     if [[ -z "$blob" ]]; then
-      blob=$(grep -a -oE 'tailscale\.com(/cmd/derper)?[[:space:]]+v?[0-9]+\.[0-9]+\.[0-9]+' "${BIN_PATH}" 2>/dev/null || true)
+      blob=$(grep -a -oE "$module_re" "${BIN_PATH}" 2>/dev/null || true)
     fi
     ver=$(printf '%s\n' "$blob" \
-      | grep -oE 'tailscale\.com(/cmd/derper)?[[:space:]]+v?[0-9]+\.[0-9]+\.[0-9]+' \
-      | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' || true)
+      | grep -oE "$module_re" \
+      | head -n1 \
+      | grep -oE "$version_re" || true)
   fi
   # 不再用裸 semver 回退：Go 工具链版本（go1.22.6）会先被匹配，导致误判已对齐。
   normalize_version_tag "$ver"
@@ -721,6 +931,7 @@ resolve_derper_module_version() {
 
 # 判断是否需要安装/重装 derper：缺失、或目标版本（非 latest）与已安装不一致。
 derper_binary_needs_install() {
+  [[ -z "${LOCAL_BINARY:-}" ]] || return 0
   if [[ ! -x "${BIN_PATH}" ]]; then
     return 0
   fi
@@ -766,6 +977,8 @@ derper_binary_needs_install() {
 # 优先对齐到本机 tailscaled 的 Git commit（真正的同源），
 # 取不到 commit 时才退化为语义版本标签并给出警告。
 align_derper_version_with_tailscale() {
+  # 本地输入必须保持操作者固定的版本；daemon兼容性由发布前独立校核，不能改写目标后放行。
+  [[ -z "${LOCAL_BINARY:-}" ]] || return 0
   [[ "${VERIFY_CLIENTS_MODE}" == "on" ]] || return 0
   [[ "${DERPER_VERSION}" == "latest" ]] || return 0
   if [[ -z "${TS_VERSION:-}" ]]; then
@@ -1020,15 +1233,21 @@ infer_healthcheck_settings_from_unit() {
 _timeout_run() {
   local secs="$1"; shift
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$secs" "$@"
+    timeout --kill-after=1 "$secs" "$@" &
+    local timed_pid=$! timed_rc=0
+    wait "$timed_pid" || timed_rc=$?
+    # timeout默认建立独立进程组；主进程提前响应TERM时，也清理仍留在该组中的子进程。
+    kill -KILL -- "-$timed_pid" 2>/dev/null || true
+    return "$timed_rc"
   else
     "$@" &
     local pid=$!
-    ( sleep "$secs" && kill "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+    ( sleep "$secs"; kill -TERM "$pid" 2>/dev/null || exit 0; sleep 1; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
     local killer=$!
-    wait "$pid" 2>/dev/null
-    local rc=$?
-    kill "$killer" 2>/dev/null; wait "$killer" 2>/dev/null || true
+    local rc=0
+    wait "$pid" 2>/dev/null || rc=$?
+    kill "$killer" 2>/dev/null || true
+    wait "$killer" 2>/dev/null || true
     return $rc
   fi
 }
@@ -1171,16 +1390,25 @@ read_derper_unit_content() {
 
 check_ports_status() {
   PORT_TLS_OK=0; PORT_STUN_OK=0
+  PORT_CHECK_UNKNOWN=0; PORT_OWNER_DATA_AVAILABLE=0
   local derp_port stun_port
+  local tcp_rows='' udp_rows=''
   derp_port=$(_decimal_norm "${DERP_PORT}")
   stun_port=$(_decimal_norm "${STUN_PORT}")
   if command -v ss >/dev/null 2>&1; then
-    ss -ltnp 2>/dev/null | grep -E ":${derp_port}([^0-9]|$)" >/dev/null 2>&1 && PORT_TLS_OK=1 || true
-    ss -lunp 2>/dev/null | grep -E ":${stun_port}([^0-9]|$)" >/dev/null 2>&1 && PORT_STUN_OK=1 || true
+    tcp_rows=$(ss -ltnp 2>/dev/null) || PORT_CHECK_UNKNOWN=1
+    udp_rows=$(ss -lunp 2>/dev/null) || PORT_CHECK_UNKNOWN=1
   elif command -v netstat >/dev/null 2>&1; then
-    netstat -ltnp 2>/dev/null | grep -E ":${derp_port}([^0-9]|$)" >/dev/null 2>&1 && PORT_TLS_OK=1 || true
-    netstat -lunp 2>/dev/null | grep -E ":${stun_port}([^0-9]|$)" >/dev/null 2>&1 && PORT_STUN_OK=1 || true
+    tcp_rows=$(netstat -ltnp 2>/dev/null) || PORT_CHECK_UNKNOWN=1
+    udp_rows=$(netstat -lunp 2>/dev/null) || PORT_CHECK_UNKNOWN=1
+  else
+    PORT_CHECK_UNKNOWN=1
   fi
+  tcp_rows=$(printf '%s\n' "$tcp_rows" | grep -E ":${derp_port}([^0-9]|$)" || true)
+  udp_rows=$(printf '%s\n' "$udp_rows" | grep -E ":${stun_port}([^0-9]|$)" || true)
+  [[ -z "$tcp_rows" ]] || PORT_TLS_OK=1
+  [[ -z "$udp_rows" ]] || PORT_STUN_OK=1
+  if printf '%s\n' "$tcp_rows" | grep -qE 'pid=[0-9]+|[0-9]+/' && printf '%s\n' "$udp_rows" | grep -qE 'pid=[0-9]+|[0-9]+/'; then PORT_OWNER_DATA_AVAILABLE=1; fi
 }
 
 regex_escape() {
@@ -1712,6 +1940,69 @@ file_sha256() {
   sha256_hex <"$1"
 }
 
+# 恢复载荷允许空文件。sha256_hex 会拒绝空输入，那是为了不把空摘要当成证书指纹。
+payload_sha256() {
+  local out=""
+  [[ -f "$1" && ! -L "$1" ]] || return 1
+  if command -v sha256sum >/dev/null 2>&1; then
+    out=$(sha256sum <"$1" | awk '{print $1}')
+  elif command -v shasum >/dev/null 2>&1; then
+    out=$(shasum -a 256 <"$1" | awk '{print $1}')
+  else
+    out=$(openssl dgst -sha256 <"$1" | awk '{print $2}')
+  fi
+  [[ "$out" =~ ^[0-9a-f]{64}$ ]] || return 1
+  printf '%s\n' "$out"
+}
+
+recovery_file_digest() {
+  local file="$1"
+  if [[ -L "$file" || ( -e "$file" && ! -f "$file" ) ]]; then
+    return 1
+  fi
+  if [[ -f "$file" ]]; then
+    payload_sha256 "$file" || return 1
+    return 0
+  fi
+  printf 'absent\n'
+}
+
+recovery_state_digest() {
+  local dir="$1" entry file name sum listing="" any=0 sorted
+  if [[ ! -e "$dir" ]]; then
+    printf 'absent\n'
+    return 0
+  fi
+  if [[ -L "$dir" || ! -d "$dir" ]]; then
+    return 1
+  fi
+  local files=()
+  for entry in "$dir"/* "$dir"/.[!.]* "$dir"/..?*; do
+    [[ -e "$entry" || -L "$entry" ]] || continue
+    if [[ -L "$entry" || ! -f "$entry" ]]; then
+      return 1
+    fi
+    files+=("$entry")
+  done
+  if [[ "${#files[@]}" -eq 0 ]]; then
+    printf 'absent\n'
+    return 0
+  fi
+  sorted=$(printf '%s\n' "${files[@]}" | LC_ALL=C sort) || return 1
+  while IFS= read -r file; do
+    [[ -n "$file" ]] || continue
+    name=$(basename "$file")
+    case "$name" in
+      ''|*[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    sum=$(payload_sha256 "$file") || return 1
+    listing+="${name} ${sum}"$'\n'
+    any=1
+  done <<<"$sorted"
+  [[ "$any" -eq 1 ]] || return 1
+  printf '%s' "$listing" | sha256_hex
+}
+
 read_kv_value() {
   local file="$1" want="$2" line key value found=""
   [[ -f "$file" && ! -L "$file" ]] || return 1
@@ -1799,17 +2090,39 @@ write_incomplete_marker() {
   mv -f "$tmp" "${root}/incomplete" || { rm -f "$tmp"; return 1; }
 }
 
-verify_recovery_dir() {
-  local dir="$1" expect got intent
-  [[ -f "${dir}/manifest" && ! -L "${dir}/manifest" && -f "${dir}/binary" && ! -L "${dir}/binary" ]] || return 1
-  expect=$(read_kv_value "${dir}/manifest" binary_sha256) || return 1
-  got=$(file_sha256 "${dir}/binary") || return 1
-  [[ "$expect" == "$got" ]] || return 1
-  intent=$(read_kv_value "${dir}/manifest" run_intent) || return 1
+expect_payload_digest() {
+  local manifest="$1" key="$2" actual="$3" expect=""
+  if expect=$(read_kv_value "$manifest" "$key"); then
+    [[ "$expect" == "$actual" ]] || return 1
+    return 0
+  fi
+  # 旧恢复集没有该字段时，只接受载荷确实不存在。已有文件却没有摘要必须拒绝。
+  [[ "$actual" == "absent" ]]
+}
+
+verify_recovery_payload() {
+  local dir="$1" manifest="${1}/manifest" actual="" intent=""
+  [[ -f "$manifest" && ! -L "$manifest" ]] || return 1
+  actual=$(recovery_file_digest "${dir}/unit") || return 1
+  expect_payload_digest "$manifest" unit_sha256 "$actual" || return 1
+  actual=$(recovery_file_digest "${dir}/config") || return 1
+  expect_payload_digest "$manifest" config_sha256 "$actual" || return 1
+  actual=$(recovery_state_digest "${dir}/state") || return 1
+  expect_payload_digest "$manifest" state_sha256 "$actual" || return 1
+  intent=$(read_kv_value "$manifest" run_intent) || return 1
   case "$intent" in
     active|inactive|absent) return 0 ;;
     *) return 1 ;;
   esac
+}
+
+verify_recovery_dir() {
+  local dir="$1" expect="" got=""
+  [[ -f "${dir}/manifest" && ! -L "${dir}/manifest" && -f "${dir}/binary" && ! -L "${dir}/binary" ]] || return 1
+  expect=$(read_kv_value "${dir}/manifest" binary_sha256) || return 1
+  got=$(file_sha256 "${dir}/binary") || return 1
+  [[ "$expect" == "$got" ]] || return 1
+  verify_recovery_payload "$dir"
 }
 
 promote_recovery_staging() {
@@ -1851,7 +2164,7 @@ current_service_run_intent() {
 }
 
 capture_and_promote_recovery() {
-  local root staging intent sum config
+  local root staging intent sum config unit_sum config_sum state_sum
   root=$(deploy_state_root)
   staging="${root}/recovery.staging"
   rm -rf "$staging"
@@ -1874,15 +2187,22 @@ capture_and_promote_recovery() {
   state_dir=$(derper_node_state_dir)
   if [[ -d "$state_dir" && ! -L "$state_dir" ]]; then
     mkdir -p "${staging}/state" || { rm -rf "$staging"; return 1; }
-    for state_file in "$state_dir"/*; do
-      [[ -f "$state_file" && ! -L "$state_file" ]] || continue
+    for state_file in "$state_dir"/* "$state_dir"/.[!.]* "$state_dir"/..?*; do
+      [[ -e "$state_file" || -L "$state_file" ]] || continue
+      [[ -f "$state_file" && ! -L "$state_file" ]] || { rm -rf "$staging"; return 1; }
       cp -p "$state_file" "${staging}/state/$(basename "$state_file")" || { rm -rf "$staging"; return 1; }
     done
   fi
   intent=$(current_service_run_intent)
   sum=$(file_sha256 "${staging}/binary") || { rm -rf "$staging"; return 1; }
+  unit_sum=$(recovery_file_digest "${staging}/unit") || { rm -rf "$staging"; return 1; }
+  config_sum=$(recovery_file_digest "${staging}/config") || { rm -rf "$staging"; return 1; }
+  state_sum=$(recovery_state_digest "${staging}/state") || { rm -rf "$staging"; return 1; }
   {
     printf 'binary_sha256=%s\n' "$sum"
+    printf 'unit_sha256=%s\n' "$unit_sum"
+    printf 'config_sha256=%s\n' "$config_sum"
+    printf 'state_sha256=%s\n' "$state_sum"
     printf 'run_intent=%s\n' "$intent"
     printf 'verify_clients=%s\n' "${VERIFY_CLIENTS_MODE:-off}"
   } >"${staging}/manifest" || { rm -rf "$staging"; return 1; }
@@ -1924,10 +2244,77 @@ candidate_self_check() {
   fi
 }
 
+# 进程名只能定位候选，不能授权 root 执行普通用户的程序。
+tailscaled_process_is_trusted() {
+  local pid="$1" caller uids real effective saved fs extra comm
+  [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/${pid}/status" ]] || return 1
+  caller=$(id -u) || return 1
+  uids=$(awk '/^Uid:/ {print $2, $3, $4, $5; exit}' "/proc/${pid}/status") || return 1
+  read -r real effective saved fs extra <<<"$uids"
+  [[ -z "$extra" && "$real" == "$caller" && "$effective" == "$caller" && "$saved" == "$caller" && "$fs" == "$caller" ]] || return 1
+  comm=$(cat "/proc/${pid}/comm" 2>/dev/null) || return 1
+  [[ "$comm" == tailscaled ]]
+}
+
+tailscaled_executable_is_trusted() {
+  local file="$1" caller owner mode
+  [[ -f "$file" && -x "$file" ]] || return 1
+  caller=$(id -u) || return 1
+  owner=$(stat -Lc %u "$file" 2>/dev/null) || return 1
+  mode=$(stat -Lc %a "$file" 2>/dev/null) || return 1
+  [[ "$owner" == 0 || "$owner" == "$caller" ]] || return 1
+  [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+  # 拒绝组/其他用户可写，以及 setuid/setgid 文件。
+  (( (8#$mode & 06022) == 0 ))
+}
+
+# 只认仍在运行且凭据可信的 tailscaled。磁盘新文件不能代表旧进程。
+tailscaled_daemon_pid() {
+  local pid="" comm="" ids="" count=0 chosen=""
+  if command -v systemctl >/dev/null 2>&1; then
+    pid=$(systemctl show -p MainPID --value tailscaled 2>/dev/null || true)
+    pid=${pid//$'\r'/}
+    pid=${pid//$'\n'/}
+    if [[ "$pid" =~ ^[1-9][0-9]*$ && -r "/proc/${pid}/comm" ]]; then
+      comm=$(tr -d '[:space:]' <"/proc/${pid}/comm" 2>/dev/null || true)
+      if [[ "$comm" == "tailscaled" ]] && tailscaled_process_is_trusted "$pid"; then
+        printf '%s\n' "$pid"
+        return 0
+      fi
+    fi
+  fi
+  command -v pgrep >/dev/null 2>&1 || return 1
+  ids=$(pgrep -x tailscaled 2>/dev/null || true)
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    count=$((count + 1))
+    [[ "$count" -le 1 ]] || return 1
+    chosen=$pid
+  done <<<"$ids"
+  [[ "$count" -eq 1 && -r "/proc/${chosen}/comm" ]] || return 1
+  comm=$(tr -d '[:space:]' <"/proc/${chosen}/comm" 2>/dev/null || true)
+  [[ "$comm" == "tailscaled" ]] && tailscaled_process_is_trusted "$chosen" || return 1
+  printf '%s\n' "$chosen"
+}
+
+tailscaled_running_exe() {
+  local pid exe
+  pid=$(tailscaled_daemon_pid) || return 1
+  exe="/proc/${pid}/exe"
+  [[ -x "$exe" ]] || return 1
+  printf '%s\n' "$exe"
+}
+
 tailscaled_daemon_revision() {
-  local out rev=""
-  command -v tailscaled >/dev/null 2>&1 || return 1
-  out=$(tailscaled --version 2>/dev/null || true)
+  local exe out rev=""
+  exe=$(tailscaled_running_exe) || return 1
+  # 在子 shell 固定 inode，检查与执行使用同一个描述符，避免 PID/路径替换竞争。
+  out=$(
+    exec 8<"$exe" || exit 1
+    tailscaled_executable_is_trusted /proc/self/fd/8 || exit 1
+    /proc/self/fd/8 --version 2>/dev/null
+  ) || return 1
   rev=$(printf '%s\n' "$out" | awk '$1 == "tailscale" && $2 == "commit:" {print $3; exit}' | grep -E '^[0-9a-f]{7,40}$' || true)
   [[ -n "$rev" ]] || return 1
   printf '%s\n' "$rev"
@@ -2023,8 +2410,9 @@ rollback_deploy_change() {
     return 1
   fi
   if [[ "$phase" == "first-install" ]]; then
-    rm -f "$BIN_PATH"
-    rm -f "$marker"
+    ensure_derper_stopped || return 1
+    remove_restored_plain_file "$BIN_PATH" || return 1
+    rm -f "$marker" || return 1
     echo "[信息] 首次安装未完成，已清理半成品。没有可恢复的上一版本。" >&2
     return 0
   fi
@@ -2034,8 +2422,8 @@ rollback_deploy_change() {
         echo "[错误] 迁移恢复集无法校验，已保留备份。" >&2
         return 1
       fi
-    elif ! read_kv_value "${recovery}/manifest" run_intent >/dev/null; then
-      echo "[错误] 迁移恢复集缺少运行意图，已保留备份。" >&2
+    elif ! verify_recovery_payload "$recovery"; then
+      echo "[错误] 迁移恢复集无法校验，已保留备份。" >&2
       return 1
     fi
   elif ! verify_recovery_dir "$recovery"; then
@@ -2066,6 +2454,12 @@ rollback_deploy_change() {
       echo "[错误] 恢复 unit 失败，已保留恢复集。" >&2
       return 1
     }
+  elif [[ "$(read_kv_value "${recovery}/manifest" unit_sha256 || true)" == absent ]]; then
+    remove_restored_plain_file "$SERVICE_PATH" || return 1
+  fi
+  if ! expect_payload_digest "${recovery}/manifest" unit_sha256 "$(recovery_file_digest "$SERVICE_PATH")"; then
+    echo "[错误] unit 的恢复结果与快照不一致，已保留标记。" >&2
+    return 1
   fi
   if ! restore_saved_payload "$recovery"; then
     echo "[错误] 恢复配置或节点状态失败，已保留恢复集。" >&2
@@ -2075,9 +2469,14 @@ rollback_deploy_change() {
     harden_cert_dir || return 1
   fi
   intent=$(read_kv_value "${recovery}/manifest" run_intent) || return 1
+  # inactive/absent 也可能写回或移除了 unit，必须同步 systemd 缓存。
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || return 1
+  fi
   if [[ "$intent" == "active" ]]; then
     if command -v systemctl >/dev/null 2>&1; then
-      systemctl daemon-reload >/dev/null 2>&1 || return 1
+      # 坏候选可能耗尽启动频率；只在明确回退旧文件后清除失败计数。
+      systemctl reset-failed derper >/dev/null 2>&1 || return 1
       systemctl start derper || return 1
     fi
     if ! verify_restored_service; then
@@ -2085,13 +2484,16 @@ rollback_deploy_change() {
       return 1
     fi
   fi
-  rm -f "$marker"
+  rm -f "$marker" || return 1
   return 0
 }
 
 ensure_derper_stopped() {
   command -v systemctl >/dev/null 2>&1 || return 0
-  systemctl stop derper || return 1
+  if ! systemctl stop derper; then
+    # 首装在写unit之前中断时，明确not-found也属于没有运行服务；通信失败不能当成停止。
+    [[ "$(systemctl show -p LoadState --value derper 2>/dev/null)" == not-found ]] || return 1
+  fi
   if systemctl is-active --quiet derper; then
     echo "[错误] derper 仍在运行，不能继续恢复。" >&2
     return 1
@@ -2178,16 +2580,25 @@ install_without_following_link() {
     echo "[错误] 恢复目标仍是符号链接：${dest}" >&2
     return 1
   fi
-  src_sum=$(file_sha256 "$src") || return 1
-  dest_sum=$(file_sha256 "$dest") || return 1
+  src_sum=$(payload_sha256 "$src") || return 1
+  dest_sum=$(payload_sha256 "$dest") || return 1
   [[ "$src_sum" == "$dest_sum" ]]
 }
 
+remove_restored_plain_file() {
+  local file="$1"
+  [[ ! -L "$file" && ( ! -e "$file" || -f "$file" ) ]] || return 1
+  [[ ! -e "$file" ]] || rm -f -- "$file" || return 1
+  [[ ! -e "$file" && ! -L "$file" ]]
+}
+
 restore_saved_payload() {
-  local recovery="$1" dest state_dir state_file rc=0 claimed=0
-  if [[ -f "${recovery}/config" && ! -L "${recovery}/config" ]] || [[ -d "${recovery}/state" && ! -L "${recovery}/state" ]]; then
+  local recovery="$1" dest state_dir state_file name rc=0 claimed=0 declared="" state_declared=""
+  declared=$(read_kv_value "${recovery}/manifest" config_sha256 2>/dev/null || true)
+  state_declared=$(read_kv_value "${recovery}/manifest" state_sha256 2>/dev/null || true)
+  if [[ -n "$declared$state_declared" || -f "${recovery}/config" ]] || [[ -d "${recovery}/state" && ! -L "${recovery}/state" ]]; then
     state_dir=$(derper_node_state_dir)
-    if [[ -L "$state_dir" ]]; then
+    if [[ "$state_dir" == / || -L "$state_dir" ]]; then
       echo "[错误] 节点状态目录是符号链接，拒绝恢复。" >&2
       return 1
     fi
@@ -2199,16 +2610,54 @@ restore_saved_payload() {
     claim_node_state_dir "$state_dir" || return 1
     claimed=1
   fi
-  if [[ -f "${recovery}/config" && ! -L "${recovery}/config" ]]; then
+  # 只清理已明确快照的专用状态目录的普通文件；链接/子目录先拒绝，绝不递归删除。
+  if [[ -n "$state_declared" ]]; then
+    for state_file in "$state_dir"/* "$state_dir"/.[!.]* "$state_dir"/..?*; do
+      [[ -e "$state_file" || -L "$state_file" ]] || continue
+      [[ -f "$state_file" && ! -L "$state_file" ]] || { rc=1; break; }
+    done
+    if [[ "$rc" == 0 ]]; then
+      for state_file in "$state_dir"/* "$state_dir"/.[!.]* "$state_dir"/..?*; do
+        [[ -e "$state_file" || -L "$state_file" ]] || continue
+        name=$(basename "$state_file")
+        if [[ ! -f "${recovery}/state/${name}" ]]; then
+          remove_restored_plain_file "$state_file" || { rc=1; break; }
+        fi
+      done
+    fi
+  fi
+  if [[ "$rc" == 0 && -f "${recovery}/config" && ! -L "${recovery}/config" ]]; then
     dest=$(derper_config_path)
     install_without_following_link "${recovery}/config" "$dest" || rc=1
   fi
   if [[ "$rc" -eq 0 && -d "${recovery}/state" && ! -L "${recovery}/state" ]]; then
     state_dir=$(derper_node_state_dir)
-    for state_file in "${recovery}/state/"*; do
+    for state_file in "${recovery}/state/"* "${recovery}/state/".[!.]* "${recovery}/state/"..?*; do
       [[ -f "$state_file" && ! -L "$state_file" ]] || continue
       install_without_following_link "$state_file" "${state_dir}/$(basename "$state_file")" || rc=1
     done
+  fi
+  if [[ "$rc" -eq 0 && ! -f "${recovery}/config" ]]; then
+    if [[ "$declared" == "absent" ]]; then
+      state_dir=$(derper_node_state_dir)
+      dest=$(derper_config_path)
+      if [[ -L "$state_dir" || -L "$dest" ]]; then
+        echo "[错误] 节点状态目录是符号链接，拒绝恢复。" >&2
+        rc=1
+      elif [[ -e "$dest" && ! -f "$dest" ]]; then
+        echo "[错误] 当前节点配置不是普通文件，拒绝删除迁移产物。" >&2
+        rc=1
+      elif ! remove_restored_plain_file "$dest"; then
+        rc=1
+      fi
+    fi
+  fi
+  if [[ "$rc" == 0 && -n "$declared" ]]; then
+    dest=$(derper_config_path)
+    [[ "$(recovery_file_digest "$dest")" == "$declared" ]] || rc=1
+  fi
+  if [[ "$rc" == 0 && -n "$state_declared" ]]; then
+    [[ "$(recovery_state_digest "$state_dir")" == "$state_declared" ]] || rc=1
   fi
   if [[ "$claimed" -eq 1 ]]; then
     release_node_state_dir "$state_dir" || rc=1
@@ -2253,7 +2702,7 @@ recover_interrupted_change() {
 }
 
 snapshot_migration_recovery() {
-  local legacy="$1" root staging intent sum phase recovery
+  local legacy="$1" root staging intent sum phase recovery config state_dir state_file unit_sum config_sum state_sum
   root=$(deploy_state_root)
   # 发布已经开始时必须复用唯一恢复集，不能用已发布的候选覆盖旧版本。
   if [[ -e "${root}/incomplete" || -L "${root}/incomplete" ]]; then
@@ -2263,11 +2712,10 @@ snapshot_migration_recovery() {
     case "$phase" in
       switch) verify_recovery_dir "$recovery" || return 1 ;;
       migrate)
-        if [[ -f "${recovery}/binary" ]]; then
+        if [[ -f "${recovery}/binary" && ! -L "${recovery}/binary" ]]; then
           verify_recovery_dir "$recovery" || return 1
         else
-          intent=$(read_kv_value "${recovery}/manifest" run_intent) || return 1
-          case "$intent" in active|inactive|absent) ;; *) return 1 ;; esac
+          verify_recovery_payload "$recovery" || return 1
         fi
         ;;
       first-install) ;;
@@ -2286,21 +2734,58 @@ snapshot_migration_recovery() {
   staging="${root}/recovery.staging"
   rm -rf "$staging"
   mkdir -p "$staging" || return 1
+  if [[ ! -f "$legacy" || -L "$legacy" ]]; then
+    echo "[错误] 迁移来源不是普通文件，拒绝建立恢复集。" >&2
+    rm -rf "$staging"
+    return 1
+  fi
   intent=$(current_service_run_intent)
-  if [[ -f "$legacy" && ! -L "$legacy" ]]; then
-    cp -p "$legacy" "${staging}/config" || { rm -rf "$staging"; return 1; }
+  # 恢复目标是迁移前已经生效的节点身份，不是 INSTALL_DIR 里的遗留文件。
+  config=$(derper_config_path)
+  if [[ -f "$config" && ! -L "$config" ]]; then
+    cp -p "$config" "${staging}/config" || { rm -rf "$staging"; return 1; }
+  elif [[ -e "$config" || -L "$config" ]]; then
+    echo "[错误] 当前节点配置不是普通文件，拒绝迁移。" >&2
+    rm -rf "$staging"
+    return 1
+  fi
+  state_dir=$(derper_node_state_dir)
+  if [[ -d "$state_dir" && ! -L "$state_dir" ]]; then
+    mkdir -p "${staging}/state" || { rm -rf "$staging"; return 1; }
+    for state_file in "$state_dir"/* "$state_dir"/.[!.]* "$state_dir"/..?*; do
+      [[ -e "$state_file" || -L "$state_file" ]] || continue
+      if [[ ! -f "$state_file" || -L "$state_file" ]]; then
+        echo "[错误] 节点状态含符号链接或非普通文件，拒绝迁移。" >&2
+        rm -rf "$staging"
+        return 1
+      fi
+      cp -p "$state_file" "${staging}/state/$(basename "$state_file")" || { rm -rf "$staging"; return 1; }
+    done
+  elif [[ -e "$state_dir" || -L "$state_dir" ]]; then
+    echo "[错误] 节点状态目录不是普通目录，拒绝迁移。" >&2
+    rm -rf "$staging"
+    return 1
   fi
   if [[ -f "$SERVICE_PATH" && ! -L "$SERVICE_PATH" ]]; then
     cp -p "$SERVICE_PATH" "${staging}/unit" || { rm -rf "$staging"; return 1; }
   fi
+  unit_sum=$(recovery_file_digest "${staging}/unit") || { rm -rf "$staging"; return 1; }
+  config_sum=$(recovery_file_digest "${staging}/config") || { rm -rf "$staging"; return 1; }
+  state_sum=$(recovery_state_digest "${staging}/state") || { rm -rf "$staging"; return 1; }
   {
     printf 'kind=migrate\n'
     printf 'run_intent=%s\n' "$intent"
+    printf 'unit_sha256=%s\n' "$unit_sum"
+    printf 'config_sha256=%s\n' "$config_sum"
+    printf 'state_sha256=%s\n' "$state_sum"
   } >"${staging}/manifest" || { rm -rf "$staging"; return 1; }
   if [[ -f "$BIN_PATH" && ! -L "$BIN_PATH" ]]; then
     cp -p "$BIN_PATH" "${staging}/binary" || { rm -rf "$staging"; return 1; }
     sum=$(file_sha256 "${staging}/binary") || { rm -rf "$staging"; return 1; }
     printf 'binary_sha256=%s\n' "$sum" >>"${staging}/manifest" || { rm -rf "$staging"; return 1; }
+    verify_recovery_dir "$staging" || { rm -rf "$staging"; return 1; }
+  else
+    verify_recovery_payload "$staging" || { rm -rf "$staging"; return 1; }
   fi
   rm -rf "${root}/recovery.replacing"
   if [[ -d "${root}/recovery" ]]; then
@@ -2448,7 +2933,53 @@ layout_install_tree() {
   migrate_node_state || return 1
 }
 
+validate_local_elf() {
+  local bin="$1" header machine want
+  command -v od >/dev/null 2>&1 || return 1
+  header=$(od -An -tx1 -N20 "$bin" | tr -d ' \n') || return 1
+  # 64位、小端、System V/Linux ABI；在执行候选之前拒绝脚本及其他平台。
+  [[ ${#header} -eq 40 && "${header:0:14}" == 7f454c46020101 ]] || return 1
+  [[ "${header:14:2}" == 00 || "${header:14:2}" == 03 ]] || return 1
+  case "$(uname -m)" in x86_64|amd64) want=3e00 ;; aarch64|arm64) want=b700 ;; *) return 1 ;; esac
+  machine=${header:36:4}
+  [[ "$machine" == "$want" ]]
+}
+
+import_local_derper() {
+  local dir candidate actual expected version
+  [[ -f "$LOCAL_BINARY" && ! -L "$LOCAL_BINARY" && -r "$LOCAL_BINARY" ]] || { echo '[错误] 本地二进制必须为可读普通文件。' >&2; return 1; }
+  [[ "$DERPER_VERSION" != latest && -n "$DERPER_VERSION" ]] || return 1
+  dir="$(deploy_state_root)/candidate"
+  mkdir -p "$dir" && chmod 700 "$dir" || return 1
+  candidate=$(mktemp "$dir/import.XXXXXXXX") || return 1
+  if ! cp "$LOCAL_BINARY" "$candidate" || ! chmod 755 "$candidate" || ! validate_local_elf "$candidate"; then
+    rm -f "$candidate"
+    echo '[错误] 本地产物不是当前架构的Linux ELF，未执行或发布。' >&2
+    return 1
+  fi
+  actual=$(file_sha256 "$candidate") || { rm -f "$candidate"; return 1; }
+  expected=$(printf '%s' "$BINARY_SHA256" | tr 'A-F' 'a-f')
+  if [[ -n "$expected" && "$actual" != "$expected" ]]; then rm -f "$candidate"; echo '[错误] 本地产物摘要不符。' >&2; return 1; fi
+  version=$(derper_artifact_revision "$candidate" || true)
+  if [[ -z "$version" ]] || ! same_derper_identity "$version" "$DERPER_VERSION"; then
+    rm -f "$candidate"
+    echo '[错误] 本地产物版本无法确认或与目标不符。' >&2
+    return 1
+  fi
+  local help rc=0 flag
+  help=$(_timeout_run 10 "$candidate" -h 2>&1) || rc=$?
+  if [[ "$rc" != 0 && "$rc" != 2 ]]; then rm -f "$candidate"; echo '[错误] 候选帮助检查失败或超时。' >&2; return 1; fi
+  for flag in -a -c -certdir -certmode -stun; do
+    if ! printf '%s\n' "$help" | grep -qE -- "(^|[[:space:]])${flag}([[:space:]]|$)"; then rm -f "$candidate"; echo '[错误] 候选缺少部署所需能力。' >&2; return 1; fi
+  done
+  if [[ "$STUN_PORT" != 3478 ]] && ! printf '%s\n' "$help" | grep -q -- -stun-port; then rm -f "$candidate"; return 1; fi
+  if ! publish_derper_candidate "$candidate"; then rm -f "$candidate"; return 1; fi
+  rm -f "$candidate"
+  echo "[信息] 本地产物已发布：version=${version} sha256=${actual}（摘要仅校验完整性，不认证来源）"
+}
+
 install_derper() {
+  if [[ -n "${LOCAL_BINARY:-}" ]]; then import_local_derper || return 1; return 0; fi
   echo "[步骤] 安装/构建 derper 可执行文件…"
   precheck_go_network || exit 1
   ensure_go
@@ -2472,6 +3003,14 @@ install_derper() {
   fi
   publish_derper_candidate "${candidate_dir}/derper" || exit 1
   echo "[信息] derper 安装到：${BIN_PATH}"
+}
+
+ensure_deploy_dependencies() {
+  if [[ -z "$LOCAL_BINARY" ]]; then install_deps; return; fi
+  local tool
+  for tool in openssl curl od; do
+    command -v "$tool" >/dev/null 2>&1 || { echo "[错误] 本地导入缺少依赖 ${tool}，请先安装。" >&2; return 1; }
+  done
 }
 
 derper_supports_stun_port() {
@@ -3010,6 +3549,8 @@ check_live_cert_status() {
   local file_fp="" live_fp=""
   file_fp=$(cert_file_sha256_raw || true)
   live_fp=$(live_cert_sha256_raw || true)
+  HEALTH_CERT_SHA256="$file_fp"
+  HEALTH_LIVE_SHA256="$live_fp"
   if [[ -n "$file_fp" && -n "$live_fp" && "$file_fp" == "$live_fp" ]]; then
     CERT_LIVE_MATCH=1
   fi
@@ -3149,7 +3690,7 @@ setup_service_user() {
   
   # 创建系统用户（-r 系统用户，-M 不创建家目录，-g 指定组，-s 指定 shell）
   if useradd -r -M -g "$RUN_USER" -s "$nologin_path" "$RUN_USER" 2>/dev/null; then
-    echo "[信息] 用户 $RUN_USER 创建成功（shell: $nologin_path）"
+    echo "[信息] 用户 $RUN_USER 创建成功（shell: ${nologin_path}）"
   else
     # 回退：尝试不指定组（让系统自动处理）
     if useradd --system --no-create-home --shell "$nologin_path" "$RUN_USER" 2>/dev/null; then
@@ -3223,18 +3764,19 @@ service_verified_running() {
   return 0
 }
 
-# 失败回滚：恢复备份的旧 unit，并尝试重新启动旧服务（若此前在运行）后验证，
-# 保证“自动故障恢复”不只是还原文件、而是真正恢复可用状态。
+# 失败回滚：恢复备份的旧 unit，并尝试重新启动旧服务（若此前在运行）后验证。
+# 返回 0 表示回滚已经做完（全新安装已停止，或旧单元已写回且原服务本来就停着）。
+# 返回 1 只表示原先在运行的服务没能恢复，调用方这时才应提示保留恢复材料。
 rollback_previous_unit() {
   local backup="$1" was_running="${2:-0}"
   if [[ -z "$backup" || ! -f "$backup" ]]; then
     if [[ "$was_running" -ne 1 ]]; then
-      # 全新安装失败且无备份：停止残留的半启动状态
-      systemctl stop derper 2>/dev/null || true
+      # 全新安装失败且无备份：停止残留的半启动状态。回滚到此结束。
+      ensure_derper_stopped || return 1
       echo "[信息] 新安装启动失败，服务已停止；请排查后重新运行本脚本。" >&2
-    else
-      echo "[警告] 无可用备份单元，旧服务可能已停止；请立即检查 systemctl status derper。" >&2
+      return 0
     fi
+    echo "[警告] 无可用备份单元，旧服务可能已停止；请立即检查 systemctl status derper。" >&2
     return 1
   fi
   echo "[步骤] 正在恢复备份的 systemd 单元：${backup}" >&2
@@ -3255,9 +3797,9 @@ rollback_previous_unit() {
     echo "  请立即执行 systemctl status derper 与 journalctl -u derper -n 100 排查。" >&2
     return 1
   fi
-  systemctl stop derper 2>/dev/null || true
+  ensure_derper_stopped || return 1
   echo "[信息] 已恢复旧单元；新配置启动失败，服务保持停止状态。" >&2
-  return 1
+  return 0
 }
 
 intercept_non_systemd_environment() {
@@ -3630,6 +4172,28 @@ WantedBy=multi-user.target
 SERVICE
 }
 
+rollback_failed_release() {
+  local backup="$1" was_running="$2" marker phase
+  rollback_cert_update || return 1
+  marker="$(deploy_state_root)/incomplete"
+  if [[ -e "$marker" || -L "$marker" ]]; then
+    phase=$(read_kv_value "$marker" phase) || return 1
+    if [[ "$phase" == first-install && -n "$backup" && -f "$backup" ]]; then
+      # 首装没有旧二进制可重启。先停服并放回已有unit，再清理候选与标记。
+      ensure_derper_stopped || return 1
+      atomic_copy_file "$backup" "$SERVICE_PATH" || return 1
+      systemctl daemon-reload || return 1
+    fi
+    if ! rollback_deploy_change; then
+      echo '[错误] 发布回退未完成，恢复集与标记已保留。' >&2
+      return 1
+    fi
+    # A/B回退已经恢复并复验进程，不能再执行旧unit分支重复重启。
+    return 0
+  fi
+  rollback_previous_unit "$backup" "$was_running"
+}
+
 deploy_and_verify_derper_service() {
   local svc_path="$1" unit_content="$2"
   local unit_backup=""
@@ -3661,7 +4225,7 @@ deploy_and_verify_derper_service() {
   fi
 
   if [[ "${service_started}" -eq 1 ]]; then
-    if ! service_verified_running; then
+    if ! service_verified_running || ! publish_verification_gate; then
       echo "[警告] 服务启动命令成功，但未通过健康验证（active/端口/TLS/进程）。" >&2
       service_started=0
     fi
@@ -3681,16 +4245,14 @@ deploy_and_verify_derper_service() {
       systemctl enable derper >/dev/null 2>&1 || true
       local degraded_ok=0
       if systemctl restart derper 2>/dev/null || systemctl start derper 2>/dev/null; then
-        if service_verified_running; then
+        if service_verified_running && publish_verification_gate; then
           degraded_ok=1
           echo "[信息] 服务已成功启动（已禁用 MemoryDenyWriteExecute；unit 已标记为 paranoid 降级）"
         fi
       fi
       if [[ "$degraded_ok" -ne 1 ]]; then
         echo "[警告] 降级后服务仍未通过健康验证，开始回滚。" >&2
-        rollback_cert_update || return 1
-        rollback_deploy_change || echo "[错误] 发布回退未完成，恢复集已保留。" >&2
-        rollback_previous_unit "$unit_backup" "$was_running" || true
+        rollback_failed_release "$unit_backup" "$was_running" || echo '[错误] 回退未完成，请保留恢复材料并检查日志。' >&2
         cat >&2 <<'EOT'
 
 [错误] 服务仍然无法启动
@@ -3715,9 +4277,7 @@ EOT
       fi
     else
       echo "[步骤] 启动失败，正在回滚到备份的旧服务配置。" >&2
-      rollback_cert_update || return 1
-      rollback_deploy_change || echo "[错误] 发布回退未完成，恢复集已保留。" >&2
-      rollback_previous_unit "$unit_backup" "$was_running" || true
+      rollback_failed_release "$unit_backup" "$was_running" || echo '[错误] 回退未完成，请保留恢复材料并检查日志。' >&2
       cat >&2 <<'EOT'
 
 [错误] 服务启动失败
@@ -4047,7 +4607,10 @@ systemd_escape_arg() {
 
 render_healthcheck_commands() {
   local prog="$1" ip="$2" metrics="$3"
-  local cron_prog cron_ip cron_metrics cron_port cron_stun cron_level cron_verify
+  local cron_prog cron_ip cron_metrics cron_port cron_stun cron_level cron_verify non_global_arg=""
+  if [[ "${ALLOW_NON_GLOBAL_IP:-0}" -eq 1 ]]; then
+    non_global_arg=" --allow-non-global-ip"
+  fi
   cron_prog=$(printf '%q' "$prog")
   cron_ip=$(printf '%q' "$ip")
   cron_metrics=$(printf '%q' "$metrics")
@@ -4059,7 +4622,7 @@ render_healthcheck_commands() {
   else
     cron_verify="--force-verify-clients"
   fi
-  BASH_HEALTHCHECK_CMD="bash ${cron_prog} --health-check --ip ${cron_ip} --derp-port ${cron_port} --stun-port ${cron_stun} --security-level ${cron_level} ${cron_verify} --metrics-textfile ${cron_metrics}"
+  BASH_HEALTHCHECK_CMD="bash ${cron_prog} --health-check --ip ${cron_ip} --derp-port ${cron_port} --stun-port ${cron_stun} --security-level ${cron_level} ${cron_verify}${non_global_arg} --metrics-textfile ${cron_metrics}"
 
   local sys_prog sys_ip sys_metrics sys_port sys_stun sys_level
   sys_prog=$(systemd_escape_arg "$prog")
@@ -4068,7 +4631,20 @@ render_healthcheck_commands() {
   sys_port=$(systemd_escape_arg "${DERP_PORT}")
   sys_stun=$(systemd_escape_arg "${STUN_PORT}")
   sys_level=$(systemd_escape_arg "${SECURITY_LEVEL}")
-  SYSTEMD_HEALTHCHECK_EXEC="/bin/bash ${sys_prog} --health-check --ip ${sys_ip} --derp-port ${sys_port} --stun-port ${sys_stun} --security-level ${sys_level} ${cron_verify} --metrics-textfile ${sys_metrics}"
+  SYSTEMD_HEALTHCHECK_EXEC="/bin/bash ${sys_prog} --health-check --ip ${sys_ip} --derp-port ${sys_port} --stun-port ${sys_stun} --security-level ${sys_level} ${cron_verify}${non_global_arg} --metrics-textfile ${sys_metrics}"
+  local extra flag val
+  for flag in state-file external-probe; do
+    case "$flag" in state-file) val=$HEALTH_STATE_FILE ;; *) val=$EXTERNAL_PROBE ;; esac
+    [[ -n "$val" ]] || continue
+    printf -v extra '%q' "$val"
+    BASH_HEALTHCHECK_CMD+=" --$flag $extra"
+    SYSTEMD_HEALTHCHECK_EXEC+=" --$flag $(systemd_escape_arg "$val")"
+  done
+  if [[ -n "$EXTERNAL_PROBE" || "$REQUIRE_H3" == 1 ]]; then
+    BASH_HEALTHCHECK_CMD+=" --probe-timeout $PROBE_TIMEOUT --probe-max-age $PROBE_MAX_AGE --region-id $REGION_ID"
+    SYSTEMD_HEALTHCHECK_EXEC+=" --probe-timeout $PROBE_TIMEOUT --probe-max-age $PROBE_MAX_AGE --region-id $REGION_ID"
+    if [[ "$REQUIRE_H3" == 1 ]]; then BASH_HEALTHCHECK_CMD+=' --require-h3'; SYSTEMD_HEALTHCHECK_EXEC+=' --require-h3'; fi
+  fi
 }
 
 render_healthcheck_units() {
@@ -4224,6 +4800,7 @@ finish_healthcheck_rollback() {
 }
 
 install_healthcheck_cron() {
+  local HEALTH_STATE_FILE="${HEALTH_STATE_FILE:-$(deploy_state_root)/health/status.json}"
   local self ip metrics stable dest
   self=$(script_self_path)
   if [[ ! -f "$self" ]]; then
@@ -4770,6 +5347,327 @@ Tailscale 默认 ACL 是全通的：如果这台公网机器被攻破，攻击�
 EOF
 }
 
+# JSON渲染不依赖jq/Python，单文件仍可直接复制运行。
+json_quote() {
+  local s="${1-}" ch code i
+  printf '"'
+  for ((i=0; i<${#s}; i++)); do
+    ch=${s:i:1}
+    case "$ch" in
+      '"') printf '\\"' ;; '\') printf '\\\\' ;;
+      $'\n') printf '\\n' ;; $'\r') printf '\\r' ;; $'\t') printf '\\t' ;;
+      # Bash 3.2 按字节切片，printf %d 对 >=0x80 的字节返回符号扩展的负数；先还原为无符号再判断控制字符。
+      *) printf -v code '%d' "'$ch"; (( code >= 0 )) || code=$((code + 256)); if (( code < 32 )); then printf '\\u%04x' "$code"; else printf '%s' "$ch"; fi ;;
+    esac
+  done
+  printf '"'
+}
+
+json_nullable() { if [[ -n "${1-}" ]]; then json_quote "$1"; else printf null; fi; }
+# 与 REGION_ID 一样只输出 JSON 安全整数（绝对值不超过 2^53-1）。超出则 null，避免大整数被静默截断。
+json_number() {
+  local n="${1-}" abs
+  [[ "$n" =~ ^-?(0|[1-9][0-9]*)$ ]] || { printf null; return; }
+  abs=${n#-}
+  if decimal_in_closed_range "$abs" 0 9007199254740991; then printf '%s' "$n"; else printf null; fi
+}
+
+probe_path_is_trusted() {
+  local path="$1" uid mode
+  [[ "$path" == /* && -f "$path" && -x "$path" && ! -L "$path" ]] || return 1
+  [[ "$(id -u)" == 0 ]] || return 0
+  while :; do
+    [[ ! -L "$path" ]] || return 1
+    uid=$(stat -c %u "$path" 2>/dev/null) || return 1
+    mode=$(stat -c %a "$path" 2>/dev/null) || return 1
+    [[ "$uid" == 0 ]] && (( (8#$mode & 0022) == 0 )) || return 1
+    [[ "$path" != / ]] || break
+    path=$(dirname "$path")
+  done
+}
+
+run_external_probe() {
+  H3_STATUS=not_checked; H3_REASON=probe_not_configured
+  [[ -n "$EXTERNAL_PROBE" ]] || return 0
+  H3_STATUS=unknown; H3_REASON=probe_untrusted_or_unavailable
+  probe_path_is_trusted "$EXTERNAL_PROBE" || return 0
+  command -v timeout >/dev/null 2>&1 || { H3_REASON=probe_timeout_tool_missing; return 0; }
+  local out err rc=0 line key value seen='|' now checked='' schema='' region='' ip='' dp='' sp='' derp='' stun=''
+  out=$(mktemp) || return 0
+  err=$(mktemp) || { rm -f "$out"; return 0; }
+  # 文件大小与运行时间均有界；不把适配器的输出/凭据直接打到日志。
+  ( ulimit -f 128; _timeout_run "$PROBE_TIMEOUT" "$EXTERNAL_PROBE" --region-id "$REGION_ID" --ip "$IP_ADDR" --derp-port "$DERP_PORT" --stun-port "$STUN_PORT" ) >"$out" 2>"$err" || rc=$?
+  H3_REASON=probe_invalid_report
+  if [[ "$rc" != 0 && "$rc" != 1 ]]; then H3_REASON=probe_timeout_or_error; rm -f "$out" "$err"; return 0; fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" == *=* ]] || { rm -f "$out" "$err"; return 0; }
+    key=${line%%=*}; value=${line#*=}
+    [[ "$seen" != *"|$key|"* ]] || { rm -f "$out" "$err"; return 0; }
+    seen+="$key|"
+    case "$key" in
+      schema) schema=$value ;; region_id) region=$value ;; ip) ip=$value ;;
+      derp_port) dp=$value ;; stun_port) sp=$value ;; checked_at) checked=$value ;;
+      derp) derp=$value ;; stun) stun=$value ;;
+      *) rm -f "$out" "$err"; return 0 ;;
+    esac
+  done <"$out"
+  rm -f "$out" "$err"
+  [[ "$schema" == 1 && "$region" == "$REGION_ID" && "$ip" == "$IP_ADDR" && "$dp" == "$DERP_PORT" && "$sp" == "$STUN_PORT" && "$checked" =~ ^[1-9][0-9]{0,10}$ ]] || return 0
+  [[ "$derp" == ok || "$derp" == failed ]] && [[ "$stun" == ok || "$stun" == failed ]] || return 0
+  now=$(date +%s)
+  if (( checked > now+5 || now-checked > PROBE_MAX_AGE )); then H3_REASON=probe_stale; return 0; fi
+  if [[ "$rc" == 0 && "$derp" == ok && "$stun" == ok ]]; then
+    H3_STATUS=healthy; H3_REASON=external_derp_and_stun_verified
+  elif [[ "$rc" == 1 && ( "$derp" == failed || "$stun" == failed ) ]]; then
+    H3_STATUS=failed; H3_REASON=external_derp_or_stun_failed
+  fi
+}
+
+check_metrics_freshness() {
+  METRICS_FRESHNESS=not_checked; METRICS_AGE=''
+  [[ -n "$METRICS_SOURCE" ]] || return 0
+  METRICS_FRESHNESS=unknown
+  [[ -r "$METRICS_SOURCE" && -f "$METRICS_SOURCE" && ! -L "$METRICS_SOURCE" ]] || return 0
+  local stamp count
+  count=$(grep -c '^derper_metrics_unixtime ' "$METRICS_SOURCE" || true)
+  [[ "$count" == 1 ]] || return 0
+  stamp=$(awk '$1=="derper_metrics_unixtime" && NF==2 {print $2}' "$METRICS_SOURCE")
+  [[ "$stamp" =~ ^[1-9][0-9]{0,10}$ ]] || return 0
+  (( stamp <= SAMPLED_AT+5 )) || return 0
+  METRICS_AGE=$((SAMPLED_AT-stamp))
+  (( METRICS_AGE >= 0 )) || METRICS_AGE=0
+  if (( METRICS_AGE > METRICS_MAX_AGE )); then METRICS_FRESHNESS=stale; else METRICS_FRESHNESS=fresh; fi
+}
+
+derive_health_layers() {
+  H0_STATUS=healthy; H1_STATUS=failed; H2_STATUS=not_applicable
+  local tool
+  for tool in openssl systemctl; do command -v "$tool" >/dev/null 2>&1 || H0_STATUS=unknown; done
+  if ! command -v ss >/dev/null 2>&1 && ! command -v netstat >/dev/null 2>&1; then H0_STATUS=unknown; fi
+  if [[ "$H0_STATUS" == unknown || "${CERT_CHECK_UNKNOWN:-0}" == 1 || "${PORT_CHECK_UNKNOWN:-0}" == 1 ]]; then
+    H1_STATUS=unknown
+  elif [[ "${DERPER_RUNNING:-0}" == 1 && "${PORT_TLS_OK:-0}" == 1 && "${PORT_STUN_OK:-0}" == 1 && "${CURRENT_DERPER_OWNS_PORTS:-0}" != 1 && "${PORT_OWNER_DATA_AVAILABLE:-0}" != 1 ]]; then
+    H1_STATUS=unknown
+  elif ( local DERPER_VERIFY_CLIENTS_EFFECTIVE=0; health_is_ok ) && [[ "${CURRENT_DERPER_OWNS_PORTS:-0}" == 1 ]]; then
+    H1_STATUS=healthy
+  fi
+  if [[ "${DERPER_VERIFY_CLIENTS_EFFECTIVE:-0}" == 1 ]]; then
+    H2_STATUS=failed
+    if [[ "${TS_AUTH_UNKNOWN:-0}" == 1 ]]; then H2_STATUS=unknown
+    elif [[ "${TS_RUNNING:-0}" == 1 && "${TS_LOCALAPI_OK:-0}" == 1 ]]; then H2_STATUS=healthy; fi
+  fi
+}
+
+snapshot_exit_code() {
+  if [[ "${HEALTH_SNAPSHOT_READY:-0}" != 1 ]]; then health_check_exit_code "${1:-0}"; return; fi
+  local status unknown=0 failed=0
+  for status in "$H0_STATUS" "$H1_STATUS" "$H2_STATUS"; do
+    [[ "$status" != unknown ]] || unknown=1
+    [[ "$status" != failed ]] || failed=1
+  done
+  if [[ -n "$EXTERNAL_PROBE" || "$REQUIRE_H3" == 1 ]]; then
+    [[ "$H3_STATUS" != failed ]] || failed=1
+    [[ "$H3_STATUS" == healthy || "$H3_STATUS" == failed ]] || unknown=1
+  fi
+  case "$METRICS_FRESHNESS" in stale|unknown) unknown=1 ;; esac
+  if [[ "${METRICS_WRITE_FAILED:-0}" == 1 || "${STATE_WRITE_FAILED:-0}" == 1 || "${1:-${HEALTH_VALIDATE_FAILED:-0}}" != 0 ]]; then failed=1; fi
+  if [[ "$unknown" == 1 ]]; then printf '2\n'; elif [[ "$failed" == 1 ]]; then printf '1\n'; else printf '0\n'; fi
+}
+
+render_status_json() {
+  local rc result reason=verified_local_scope attention=false success="${HEALTH_LAST_SUCCESS:-0}"
+  rc=$(snapshot_exit_code "${HEALTH_VALIDATE_FAILED:-0}")
+  case "$rc" in 0) result=healthy; success=$SAMPLED_AT ;; 1) result=failed ;; *) result=unknown ;; esac
+  if [[ "$rc" != 0 ]]; then
+    attention=true; reason=local_health_not_verified
+    if [[ "$METRICS_FRESHNESS" == stale || "$METRICS_FRESHNESS" == unknown ]]; then reason=metrics_source_not_fresh
+    elif [[ -n "$EXTERNAL_PROBE" || "$REQUIRE_H3" == 1 ]] && [[ "$H3_STATUS" != healthy ]]; then reason=$H3_REASON
+    elif [[ "${METRICS_WRITE_FAILED:-0}" == 1 || "${STATE_WRITE_FAILED:-0}" == 1 ]]; then reason=result_write_failed; fi
+  fi
+  printf '{"schema_version":1,"scope_id":'
+  json_nullable "$(health_scope_id || true)"
+  printf ',"sampled_at":%s,"last_success_at":' "$SAMPLED_AT"
+  if [[ "$success" == 0 ]]; then printf null; else printf '%s' "$success"; fi
+  printf ',"result":'
+  json_quote "$result"
+  printf ',"reason":'; json_quote "$reason"; printf ',"needs_manual_attention":%s,"config_file":' "$attention"; json_nullable "$CONFIG_FILE"
+  printf ',"journal_storage":'; json_quote "${JOURNAL_STORAGE:-unknown}"
+  printf ',"scope":"H0-H2; H3 requires independent client","layers":{"h0":'; json_quote "$H0_STATUS"
+  printf ',"h1":'; json_quote "$H1_STATUS"; printf ',"h2":'; json_quote "$H2_STATUS"; printf ',"h3":'; json_quote "$H3_STATUS"
+  printf '},"h3_reason":'; json_quote "$H3_REASON"
+  printf ',"metrics":{"freshness":'; json_quote "$METRICS_FRESHNESS"; printf ',"age_seconds":'; json_number "$METRICS_AGE"
+  printf '},"target":{"ip":'; json_quote "$IP_ADDR"; printf ',"derp_port":'; json_number "$DERP_PORT"
+  printf ',"stun_port":'; json_number "$STUN_PORT"; printf ',"region_id":'; json_number "$REGION_ID"
+  printf ',"region_code":'; json_quote "$REGION_CODE"; printf ',"region_name":'; json_quote "$REGION_NAME"
+  printf ',"verify_clients":'; json_quote "$VERIFY_CLIENTS_MODE"; printf '},"certificate":{"disk_sha256":'; json_nullable "${HEALTH_CERT_SHA256:-}"
+  printf ',"live_sha256":'; json_nullable "${HEALTH_LIVE_SHA256:-}"; printf ',"days_remaining":'; json_number "${HEALTH_DAYS_LEFT:-}"
+  printf '},"writes":{"metrics_failed":%s,"state_failed":%s}}\n' "${METRICS_WRITE_FAILED:-0}" "${STATE_WRITE_FAILED:-0}"
+}
+
+render_derpmap_json() {
+  if [[ "$H1_STATUS" != healthy || ! "${HEALTH_LIVE_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo '[错误] 本地身份未验证，不能生成可信derpMap。' >&2
+    # 确认故障是 1；采不到（未知或没有指纹）是 2，不能把未知报成故障。
+    if [[ "$H1_STATUS" == failed ]]; then return 1; fi
+    return 2
+  fi
+  printf '{"Regions":{'; json_quote "$REGION_ID"
+  printf ':{"RegionID":%s,"RegionCode":' "$REGION_ID"; json_quote "$REGION_CODE"
+  printf ',"RegionName":'; json_quote "$REGION_NAME"
+  printf ',"Nodes":[{"Name":"custom","RegionID":%s,"HostName":' "$REGION_ID"; json_quote "$IP_ADDR"
+  printf ',"IPv4":'; json_quote "$IP_ADDR"; printf ',"DERPPort":%s,"STUNPort":%s,"CertName":' "$DERP_PORT" "$STUN_PORT"
+  json_quote "sha256-raw:$HEALTH_LIVE_SHA256"; printf '}]}}}\n'
+}
+
+# 路径比较不创建目录；父目录物理路径和词法归一化用于识别尚不存在的输出别名。
+canonical_output_path() {
+  local path="$1" dir base tail='' parent
+  [[ -n "$path" && "$path" != *$'\n'* && "$path" != *$'\r'* ]] || return 1
+  [[ "$path" == /* ]] || path="$PWD/$path"
+  dir=$(dirname "$path"); base=$(basename "$path")
+  while [[ ! -d "$dir" ]]; do
+    parent=$(dirname "$dir")
+    [[ "$parent" != "$dir" ]] || return 1
+    tail="/$(basename "$dir")$tail"; dir=$parent
+  done
+  dir=$(cd -P "$dir" && pwd) || return 1
+  printf '%s\n' "$dir$tail/$base" | awk -F/ '{n=0; for(i=1;i<=NF;i++){if($i==""||$i==".")continue;if($i==".."){if(n)n--}else a[++n]=$i}for(i=1;i<=n;i++)printf "/%s",a[i];print ""}'
+}
+
+health_output_paths_are_distinct() {
+  local left right a b
+  for left in "$HEALTH_STATE_FILE" "$METRICS_TEXTFILE"; do
+    [[ -n "$left" ]] || continue
+    right=$METRICS_SOURCE
+    if [[ -n "$right" ]]; then
+      a=$(canonical_output_path "$left") && b=$(canonical_output_path "$right") || return 1
+      if [[ "$a" == "$b" || "$left" -ef "$right" ]]; then
+        echo '[错误] 健康状态/指标输出不能覆盖指标输入。' >&2; return 1
+      fi
+    fi
+  done
+  if [[ -n "$HEALTH_STATE_FILE" && -n "$METRICS_TEXTFILE" ]]; then
+    a=$(canonical_output_path "$HEALTH_STATE_FILE") && b=$(canonical_output_path "$METRICS_TEXTFILE") || return 1
+    if [[ "$a" == "$b" || "$HEALTH_STATE_FILE" -ef "$METRICS_TEXTFILE" ]]; then
+      echo '[错误] --state-file 与 --metrics-textfile 不能指向同一文件或别名。' >&2; return 1
+    fi
+  fi
+  return 0
+}
+
+# 按原始路径逐层检查，不能先解析不可信链接再把其目标当成用户授权的路径。
+health_state_parent_is_safe() {
+  local file="$1" create="${2:-0}" create_mode="${3:-700}" dir rest part current=/ caller owner mode
+  [[ -n "$file" && "$file" != *$'\n'* && "$file" != *$'\r'* && ! -L "$file" && ( ! -e "$file" || -f "$file" ) ]] || return 1
+  [[ "$file" == /* ]] || file="$PWD/$file"
+  dir=$(dirname "$file"); rest=${dir#/}
+  caller=$(id -u) || return 1
+  while [[ -n "$rest" ]]; do
+    part=${rest%%/*}
+    if [[ "$rest" == "$part" ]]; then rest=''; else rest=${rest#*/}; fi
+    [[ -n "$part" && "$part" != . ]] || continue
+    [[ "$part" != .. ]] || return 1
+    current="${current%/}/$part"
+    if [[ ! -e "$current" && ! -L "$current" ]]; then
+      [[ "$create" == 1 ]] || return 1
+      mkdir -m "$create_mode" "$current" || return 1
+    fi
+    [[ -d "$current" ]] || return 1
+    [[ "$caller" != 0 || ! -L "$current" ]] || return 1
+    owner=$(stat -Lc %u "$current" 2>/dev/null || stat -L -f %u "$current") || return 1
+    mode=$(stat -Lc %a "$current" 2>/dev/null || stat -L -f %Lp "$current") || return 1
+    [[ "$owner" == 0 || "$owner" == "$caller" ]] || return 1
+    [[ "$mode" =~ ^[0-7]{3,4}$ ]] || return 1
+    if (( (8#$mode & 0022) != 0 )); then
+      [[ "$owner" == 0 ]] && (( (8#$mode & 01000) != 0 )) || return 1
+    fi
+  done
+  # /tmp这样的sticky目录可以是祖先，不能直接作为结果文件的父目录。
+  mode=$(stat -Lc %a "$dir" 2>/dev/null || stat -L -f %Lp "$dir") || return 1
+  (( (8#$mode & 0022) == 0 )) || return 1
+}
+
+health_scope_id() {
+  printf '%s\000' 1 "$IP_ADDR" "$DERP_PORT" "$STUN_PORT" "$REGION_ID" "$REGION_CODE" "$REGION_NAME" "$VERIFY_CLIENTS_MODE" "${DERPER_VERIFY_CLIENTS_EFFECTIVE:-0}" "$REQUIRE_H3" "$EXTERNAL_PROBE" "$PROBE_TIMEOUT" "$PROBE_MAX_AGE" "$METRICS_SOURCE" "$METRICS_MAX_AGE" | sha256_hex
+}
+
+load_health_last_success() {
+  HEALTH_LAST_SUCCESS=0
+  [[ -n "$HEALTH_STATE_FILE" && -r "$HEALTH_STATE_FILE" && -f "$HEALTH_STATE_FILE" && ! -L "$HEALTH_STATE_FILE" ]] || return 0
+  health_state_parent_is_safe "$HEALTH_STATE_FILE" || return 0
+  local prior stored scope
+  scope=$(health_scope_id) || return 0
+  stored=$(sed -nE 's/^\{"schema_version":1,"scope_id":"([0-9a-f]{64})","sampled_at":[0-9]+,"last_success_at":([0-9]+),.*/\1 \2/p' "$HEALTH_STATE_FILE")
+  [[ "$stored" == "$scope "* ]] || return 0
+  prior=${stored#* }
+  if [[ "$prior" =~ ^(0|[1-9][0-9]{0,10})$ ]] && (( prior <= SAMPLED_AT )); then HEALTH_LAST_SUCCESS=$prior; fi
+}
+
+write_health_state() {
+  [[ -n "$HEALTH_STATE_FILE" ]] || return 0
+  local dir tmp
+  dir=$(dirname "$HEALTH_STATE_FILE")
+  health_state_parent_is_safe "$HEALTH_STATE_FILE" 1 || return 1
+  tmp=$(mktemp "$dir/.health.XXXXXXXX") || return 1
+  if ! render_status_json >"$tmp" || ! chmod 600 "$tmp" || ! mv -f "$tmp" "$HEALTH_STATE_FILE"; then rm -f "$tmp"; return 1; fi
+  [[ -f "$HEALTH_STATE_FILE" && ! -L "$HEALTH_STATE_FILE" ]] || return 1
+}
+
+port_observation_available() {
+  if command -v ss >/dev/null 2>&1 || command -v netstat >/dev/null 2>&1; then
+    return 0
+  fi
+  return 1
+}
+
+tls_observation_available() {
+  command -v openssl >/dev/null 2>&1
+}
+
+# service_verified_running 在缺 ss/netstat/openssl 时只警告并继续（BUG-027）。
+# 发布门禁不能把同一种“观测工具缺失”再当成故障，把刚验证过的服务回滚掉。
+# 工具齐备时的未知、已确认故障，以及 H3/指标问题，仍然阻断提交。
+degraded_startup_satisfies_gate() {
+  local missing=0
+  port_observation_available || missing=1
+  tls_observation_available || missing=1
+  [[ "$missing" == 1 ]] || return 1
+  [[ "$H0_STATUS" != failed && "$H1_STATUS" != failed && "$H2_STATUS" != failed && "$H3_STATUS" != failed ]] || return 1
+  [[ "$H2_STATUS" == healthy || "$H2_STATUS" == not_applicable ]] || return 1
+  if [[ -n "$EXTERNAL_PROBE" || "$REQUIRE_H3" == 1 ]]; then
+    [[ "$H3_STATUS" == healthy ]] || return 1
+  fi
+  case "$METRICS_FRESHNESS" in
+    stale|unknown) return 1 ;;
+  esac
+  [[ "${METRICS_WRITE_FAILED:-0}" == 0 && "${STATE_WRITE_FAILED:-0}" == 0 && "${HEALTH_VALIDATE_FAILED:-0}" == 0 ]] || return 1
+  [[ "${DERPER_RUNNING:-0}" == 1 && "${PURE_IP_OK:-0}" == 1 && "${DESIRED_CONFIG_OK:-0}" == 1 ]] || return 1
+  if port_observation_available; then
+    [[ "${PORT_CHECK_UNKNOWN:-0}" == 0 && "${PORT_TLS_OK:-0}" == 1 && "${PORT_STUN_OK:-0}" == 1 && "${CURRENT_DERPER_OWNS_PORTS:-0}" == 1 ]] || return 1
+  fi
+  if tls_observation_available; then
+    [[ "${CERT_CHECK_UNKNOWN:-0}" == 0 && "${CERT_PRESENT:-0}" == 1 && "${CERT_NAMING_OK:-0}" == 1 ]] || return 1
+    [[ "${CERT_SAN_MATCH:-0}" == 1 && "${CERT_EXPIRY_OK:-0}" == 1 && "${CERT_KEY_MATCH:-1}" == 1 ]] || return 1
+    if [[ "${LIVE_CERT_CHECKED:-0}" == 1 ]]; then
+      [[ "${CERT_LIVE_MATCH:-0}" == 1 ]] || return 1
+    fi
+  fi
+  return 0
+}
+
+publish_verification_gate() {
+  collect_health_status >&2
+  local rc
+  rc=$(snapshot_exit_code)
+  if [[ "$rc" == 0 ]]; then return 0; fi
+  if degraded_startup_satisfies_gate; then
+    echo "[警告] 缺少 ss/netstat 或 openssl，发布门禁沿用启动验证的降级结果，不回滚已通过启动验证的服务（H0=${H0_STATUS} H1=${H1_STATUS} H2=${H2_STATUS}）。" >&2
+    return 0
+  fi
+  echo "[错误] 发布门禁未通过：H0=$H0_STATUS H1=$H1_STATUS H2=$H2_STATUS H3=${H3_STATUS}。" >&2
+  return 1
+}
+
 # 健康检查摘要（适合 cron 调用）
 health_is_ok() {
   [[ "${DERPER_RUNNING:-0}" -eq 1 ]] || return 1
@@ -4797,6 +5695,7 @@ health_is_ok() {
 # 健康检查退出码。旧 cron 丢弃退出码；`if ! --health-check` 把任意非 0 当成未通过。
 # 0 健康；1 已确认故障；2 未知（无权限或无法采集）。未知不能返回 0。
 health_check_exit_code() {
+  if [[ "${HEALTH_SNAPSHOT_READY:-0}" == 1 ]]; then snapshot_exit_code "${1:-0}"; return 0; fi
   local validate_failed="${1:-0}" unknown="${2:-0}"
   if [[ "$unknown" -eq 1 || "${CERT_CHECK_UNKNOWN:-0}" -eq 1 || "${TS_AUTH_UNKNOWN:-0}" -eq 1 ]]; then
     printf '2\n'
@@ -4825,6 +5724,9 @@ cert_expiry_alarm() {
 }
 
 collect_health_status() {
+  HEALTH_SNAPSHOT_READY=0
+  SAMPLED_AT=$(date +%s)
+  HEALTH_VALIDATE_FAILED=0
   # 检查关键依赖工具
   local missing_tools=()
   command -v timeout >/dev/null 2>&1 || missing_tools+=(timeout)
@@ -4835,25 +5737,31 @@ collect_health_status() {
 
   infer_ip_from_existing_deployment || true
   infer_healthcheck_settings_from_unit || true
-  validate_settings || true
+  validate_settings || HEALTH_VALIDATE_FAILED=1
   check_tailscale_status
   check_derper_status
   check_cert_status
   check_live_cert_status
+  HEALTH_DAYS_LEFT=$(cert_days_remaining || true)
+  HEALTH_RSS_KB=0
+  local pid
+  pid=$(systemctl show -p MainPID --value derper 2>/dev/null || true)
+  if [[ "$pid" =~ ^[1-9][0-9]*$ ]]; then
+    HEALTH_RSS_KB=$(ps -o rss= -p "$pid" 2>/dev/null | awk '{s+=$1} END {print s+0}') || HEALTH_RSS_KB=0
+  fi
+  derive_health_layers
+  run_external_probe
+  check_metrics_freshness
+  load_health_last_success
+  JOURNAL_STORAGE=volatile_or_unconfigured
+  [[ ! -d /var/log/journal ]] || JOURNAL_STORAGE=persistent_directory_present
+  HEALTH_SNAPSHOT_READY=1
 }
 
 render_health_summary_text() {
   local days_left="$1" rss_kb="${2:-0}"
   echo "[健康检查] DERP 服务健康状态摘要："
-  if command -v systemctl >/dev/null 2>&1; then
-    if systemctl is-active --quiet derper 2>/dev/null; then
-      echo "✅ 服务：derper 处于运行中"
-    else
-      echo "❌ 服务：derper 未在运行"
-    fi
-  else
-    [[ $DERPER_RUNNING -eq 1 ]] && echo "✅ 进程：derper 运行中" || echo "❌ 进程：derper 未运行"
-  fi
+  [[ $DERPER_RUNNING -eq 1 ]] && echo "✅ 服务：derper 处于运行中" || echo "❌ 服务：derper 未在运行"
   [[ $PORT_TLS_OK -eq 1 ]] && echo "✅ 端口：TLS ${DERP_PORT}/tcp 正在监听" || echo "❌ 端口：TLS ${DERP_PORT}/tcp 未监听"
   [[ $PORT_STUN_OK -eq 1 ]] && echo "✅ 端口：STUN ${STUN_PORT}/udp 正在监听" || echo "❌ 端口：STUN ${STUN_PORT}/udp 未监听"
   [[ $PURE_IP_OK -eq 1 ]] && echo "✅ 配置：当前 unit 为纯 IP 模式" || echo "❌ 配置：当前 unit 不是纯 IP 模式"
@@ -4910,27 +5818,37 @@ render_health_summary_text() {
 }
 
 health_check_report() {
-  collect_health_status
-  local days_left
-  days_left=$(cert_days_remaining || true)
+  METRICS_WRITE_FAILED=0; STATE_WRITE_FAILED=0
+  collect_health_status >&2
+  local days_left="${HEALTH_DAYS_LEFT:-}" rss_kb="${HEALTH_RSS_KB:-0}"
 
-  local rss_kb=0 pidlist
-  pidlist=$(pgrep -x derper 2>/dev/null | xargs || true)
-  if [[ -n "$pidlist" ]]; then
-    rss_kb=$(ps -o rss= -p $pidlist 2>/dev/null | awk '{s+=$1} END{print s+0}')
+  if ! health_output_paths_are_distinct; then
+    METRICS_WRITE_FAILED=1; STATE_WRITE_FAILED=1
+    if [[ "$OUTPUT_FORMAT" == json ]]; then render_status_json; else echo '[错误] 输出路径冲突，未写入任何结果文件。' >&2; fi
+    return 0
   fi
-
-  render_health_summary_text "$days_left" "$rss_kb"
 
   # 导出 Prometheus 文本（可被 node_exporter textfile collector 收集）
   if [[ -n "${METRICS_TEXTFILE}" ]]; then
     if write_prometheus_metrics "${METRICS_TEXTFILE}" "$days_left" "$rss_kb"; then
       METRICS_WRITE_FAILED=0
-      echo "[信息] 已写入 Prometheus 指标：${METRICS_TEXTFILE}"
+      echo "[信息] 已写入 Prometheus 指标：${METRICS_TEXTFILE}" >&2
     else
       METRICS_WRITE_FAILED=1
       echo "[错误] Prometheus 指标写入失败：${METRICS_TEXTFILE}。旧指标文件保持不变，可按 derper_metrics_unixtime 识别为过期。" >&2
     fi
+  fi
+  if ! write_health_state; then STATE_WRITE_FAILED=1; echo '[错误] 健康状态持久化失败，旧文件保持。' >&2; fi
+  if [[ "$DERPMAP_ONLY" == 1 ]]; then
+    local map_rc=0
+    render_derpmap_json || map_rc=$?
+    return "$map_rc"
+  elif [[ "$OUTPUT_FORMAT" == json ]]; then render_status_json
+  else
+    render_health_summary_text "$days_left" "$rss_kb"
+    echo "[检查范围] H0=$H0_STATUS H1=$H1_STATUS H2=$H2_STATUS H3=$H3_STATUS ($H3_REASON)"
+    echo "[指标新鲜度] ${METRICS_FRESHNESS}；缺少H3时未验证外部客户端中继。"
+    echo "[结果入口] journalctl -u derper-healthcheck；journal=${JOURNAL_STORAGE}；状态文件=${HEALTH_STATE_FILE:-未启用}"
   fi
 }
 
@@ -4939,14 +5857,16 @@ write_prometheus_metrics() {
   local dir base tmp
   dir=$(dirname "$path")
   base=$(basename "$path")
-  mkdir -p "$dir" 2>/dev/null || true
+  health_state_parent_is_safe "$path" 1 755 || { METRICS_WRITE_FAILED=1; return 1; }
   if ! tmp=$(mktemp "${dir}/.${base}.tmp.XXXXXX" 2>/dev/null); then
     echo "[错误] 无法在指标目录创建安全临时文件：${dir}" >&2
     METRICS_WRITE_FAILED=1
     return 1
   fi
   local overall=0 cert_live=0
-  if health_is_ok; then overall=1; fi
+  if [[ "${HEALTH_SNAPSHOT_READY:-0}" == 1 ]]; then
+    [[ "$(snapshot_exit_code "${HEALTH_VALIDATE_FAILED:-0}")" != 0 ]] || overall=1
+  elif health_is_ok; then overall=1; fi
   if [[ "${LIVE_CERT_CHECKED:-0}" -eq 1 && "${CERT_LIVE_MATCH:-0}" -eq 1 ]]; then cert_live=1; fi
   if ! {
     echo "# HELP derper_up Whether derper service is up (1)"
@@ -4992,10 +5912,22 @@ write_prometheus_metrics() {
     echo "# HELP derper_metrics_unixtime Unix time when this metrics file was written"
     echo "# TYPE derper_metrics_unixtime gauge"
     echo "derper_metrics_unixtime $(date +%s)"
+    if [[ "${HEALTH_SNAPSHOT_READY:-0}" == 1 ]]; then
+      echo "derper_sample_unixtime $SAMPLED_AT"
+      local layer state code lower
+      for layer in H0 H1 H2 H3; do
+        case "$layer" in H0) state=$H0_STATUS ;; H1) state=$H1_STATUS ;; H2) state=$H2_STATUS ;; H3) state=$H3_STATUS ;; esac
+        case "$state" in healthy) code=1 ;; failed) code=0 ;; unknown) code=-1 ;; not_checked) code=-2 ;; *) code=2 ;; esac
+        lower=$(printf '%s' "$layer" | tr 'A-Z' 'a-z')
+        echo "derper_${lower}_status $code"
+      done
+      echo "derper_metrics_source_age_seconds ${METRICS_AGE:--1}"
+      if [[ "$overall" == 1 ]]; then echo "derper_last_success_unixtime $SAMPLED_AT"; else echo "derper_last_success_unixtime ${HEALTH_LAST_SUCCESS:-0}"; fi
+    fi
 
     echo "# HELP derper_check_unknown Whether the health result is unknown rather than a confirmed fault"
     echo "# TYPE derper_check_unknown gauge"
-    if [[ "${CERT_CHECK_UNKNOWN:-0}" -eq 1 || "${TS_AUTH_UNKNOWN:-0}" -eq 1 ]]; then
+    if [[ "${CERT_CHECK_UNKNOWN:-0}" -eq 1 || "${TS_AUTH_UNKNOWN:-0}" -eq 1 ]] || { [[ "${HEALTH_SNAPSHOT_READY:-0}" == 1 ]] && [[ "$(snapshot_exit_code "${HEALTH_VALIDATE_FAILED:-0}")" == 2 ]]; }; then
       echo "derper_check_unknown 1"
     else
       echo "derper_check_unknown 0"
@@ -5009,7 +5941,7 @@ write_prometheus_metrics() {
       echo "derper_process_rss_bytes 0"
     fi
   } >"$tmp"; then
-    echo "[错误] Prometheus 指标写入临时文件失败：$tmp（权限或路径问题）" >&2
+    echo "[错误] Prometheus 指标写入临时文件失败：${tmp}（权限或路径问题）" >&2
     rm -f "$tmp" 2>/dev/null || true
     METRICS_WRITE_FAILED=1
     return 1
@@ -5372,13 +6304,19 @@ main() {
     shift
   fi
   
-  parse_args "$@"
+  parse_args "$@" || exit 1
 
   # 参数组合校验：--purge 需配合 --uninstall、--metrics-textfile 需配合 --health-check、
   # --force/--repair/--uninstall/--check 等互斥组合直接报错，避免静默取分支或选项被忽略。
   if ! validate_arg_combos; then
     echo "[错误] 参数组合不合法，请检查选项组合。" >&2
     exit 1
+  fi
+
+  # 明确缺少探针的变更在取锁/切换前拒绝；健康查询仍输出unknown及缺失原因。
+  if [[ "$wizard_mode" == 0 && "$HEALTH_CHECK$CHECK_ONLY" == 00 && "$UNINSTALL$RECOVER_INTERRUPTED" == 00 ]]; then
+    if [[ "$REQUIRE_H3" == 1 && -z "$EXTERNAL_PROBE" ]]; then echo '[错误] 请求H3发布门禁但未配置外部合法客户端探针，未开始变更。' >&2; exit 1; fi
+    if [[ -n "$EXTERNAL_PROBE" ]] && { ! probe_path_is_trusted "$EXTERNAL_PROBE" || ! command -v timeout >/dev/null 2>&1; }; then echo '[错误] 外部探针路径或超时工具未就绪，未开始变更。' >&2; exit 1; fi
   fi
 
   if [[ "${wizard_mode}" -eq 1 ]]; then
@@ -5410,7 +6348,7 @@ main() {
   fi
   
   # 检查操作系统和运行环境（Linux only）
-  check_os_environment
+  if [[ "$OUTPUT_FORMAT" == json || "$DERPMAP_ONLY" == 1 ]]; then check_os_environment >&2; else check_os_environment; fi
 
   if [[ "$CHECK_ONLY" -ne 1 && "$DRY_RUN" -ne 1 && "$HEALTH_CHECK" -ne 1 ]]; then
     require_root
@@ -5422,8 +6360,14 @@ main() {
   # --check/--dry-run：IP 探测可容错；但参数校验失败时最终必须非 0 退出
   local check_validate_failed=0
   if [[ "${HEALTH_CHECK}" -eq 1 ]]; then
-    infer_ip_from_existing_deployment || true
-    infer_healthcheck_settings_from_unit || true
+    # 机器可读模式下 stdout 只能是 JSON；推断提示与环境检测一样改走 stderr。
+    if [[ "$OUTPUT_FORMAT" == json || "$DERPMAP_ONLY" == 1 ]]; then
+      infer_ip_from_existing_deployment >&2 || true
+      infer_healthcheck_settings_from_unit >&2 || true
+    else
+      infer_ip_from_existing_deployment || true
+      infer_healthcheck_settings_from_unit || true
+    fi
   else
     detect_public_ip || true
   fi
@@ -5438,7 +6382,10 @@ main() {
 
   # 健康检查模式（仅输出状态/指标，不变更系统；单次采集）
   if [[ "${HEALTH_CHECK}" -eq 1 ]]; then
-    health_check_report
+    local report_rc=0
+    health_check_report || report_rc=$?
+    # derpmap 身份未知返回 2、确认失败返回 1；不要把这两种都折成 1。
+    if [[ "$report_rc" -ne 0 ]]; then exit "$report_rc"; fi
     # 0 健康，1 已确认故障，2 未知。旧调用把任意非 0 视为未通过。
     exit "$(health_check_exit_code "$check_validate_failed")"
   fi
@@ -5537,8 +6484,9 @@ main() {
   fi
 
   if [[ "${FORCE}" -eq 1 ]]; then
-    install_deps
-    install_derper
+    ensure_deploy_dependencies || exit 1
+    # Bash 3.2 不会因函数内 `|| return` 触发调用方 set -e，导入失败必须显式退出。
+    install_derper || exit 1
     generate_selfsigned_cert
     check_port_conflicts
     write_systemd_service
@@ -5547,9 +6495,9 @@ main() {
     commit_cert_update || exit 1
     run_post_deploy_extras || exit 1
   elif [[ "${REPAIR}" -eq 1 ]]; then
-    install_deps
+    ensure_deploy_dependencies || exit 1
     if [[ "$need_derper_install" -eq 1 ]]; then
-      install_derper
+      install_derper || exit 1
     fi
     ensure_compatible_certs || exit 1
     check_port_conflicts
@@ -5563,8 +6511,10 @@ main() {
     local changed=0
     local service_reload_needed=0
     if [[ "$need_derper_install" -eq 1 || $DERPER_BIN -ne 1 ]]; then
-      install_deps
-      install_derper; changed=1; service_reload_needed=1
+      ensure_deploy_dependencies || exit 1
+      install_derper || exit 1
+      changed=1
+      service_reload_needed=1
     fi
     ensure_compatible_certs || exit 1
     if [[ ${CERTS_CHANGED:-0} -eq 1 ]]; then
@@ -5576,6 +6526,7 @@ main() {
       write_systemd_service; changed=1
     fi
     if [[ $changed -eq 0 ]] && health_is_ok; then
+      publish_verification_gate || exit 1
       echo "✅ 已就绪：检测到 derper 正在以纯 IP 模式运行，跳过安装。"
       commit_cert_update || exit 1
       run_post_deploy_extras || exit 1

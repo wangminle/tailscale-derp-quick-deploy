@@ -19,4 +19,15 @@ jobs:
       - name: Review regressions
         run: bash tests/test_review_regressions.sh
       - name: S2 failure-path regressions
-        run: bash tests/test_s2_fixes.sh
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc shellcheck
+          bash tests/test_s2_fixes.sh
+      - name: S2 real flock and permission evidence
+        run: sudo bash tests/test_s2_evidence.sh
+      - name: C stage contracts and behavior
+        run: |
+          bash tests/test_c_stage.sh
+          sudo bash tests/test_c_stage.sh test_root_probe_path_trust test_bug072_root_rejects_untrusted_state_ancestors
+      - name: ShellCheck errors
+        run: shellcheck -S error scripts/deploy_derper_ip_selfsigned.sh tests/*.sh

@@ -1,9 +1,30 @@
 #!/usr/bin/env bash
+# 审查回归：历次审查反例的先红后绿回归与 B 阶段 b1/b2/b3 工作包行为。
+# 非 root 可运行（root/工具缺失场景输出 skip，不当通过）；可传测试函数名单独运行。
+# 退出码 0=全部通过，1=有失败（累计列出）。
 set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$ROOT_DIR/scripts/deploy_derper_ip_selfsigned.sh"
 fail() { echo "not ok - $*" >&2; exit 1; }
-skip() { echo "ok - $*"; }
+skip() { echo "skip - $*"; }
+
+use_running_tailscaled() {
+  local body="$1"
+  printf '#!/bin/sh\n%s\n' "$body" >"$case_tmp/running-tailscaled"
+  chmod 755 "$case_tmp/running-tailscaled"
+  tailscaled_running_exe() { printf '%s\n' "$case_tmp/running-tailscaled"; }
+}
+
+write_recovery_manifest() {
+  local dir="$1" intent="$2"
+  {
+    printf 'binary_sha256=%s\n' "$(file_sha256 "$dir/binary")"
+    printf 'unit_sha256=%s\n' "$(recovery_file_digest "$dir/unit")"
+    printf 'config_sha256=%s\n' "$(recovery_file_digest "$dir/config")"
+    printf 'state_sha256=%s\n' "$(recovery_state_digest "$dir/state")"
+    printf 'run_intent=%s\n' "$intent"
+  } >"$dir/manifest"
+}
 
 test_explicit_user() {
   USER=root; unset SUDO_USER
@@ -143,7 +164,7 @@ test_rotation_decline_preserves_certificate() {
 test_module_query_preserves_network_settings() {
   GOPROXY_ARG=https://example.invalid; GOSUMDB_ARG=sum.example.invalid
   go() { :; }
-  timeout() { shift; "$@"; }
+  timeout() { [[ "${1:-}" != --kill-after=* ]] || shift; shift; "$@"; }
   env() {
     printf '%s\n' "$@" > "$case_tmp/env"
     echo v1.102.4
@@ -166,6 +187,8 @@ test_cleanup_restarts_previously_running_service() {
     esac
   }
   read_derper_unit_content() { echo "ExecStart=derper -hostname 203.0.113.99 -a :30443 -stun-port 40000"; }
+  # 此用例隔离旧编排分支；C阶段的完整发布门禁由专用套件和真实VM验证。
+  publish_verification_gate() { return 0; }
   service_verified_running() {
     [[ "$IP_ADDR" == 203.0.113.99 && "$DERP_PORT" == 30443 && "$STUN_PORT" == 40000 ]] || return 1
     touch "$case_tmp/verified"
@@ -971,8 +994,8 @@ test_bug050_timer_rollback_restores_previous_runtime_state() {
         out=$(install_healthcheck_cron 2>&1) || rc=$?
         [[ "$rc" -ne 0 ]] || fail "删除旧 timer 失败必须返回非零：$out"
         [[ ! -e "$HEALTHCHECK_CRON_PATH" ]] || fail "失败迁移必须撤销新 cron"
-        [[ "$(cat "$timer_runtime")" == "$original_runtime" ]] || fail "必须恢复原运行状态 $original_runtime：$(cat "$timer_calls")"
-        [[ "$(cat "$timer_enabled")" == "$original_enabled" ]] || fail "必须恢复原启用状态 $original_enabled：$(cat "$timer_calls")"
+        [[ "$(cat "$timer_runtime")" == "$original_runtime" ]] || fail "必须恢复原运行状态 ${original_runtime}：$(cat "$timer_calls")"
+        [[ "$(cat "$timer_enabled")" == "$original_enabled" ]] || fail "必须恢复原启用状态 ${original_enabled}：$(cat "$timer_calls")"
         if [[ "$original_runtime" == inactive ]] && grep -Eq '^(start |enable --now)' "$timer_calls"; then
           fail "原本停止的 timer 不得被启动"
         fi
@@ -1216,9 +1239,7 @@ test_b2_stopped_intent_is_not_started() {
   chmod 755 "$DEPLOY_STATE_DIR/recovery/binary"
   printf 'old-unit\n' >"$DEPLOY_STATE_DIR/recovery/unit"
   printf 'old-unit\n' >"$SERVICE_PATH"
-  local sum
-  sum=$(sha256_hex <"$DEPLOY_STATE_DIR/recovery/binary")
-  printf 'binary_sha256=%s\nrun_intent=inactive\n' "$sum" >"$DEPLOY_STATE_DIR/recovery/manifest"
+  write_recovery_manifest "$DEPLOY_STATE_DIR/recovery" inactive
   printf 'phase=switch\nrecovery=%s/recovery\n' "$DEPLOY_STATE_DIR" >"$DEPLOY_STATE_DIR/incomplete"
   local calls="$case_tmp/systemctl-calls"
   : >"$calls"
@@ -1297,12 +1318,12 @@ test_b2_rollback_restores_config_and_state() {
   printf 'old-unit\n' >"$DEPLOY_STATE_DIR/recovery/unit"
   printf 'old-config\n' >"$DEPLOY_STATE_DIR/recovery/config"
   printf 'old-state\n' >"$DEPLOY_STATE_DIR/recovery/state/node.key"
+  # 真实快照的状态集合包含目录中的节点配置，摘要必须与恢复后的集合一致。
+  cp "$DEPLOY_STATE_DIR/recovery/config" "$DEPLOY_STATE_DIR/recovery/state/derper.json"
   printf 'new-unit\n' >"$SERVICE_PATH"
   printf 'new-config\n' >"$NODE_STATE_DIR/derper.json"
   printf 'new-state\n' >"$NODE_STATE_DIR/node.key"
-  local sum
-  sum=$(sha256_hex <"$DEPLOY_STATE_DIR/recovery/binary")
-  printf 'binary_sha256=%s\nrun_intent=inactive\n' "$sum" >"$DEPLOY_STATE_DIR/recovery/manifest"
+  write_recovery_manifest "$DEPLOY_STATE_DIR/recovery" inactive
   printf 'phase=switch\nrecovery=%s/recovery\n' "$DEPLOY_STATE_DIR" >"$DEPLOY_STATE_DIR/incomplete"
   systemctl() { [[ "$1" == is-active ]] && return 1; return 0; }
   local rc=0
@@ -1419,12 +1440,14 @@ test_bug054_restore_refuses_symlink_state_directory() {
 
 test_bug055_same_origin_candidate_passes_daemon_gate() {
   VERIFY_CLIENTS_MODE=on
-  local candidate="$case_tmp/candidate"
+  local candidate="$case_tmp/candidate" canary="$case_tmp/disk-tailscaled-called"
   printf '#!/bin/sh\n# tailscale.com v1.104.1\necho -- -a\n' >"$candidate"
   chmod 755 "$candidate"
-  tailscaled() { printf '1.104.1\n  tailscale commit: abcdef0123456789abcdef0123456789abcdef01\n'; }
+  use_running_tailscaled 'printf "1.104.1\n  tailscale commit: abcdef0123456789abcdef0123456789abcdef01\n"'
+  tailscaled() { echo called >"$canary"; printf 'tailscale commit: bbbbbbbbbbbb\n'; }
   resolve_derper_module_version() { printf 'v1.104.1\n'; }
   candidate_matches_running_daemon "$candidate" || fail "模块版本与 daemon commit 解析到同一发布时必须放行"
+  [[ ! -e "$canary" ]] || fail "同源门禁不得执行磁盘上的 tailscaled"
   resolve_derper_module_version() { printf 'v1.104.2\n'; }
   if candidate_matches_running_daemon "$candidate"; then
     fail "解析出版本不同的 commit 仍必须拒绝"
@@ -1442,7 +1465,7 @@ test_bug056_rollback_reloads_process_and_keeps_marker_on_stop_failure() {
   printf 'new-executable\n' >"$BIN_PATH"
   printf 'old-unit\n' >"$DEPLOY_STATE_DIR/recovery/unit"
   printf 'new-unit\n' >"$SERVICE_PATH"
-  printf 'binary_sha256=%s\nrun_intent=active\n' "$(file_sha256 "$DEPLOY_STATE_DIR/recovery/binary")" >"$DEPLOY_STATE_DIR/recovery/manifest"
+  write_recovery_manifest "$DEPLOY_STATE_DIR/recovery" active
   printf 'phase=switch\nrecovery=%s/recovery\n' "$DEPLOY_STATE_DIR" >"$DEPLOY_STATE_DIR/incomplete"
   local runtime=active runtime_executable=new-executable
   systemctl() {
@@ -1463,7 +1486,7 @@ test_bug056_rollback_reloads_process_and_keeps_marker_on_stop_failure() {
   [[ ! -e "$DEPLOY_STATE_DIR/incomplete" ]] || fail "确认换回旧进程后才可以清除标记"
 
   printf 'phase=switch\nrecovery=%s/recovery\n' "$DEPLOY_STATE_DIR" >"$DEPLOY_STATE_DIR/incomplete"
-  printf 'binary_sha256=%s\nrun_intent=inactive\n' "$(file_sha256 "$DEPLOY_STATE_DIR/recovery/binary")" >"$DEPLOY_STATE_DIR/recovery/manifest"
+  write_recovery_manifest "$DEPLOY_STATE_DIR/recovery" inactive
   systemctl() { [[ "$1" == stop ]] && return 1; return 0; }
   rc=0
   rollback_deploy_change >/dev/null 2>&1 || rc=$?
@@ -1567,7 +1590,83 @@ test_b3_layout_blocks_cert_rename_and_keeps_identity() {
   fi
 }
 
-for test_name in test_b1_incomplete_marker_blocks_and_is_not_executed test_b1_lock_failure_blocks_second_change test_b1_second_process_cannot_take_lock test_b1_unverified_staging_keeps_only_backup test_b2_bad_candidate_and_disk_failure_keep_live_binary test_b2_stopped_intent_is_not_started test_b2_daemon_drift_stays_manual test_b2_first_install_failure_has_no_fake_previous test_b2_rollback_restores_config_and_state test_b2_reverify_failure_keeps_recovery test_b2_build_timeout_keeps_live_binary test_b3_migration_failure_restores_running_service test_bug054_restore_does_not_follow_state_symlink test_bug054_restore_refuses_symlink_state_directory test_bug055_same_origin_candidate_passes_daemon_gate test_bug056_rollback_reloads_process_and_keeps_marker_on_stop_failure test_bug057_migration_failure_keeps_recovery_marker test_bug058_migrated_config_is_owned_by_run_user test_b3_layout_blocks_cert_rename_and_keeps_identity test_bug051_failure_before_activation_needs_no_stop test_bug050_failed_timer_update_restores_stopped_state test_bug051_incomplete_files_do_not_restart_timer test_bug047_backup_copy_failure_keeps_original_units test_bug048_sendq_is_not_main_pid test_bug049_cron_delete_failure_rolls_back_timer test_bug049_timer_delete_failure_rolls_back_cron test_bug050_timer_rollback_restores_previous_runtime_state test_bug051_restore_failure_keeps_snapshot test_bug038_verify_clients_dependency_is_not_healthy test_bug038_localapi_403_is_unhealthy test_bug039_mismatched_key_blocks_restart test_doc007_008_wording test_doc008_unsearchable_cert_dir_is_unknown test_bug034_generated_task_survives_unexecutable_source test_bug034_timer_replaces_cron_once test_metrics_failure_keeps_old_sample test_bug035_nft_rule_failure_keeps_old_rules test_bug035_iptables_append_failure_keeps_old_rules test_bug035_iptables_restore_failure_is_incomplete test_bug035_snapshot_read_failure_preserves_rules test_bug040_port_conflicts_follow_protocol test_bug040_ownership_matches_protocol_and_pid test_bug043_044_port_ownership_pid_and_netstat test_bug041_contradictory_modes_stop_before_side_effects test_numeric_args_are_canonical_after_validation test_health_check_exit_codes_keep_old_callers_safe test_legacy_symlink_migration test_cleanup_restarts_previously_running_service test_new_root_default test_real_certificate_write_failure test_interrupted_rollback test_rotation_decline_preserves_certificate test_module_query_preserves_network_settings test_explicit_user test_existing_user test_commit_versions test_certificate_resume test_rotation_requires_ack test_certificate_rollback test_recover_restart_failure_is_warning test_bug042_timer_installation_failure_retains_cron test_bug042_existing_timer_update_failure_restores_old_units test_bug045_timer_execstart_uses_proper_systemd_quoting test_bug046_all_firewall_deletions_fail_propagates_error test_bug046_mixed_backend_remove_failure_propagates_error; do
+# 审查回归：历次审查反例的先红后绿回归与 B 阶段 b1/b2/b3 工作包行为。
+# 非 root 可运行（root/工具缺失场景输出 skip，不当通过）；可传测试函数名单独运行。
+# 退出码 0=全部通过，1=有失败（累计列出）。
+
+# 默认按序执行全部用例；传参可单独运行指定用例（用于定位与变异验证）。
+tests=(
+  test_b1_incomplete_marker_blocks_and_is_not_executed
+  test_b1_lock_failure_blocks_second_change
+  test_b1_second_process_cannot_take_lock
+  test_b1_unverified_staging_keeps_only_backup
+  test_b2_bad_candidate_and_disk_failure_keep_live_binary
+  test_b2_stopped_intent_is_not_started
+  test_b2_daemon_drift_stays_manual
+  test_b2_first_install_failure_has_no_fake_previous
+  test_b2_rollback_restores_config_and_state
+  test_b2_reverify_failure_keeps_recovery
+  test_b2_build_timeout_keeps_live_binary
+  test_b3_migration_failure_restores_running_service
+  test_bug054_restore_does_not_follow_state_symlink
+  test_bug054_restore_refuses_symlink_state_directory
+  test_bug055_same_origin_candidate_passes_daemon_gate
+  test_bug056_rollback_reloads_process_and_keeps_marker_on_stop_failure
+  test_bug057_migration_failure_keeps_recovery_marker
+  test_bug058_migrated_config_is_owned_by_run_user
+  test_b3_layout_blocks_cert_rename_and_keeps_identity
+  test_bug051_failure_before_activation_needs_no_stop
+  test_bug050_failed_timer_update_restores_stopped_state
+  test_bug051_incomplete_files_do_not_restart_timer
+  test_bug047_backup_copy_failure_keeps_original_units
+  test_bug048_sendq_is_not_main_pid
+  test_bug049_cron_delete_failure_rolls_back_timer
+  test_bug049_timer_delete_failure_rolls_back_cron
+  test_bug050_timer_rollback_restores_previous_runtime_state
+  test_bug051_restore_failure_keeps_snapshot
+  test_bug038_verify_clients_dependency_is_not_healthy
+  test_bug038_localapi_403_is_unhealthy
+  test_bug039_mismatched_key_blocks_restart
+  test_doc007_008_wording
+  test_doc008_unsearchable_cert_dir_is_unknown
+  test_bug034_generated_task_survives_unexecutable_source
+  test_bug034_timer_replaces_cron_once
+  test_metrics_failure_keeps_old_sample
+  test_bug035_nft_rule_failure_keeps_old_rules
+  test_bug035_iptables_append_failure_keeps_old_rules
+  test_bug035_iptables_restore_failure_is_incomplete
+  test_bug035_snapshot_read_failure_preserves_rules
+  test_bug040_port_conflicts_follow_protocol
+  test_bug040_ownership_matches_protocol_and_pid
+  test_bug043_044_port_ownership_pid_and_netstat
+  test_bug041_contradictory_modes_stop_before_side_effects
+  test_numeric_args_are_canonical_after_validation
+  test_health_check_exit_codes_keep_old_callers_safe
+  test_legacy_symlink_migration
+  test_cleanup_restarts_previously_running_service
+  test_new_root_default
+  test_real_certificate_write_failure
+  test_interrupted_rollback
+  test_rotation_decline_preserves_certificate
+  test_module_query_preserves_network_settings
+  test_explicit_user
+  test_existing_user
+  test_commit_versions
+  test_certificate_resume
+  test_rotation_requires_ack
+  test_certificate_rollback
+  test_recover_restart_failure_is_warning
+  test_bug042_timer_installation_failure_retains_cron
+  test_bug042_existing_timer_update_failure_restores_old_units
+  test_bug045_timer_execstart_uses_proper_systemd_quoting
+  test_bug046_all_firewall_deletions_fail_propagates_error
+  test_bug046_mixed_backend_remove_failure_propagates_error
+)
+if [[ "$#" -gt 0 ]]; then
+  tests=("$@")
+fi
+failed=0
+for test_name in "${tests[@]}"; do
   if (
     DERPER_TEST_MODE=1 source "$SCRIPT"
     case_tmp=$(mktemp -d)
@@ -1578,6 +1677,10 @@ for test_name in test_b1_incomplete_marker_blocks_and_is_not_executed test_b1_lo
     echo "ok - $test_name"
   else
     echo "not ok - $test_name" >&2
-    exit 1
+    failed=$((failed + 1))
   fi
 done
+if [[ "$failed" -ne 0 ]]; then
+  echo "review regressions: ${failed} failed" >&2
+  exit 1
+fi

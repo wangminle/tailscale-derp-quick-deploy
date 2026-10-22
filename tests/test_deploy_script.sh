@@ -123,6 +123,8 @@ test_nonempty_config_uses_separate_c_argument() {
     derper_supports_stun_port() { return 0; }
     derper_supports_listen_a() { return 0; }
     setup_service_user() { return 0; }
+    # 此用例隔离旧编排分支；C阶段的完整发布门禁由专用套件和真实VM验证。
+    publish_verification_gate() { return 0; }
     service_verified_running() { return 0; }
     systemctl() { return 0; }
 
@@ -184,6 +186,8 @@ test_verify_clients_passes_socket_flag() {
     derper_supports_listen_a() { return 0; }
     derper_supports_socket_flag() { return 0; }
     setup_service_user() { return 0; }
+    # 此用例隔离旧编排分支；C阶段的完整发布门禁由专用套件和真实VM验证。
+    publish_verification_gate() { return 0; }
     service_verified_running() { return 0; }
     systemctl() { return 0; }
 
@@ -565,6 +569,8 @@ test_start_limit_lives_in_unit_section() {
     derper_supports_stun_port() { return 0; }
     derper_supports_listen_a() { return 0; }
     setup_service_user() { return 0; }
+    # 此用例隔离旧编排分支；C阶段的完整发布门禁由专用套件和真实VM验证。
+    publish_verification_gate() { return 0; }
     service_verified_running() { return 0; }
     systemctl() { return 0; }
     write_systemd_service >/dev/null
@@ -987,6 +993,34 @@ test_get_installed_derper_version_without_strings() {
     [[ "$ver" == "1.80.0" ]] || fail "grep fallback must find module version without strings, got: ${ver}"
   )
   ok "installed derper version parser works without strings"
+}
+
+test_get_installed_derper_version_keeps_prerelease_without_go() {
+  (
+    DERPER_TEST_MODE=1 source "$SCRIPT"
+    local_tmp=$(mktemp -d)
+    trap 'rm -rf "$local_tmp"' EXIT
+    BIN_PATH="${local_tmp}/derper"
+    printf 'go1.22.6\ntailscale.com/cmd/derper v1.104.1-rc1\n' >"$BIN_PATH"
+    chmod +x "$BIN_PATH"
+    go() { return 1; }
+    strings() { return 127; }
+    resolve_derper_module_version() { return 1; }
+    local ver
+    ver=$(get_installed_derper_version || true)
+    [[ "$ver" == "1.104.1-rc1" ]] || fail "prerelease suffix must be kept without Go, got: ${ver}"
+    if same_derper_identity "$ver" "1.104.1"; then
+      fail "rc build must not match the release tag"
+    fi
+    printf 'go1.22.6\ntailscale.com/cmd/derper v1.104.2-0.20261021010203-aaaaaaaaaaaa\n' >"$BIN_PATH"
+    ver=$(get_installed_derper_version || true)
+    [[ "$ver" == "1.104.2-0.20261021010203-aaaaaaaaaaaa" ]] || fail "pseudo-version must be kept without Go, got: ${ver}"
+    same_derper_identity "$ver" "aaaaaaaaaaaa" || fail "full pseudo-version must match its commit without Go"
+    if same_derper_identity "1.104.2" "aaaaaaaaaaaa"; then
+      fail "truncated release must not match that commit without Go"
+    fi
+  )
+  ok "offline module parser keeps prerelease and pseudo-version"
 }
 
 test_relax_socket_perms_restored_on_cleanup() {
@@ -1477,10 +1511,10 @@ test_readme_documents_missing_flags_and_runnable_examples() {
   if awk '/典型应用场景对比/,/^### ⚠️/' "$ROOT_DIR/README.md" | grep -q -- '`--dedicated-user --health-check`'; then
     fail "CN scenario table must not treat --health-check as a deploy combo"
   fi
-  [[ -f "$ROOT_DIR/CHANGELOG_CN.md" ]] || fail "Chinese changelog must exist at repository root"
-  [[ -f "$ROOT_DIR/CHANGELOG_EN.md" ]] || fail "English changelog must exist at repository root"
+  [[ -f "$ROOT_DIR/docs/CHANGELOG_CN.md" ]] || fail "Chinese changelog must exist in docs/"
+  [[ -f "$ROOT_DIR/docs/CHANGELOG_EN.md" ]] || fail "English changelog must exist in docs/"
   if grep -q 'docs/BUGFIX_REVIEW_20260920.md' "$ROOT_DIR/README.md" \
-       "$ROOT_DIR/CHANGELOG_CN.md" "$ROOT_DIR/CHANGELOG_EN.md"; then
+       "$ROOT_DIR/docs/CHANGELOG_CN.md" "$ROOT_DIR/docs/CHANGELOG_EN.md"; then
     fail "docs must not link to missing docs/BUGFIX_REVIEW_20260920.md"
   fi
   grep -q '1–365000' "$ROOT_DIR/docs/REFERENCE_CN.md" || fail "REFERENCE_CN must document --cert-days range"
@@ -2343,6 +2377,8 @@ test_write_systemd_service_branches_paranoid_fallback_and_rollback() {
     derper_supports_stun_port() { return 1; }
     derper_supports_listen_a() { return 1; }
     derper_supports_https_port() { return 0; }
+    # 此用例隔离旧编排分支；C阶段的完整发布门禁由专用套件和真实VM验证。
+    publish_verification_gate() { return 0; }
     service_verified_running() { return 0; }
     systemctl() { return 0; }
     write_systemd_service >/dev/null
@@ -2364,6 +2400,8 @@ test_write_systemd_service_branches_paranoid_fallback_and_rollback() {
     derper_supports_listen_a() { return 0; }
     derper_supports_stun_port() { return 0; }
     local verify_attempt=0
+    # 此用例隔离旧编排分支；C阶段的完整发布门禁由专用套件和真实VM验证。
+    publish_verification_gate() { return 0; }
     service_verified_running() {
       verify_attempt=$((verify_attempt + 1))
       [[ "$verify_attempt" -ge 2 ]]
@@ -2377,6 +2415,8 @@ test_write_systemd_service_branches_paranoid_fallback_and_rollback() {
     # 4) 启动失败回滚：恢复旧备份 unit 并重启验证旧服务
     SECURITY_LEVEL="standard"
     printf '[Service]\nExecStart=/usr/local/bin/derper -hostname 203.0.113.10 -a :30399 -stun-port 3478\n' >"$SERVICE_PATH"
+    # 此用例隔离旧编排分支；C阶段的完整发布门禁由专用套件和真实VM验证。
+    publish_verification_gate() { return 0; }
     service_verified_running() { return 1; }
     local restored_verified=0
     verify_restored_service() { restored_verified=1; return 0; }
@@ -2602,7 +2642,7 @@ test_main_modes_end_to_end_orchestration() {
     check_derper_status() {
       DERPER_BIN=1 DERPER_SERVICE_PRESENT=1 DERPER_RUNNING=1 PURE_IP_OK=1
       DESIRED_CONFIG_OK=1 DERPER_VERIFY_CLIENTS_EFFECTIVE=1
-      PORT_TLS_OK=1 PORT_STUN_OK=1
+      PORT_TLS_OK=1 PORT_STUN_OK=1 CURRENT_DERPER_OWNS_PORTS=1
       TS_LOCALAPI_OK=1 TS_AUTH_UNKNOWN=0
     }
     check_cert_status() {
@@ -2625,6 +2665,10 @@ test_main_modes_end_to_end_orchestration() {
       fail "main --check with invalid port must print summary and return non-zero"
 
     # 2) main --health-check：健康退出 0，不健康退出 1
+    # H0 要求 systemctl/openssl/ss 存在；桩化以便在 macOS 等缺这些工具的开发机上结果一致。
+    systemctl() { return 0; }
+    openssl() { return 0; }
+    ss() { return 0; }
     cert_days_remaining() { echo "120"; }
     out=$(main --health-check --ip 8.8.8.8 2>&1) || fail "healthy main --health-check must exit 0"
     check_live_cert_status() { LIVE_CERT_CHECKED=1 CERT_LIVE_MATCH=0; }
@@ -2644,6 +2688,7 @@ test_main_modes_end_to_end_orchestration() {
     out=$(main --ip 8.8.8.8 2>&1) || fail "idempotent main should exit 0 when already healthy"
     [[ "$out" == *"已就绪：检测到 derper 正在以纯 IP 模式运行，跳过安装"* ]] ||
       fail "idempotent main should print ready message"
+    unset -f systemctl openssl ss
 
     # 4) main --repair：执行修复与收尾报告
     local steps=""
@@ -2829,108 +2874,132 @@ PY
   ok "helper primitives (cert resolve, atomic_copy_file, auth visibility, tls_probe_endpoints) work as expected"
 }
 
+# 主回归套件：参数解析、环境检查、证书、systemd unit、防火墙、健康检查、向导、
+# main 编排与底层辅助函数。按领域组织用例；非 root 可运行（root 专属断言自动跳过）。
+# 用例子 shell 隔离；可传测试函数名单独运行。退出码 0=全部通过，1=有失败（累计列出）。
+
+failed=0
 run_case() {
-  ( "$1" )
+  if ( "$1" ); then
+    :
+  else
+    echo "not ok - $1" >&2
+    failed=$((failed + 1))
+  fi
 }
 
-run_case test_no_crlf_and_syntax
-run_case test_source_does_not_run_main
-run_case test_source_survives_unset_user
-run_case test_unit_matching_detects_config_drift
-run_case test_unit_matching_rejects_wrong_socket_path
-run_case test_validate_settings_rejects_invalid_user
-run_case test_port_conflict_ignores_current_derper_service
-run_case test_service_reconcile_detects_runtime_failures_and_cert_regen
-run_case test_reconcile_detects_stale_live_cert
-run_case test_nonempty_config_uses_separate_c_argument
-run_case test_unsupported_custom_stun_port_is_rejected
-run_case test_empty_derper_config_is_migrated_for_auto_key_generation
-run_case test_verify_clients_passes_socket_flag
-run_case test_verify_clients_aligns_derper_version
-run_case test_ts_commit_parses_real_tailscale_output
-run_case test_manual_cert_uses_upstream_filenames
-run_case test_cert_fallback_temp_failure_is_handled
-run_case test_derper_binary_needs_reinstall_on_version_mismatch
-run_case test_paranoid_degraded_unit_is_accepted
-run_case test_start_limit_lives_in_unit_section
-run_case test_socket_access_skips_when_world_writable
-run_case test_health_requires_upstream_cert_naming
-run_case test_script_version_is_declared_and_consistent
-run_case test_acl_cert_snippet_uses_requested_region_endpoint_and_stun
-run_case test_missing_fingerprint_fails_instead_of_insecure_fallback
-run_case test_non_global_ips_rejected_unless_explicitly_allowed
-run_case test_region_id_safe_integer_range
-run_case test_argument_combinations_are_validated
-run_case test_cert_generation_refuses_symlinked_paths
-run_case test_acl_failure_never_emits_insecure_flag
-run_case test_extra_listener_detection_flags_attack_surface
-run_case test_automatic_updates_detection_runs
-run_case test_server_node_acl_advice_includes_tag
-run_case test_go_toolchain_rejects_pre_1_21
-run_case test_get_installed_derper_version_ignores_go_toolchain
-run_case test_port_conflict_allows_derper_tls_without_stun
-run_case test_port_conflict_rejects_foreign_stun
-run_case test_ensure_compatible_certs_migrates_legacy_names
-run_case test_ssh_session_via_tailscale_detects_cgnat
-run_case test_restart_tailscaled_socket_skips_over_tailscale_ssh
-run_case test_release_tmpdir_clears_deploy_temp
-run_case test_infer_ip_from_existing_unit
-run_case test_health_check_skips_external_ip_probe_when_ip_set
-run_case test_wizard_handles_eof_cleanly
-run_case test_cert_san_matches_literal_ip_only
-run_case test_live_certificate_mismatch_fails_health_check
-run_case test_metrics_writer_avoids_predictable_tmp_path
-run_case test_goproxy_probe_targets_skip_direct
-run_case test_precheck_go_network_fails_fast_with_hint
-run_case test_precheck_go_network_succeeds_when_reachable
-run_case test_get_installed_derper_version_without_strings
-run_case test_relax_socket_perms_restored_on_cleanup
-run_case test_cleanup_restores_relaxed_socket
-run_case test_world_writable_socket_is_warned
-run_case test_tls_connlimit_zero_is_noop
-run_case test_tls_connlimit_iptables_rule
-run_case test_tls_connlimit_removed_on_uninstall
-run_case test_install_healthcheck_cron_writes_job
-run_case test_uninstall_removes_healthcheck_cron
-run_case test_healthcheck_cron_conflicts_with_uninstall
-run_case test_tls_connlimit_parse_and_reject
-run_case test_module_query_survives_missing_timeout
-run_case test_install_derper_survives_missing_timeout
-run_case test_healthcheck_cron_conflicts_with_health_check
-run_case test_tls_connlimit_conflicts_with_readonly_modes
-run_case test_tls_connlimit_explicit_zero_removes_rules
-run_case test_install_healthcheck_cron_quotes_paths
-run_case test_precheck_go_network_allows_direct_fallback
-run_case test_overflow_numeric_args_are_rejected
-run_case test_healthcheck_cron_preserves_custom_deploy_flags
-run_case test_healthcheck_infers_settings_from_unit
-run_case test_tls_connlimit_nft_uses_script_owned_table
-run_case test_readme_documents_missing_flags_and_runnable_examples
-run_case test_unit_atomic_write_refuses_symlink
-run_case test_sha256_hex_rejects_empty_input
-run_case test_install_healthcheck_cron_rejects_missing_script
-run_case test_resolve_run_user_survives_unreadable_unit
-run_case test_commit_cert_update_clears_active_transaction
-run_case test_run_post_deploy_extras_keeps_verified_deploy
-run_case test_service_verified_skips_missing_probe_tools
-run_case test_timeout_run_fallback_does_not_block_command_substitution
-run_case test_main_commits_certs_before_post_deploy_extras
-run_case test_wizard_read_choice_rejects_invalid
-run_case test_sudo_user_validation_and_fallback
-run_case test_help_and_unknown_or_missing_value_args
-run_case test_require_root_and_check_os_environment
-run_case test_precheck_verify_clients_all_branches
-run_case test_ipv4_address_class_and_validate_settings_edge_cases
-run_case test_detect_public_ip_fallback_chain
-run_case test_ver_ge_pure_bash_fallback_and_tailscale_status
-run_case test_check_pure_ip_ports_ownership_and_cert_days
-run_case test_install_deps_and_ensure_go_sha256_verification
-run_case test_derper_flag_detection_with_exit_code_2
-run_case test_harden_cert_dir_layout_check_and_finalize_report_fallbacks
-run_case test_socket_access_owner_group_and_setup_service_user
-run_case test_write_systemd_service_branches_paranoid_fallback_and_rollback
-run_case test_legacy_nft_rule_cleanup_firewall_tips_and_runtime_checks
-run_case test_health_check_report_expiry_tiers_and_uninstall_purge_modes
-run_case test_deployment_wizard_full_flow_and_validation
-run_case test_main_modes_end_to_end_orchestration
-run_case test_helper_primitives_cert_resolve_atomic_copy_and_auth_visibility
+# 默认按序执行全部用例；传参可单独运行指定用例（用于定位与变异验证）。
+cases=(
+  test_no_crlf_and_syntax
+  test_source_does_not_run_main
+  test_source_survives_unset_user
+  test_unit_matching_detects_config_drift
+  test_unit_matching_rejects_wrong_socket_path
+  test_validate_settings_rejects_invalid_user
+  test_port_conflict_ignores_current_derper_service
+  test_service_reconcile_detects_runtime_failures_and_cert_regen
+  test_reconcile_detects_stale_live_cert
+  test_nonempty_config_uses_separate_c_argument
+  test_unsupported_custom_stun_port_is_rejected
+  test_empty_derper_config_is_migrated_for_auto_key_generation
+  test_verify_clients_passes_socket_flag
+  test_verify_clients_aligns_derper_version
+  test_ts_commit_parses_real_tailscale_output
+  test_manual_cert_uses_upstream_filenames
+  test_cert_fallback_temp_failure_is_handled
+  test_derper_binary_needs_reinstall_on_version_mismatch
+  test_paranoid_degraded_unit_is_accepted
+  test_start_limit_lives_in_unit_section
+  test_socket_access_skips_when_world_writable
+  test_health_requires_upstream_cert_naming
+  test_script_version_is_declared_and_consistent
+  test_acl_cert_snippet_uses_requested_region_endpoint_and_stun
+  test_missing_fingerprint_fails_instead_of_insecure_fallback
+  test_non_global_ips_rejected_unless_explicitly_allowed
+  test_region_id_safe_integer_range
+  test_argument_combinations_are_validated
+  test_cert_generation_refuses_symlinked_paths
+  test_acl_failure_never_emits_insecure_flag
+  test_extra_listener_detection_flags_attack_surface
+  test_automatic_updates_detection_runs
+  test_server_node_acl_advice_includes_tag
+  test_go_toolchain_rejects_pre_1_21
+  test_get_installed_derper_version_ignores_go_toolchain
+  test_port_conflict_allows_derper_tls_without_stun
+  test_port_conflict_rejects_foreign_stun
+  test_ensure_compatible_certs_migrates_legacy_names
+  test_ssh_session_via_tailscale_detects_cgnat
+  test_restart_tailscaled_socket_skips_over_tailscale_ssh
+  test_release_tmpdir_clears_deploy_temp
+  test_infer_ip_from_existing_unit
+  test_health_check_skips_external_ip_probe_when_ip_set
+  test_wizard_handles_eof_cleanly
+  test_cert_san_matches_literal_ip_only
+  test_live_certificate_mismatch_fails_health_check
+  test_metrics_writer_avoids_predictable_tmp_path
+  test_goproxy_probe_targets_skip_direct
+  test_precheck_go_network_fails_fast_with_hint
+  test_precheck_go_network_succeeds_when_reachable
+  test_get_installed_derper_version_without_strings
+  test_get_installed_derper_version_keeps_prerelease_without_go
+  test_relax_socket_perms_restored_on_cleanup
+  test_cleanup_restores_relaxed_socket
+  test_world_writable_socket_is_warned
+  test_tls_connlimit_zero_is_noop
+  test_tls_connlimit_iptables_rule
+  test_tls_connlimit_removed_on_uninstall
+  test_install_healthcheck_cron_writes_job
+  test_uninstall_removes_healthcheck_cron
+  test_healthcheck_cron_conflicts_with_uninstall
+  test_tls_connlimit_parse_and_reject
+  test_module_query_survives_missing_timeout
+  test_install_derper_survives_missing_timeout
+  test_healthcheck_cron_conflicts_with_health_check
+  test_tls_connlimit_conflicts_with_readonly_modes
+  test_tls_connlimit_explicit_zero_removes_rules
+  test_install_healthcheck_cron_quotes_paths
+  test_precheck_go_network_allows_direct_fallback
+  test_overflow_numeric_args_are_rejected
+  test_healthcheck_cron_preserves_custom_deploy_flags
+  test_healthcheck_infers_settings_from_unit
+  test_tls_connlimit_nft_uses_script_owned_table
+  test_readme_documents_missing_flags_and_runnable_examples
+  test_unit_atomic_write_refuses_symlink
+  test_sha256_hex_rejects_empty_input
+  test_install_healthcheck_cron_rejects_missing_script
+  test_resolve_run_user_survives_unreadable_unit
+  test_commit_cert_update_clears_active_transaction
+  test_run_post_deploy_extras_keeps_verified_deploy
+  test_service_verified_skips_missing_probe_tools
+  test_timeout_run_fallback_does_not_block_command_substitution
+  test_main_commits_certs_before_post_deploy_extras
+  test_wizard_read_choice_rejects_invalid
+  test_sudo_user_validation_and_fallback
+  test_help_and_unknown_or_missing_value_args
+  test_require_root_and_check_os_environment
+  test_precheck_verify_clients_all_branches
+  test_ipv4_address_class_and_validate_settings_edge_cases
+  test_detect_public_ip_fallback_chain
+  test_ver_ge_pure_bash_fallback_and_tailscale_status
+  test_check_pure_ip_ports_ownership_and_cert_days
+  test_install_deps_and_ensure_go_sha256_verification
+  test_derper_flag_detection_with_exit_code_2
+  test_harden_cert_dir_layout_check_and_finalize_report_fallbacks
+  test_socket_access_owner_group_and_setup_service_user
+  test_write_systemd_service_branches_paranoid_fallback_and_rollback
+  test_legacy_nft_rule_cleanup_firewall_tips_and_runtime_checks
+  test_health_check_report_expiry_tiers_and_uninstall_purge_modes
+  test_deployment_wizard_full_flow_and_validation
+  test_main_modes_end_to_end_orchestration
+  test_helper_primitives_cert_resolve_atomic_copy_and_auth_visibility
+)
+if [[ "$#" -gt 0 ]]; then
+  cases=("$@")
+fi
+for case_name in "${cases[@]}"; do
+  run_case "$case_name"
+done
+if [[ "$failed" -ne 0 ]]; then
+  echo "main suite: ${failed} failed" >&2
+  exit 1
+fi

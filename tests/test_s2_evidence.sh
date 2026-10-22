@@ -2,8 +2,8 @@
 # S2 证据：真实 flock 双进程，以及非 root 服务用户不能改名或重建 certs。
 # 需要 root、flock 和 useradd。开发机不是该环境时退出 2，不能当成通过。
 set -euo pipefail
-if [[ "$(id -u)" -ne 0 ]] || ! command -v flock >/dev/null 2>&1; then
-  echo "not verified - S2 evidence requires root and flock" >&2
+if [[ "$(id -u)" -ne 0 ]] || ! command -v flock >/dev/null 2>&1 || ! command -v gcc >/dev/null 2>&1; then
+  echo "not verified - S2 evidence requires root, flock and gcc" >&2
   exit 2
 fi
 
@@ -102,3 +102,48 @@ rollback_deploy_change || fail "必须按旧用户完成回退"
 [[ "$RUN_USER" == derper-s2-next ]] || fail "回退不能污染调用方的目标身份"
 [[ ! -e "$DEPLOY_STATE_DIR/incomplete" ]] || fail "复验通过后应清除标记"
 echo "ok - rollback restores old service user access to node state and private key"
+
+# BUG-080：真实低权限进程不能被 root 当成 daemon 执行（包括 MainPID 与 pgrep 分支）。
+(
+  attacker_pid="" launcher_pid=""
+  trap 'if [[ -n "$attacker_pid" ]]; then kill "$attacker_pid" 2>/dev/null || true; fi; if [[ -n "$launcher_pid" ]]; then wait "$launcher_pid" 2>/dev/null || true; fi' EXIT
+  mkdir -p "$tmp/process-public" "$tmp/process-protected"
+  chown derper-s2:derper-s2 "$tmp/process-public"
+  chmod 700 "$tmp/process-protected"
+  export BUG080_TARGET="$tmp/process-protected/proof" BUG080_PIDFILE="$tmp/process-public/pid"
+  printf 'ORIGINAL\n' >"$BUG080_TARGET"
+  chmod 600 "$BUG080_TARGET"
+  cat >"$tmp/process.c" <<'C'
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+int main(int argc,char **argv) {
+  if(argc>1 && !strcmp(argv[1],"--version")) {
+    FILE *f=fopen(getenv("BUG080_TARGET"),"w");
+    if(f) { fprintf(f,"executed_euid=%ld\n",(long)geteuid()); fclose(f); }
+    puts("tailscale commit: aaaaaaaaaaaa"); return 0;
+  }
+  FILE *f=fopen(getenv("BUG080_PIDFILE"),"w");
+  if(!f) return 1;
+  fprintf(f,"%ld\n",(long)getpid()); fclose(f);
+  for(;;) pause();
+}
+C
+  gcc "$tmp/process.c" -o "$tmp/process-public/tailscaled" || fail "编译低权限进程失败"
+  chown derper-s2:derper-s2 "$tmp/process-public/tailscaled"
+  runuser -u derper-s2 -- "$tmp/process-public/tailscaled" >/dev/null 2>&1 & launcher_pid=$!
+  for _ in {1..40}; do [[ ! -s "$BUG080_PIDFILE" ]] || break; sleep 0.05; done
+  attacker_pid=$(cat "$BUG080_PIDFILE")
+  # 只选择本测试进程，避免干扰主机上其他进程。
+  systemctl() { [[ "$1" != show ]] || printf '%s\n' "$attacker_pid"; }
+  pgrep() { printf '%s\n' "$attacker_pid"; }
+  if tailscaled_daemon_revision >/dev/null 2>&1; then fail "root不得执行低权限MainPID程序"; fi
+  systemctl() { return 1; }
+  if tailscaled_daemon_revision >/dev/null 2>&1; then fail "root不得执行低权限唯一同名进程"; fi
+  # 即使进程定位被替换，执行前仍应校验已固定的 inode。
+  tailscaled_running_exe() { printf '/proc/%s/exe\n' "$attacker_pid"; }
+  if tailscaled_daemon_revision >/dev/null 2>&1; then fail "root不得执行低权限用户所有的inode"; fi
+  [[ "$(cat "$BUG080_TARGET")" == ORIGINAL ]] || fail "低权限程序不应以root身份执行"
+  echo "ok - root refuses untrusted process credentials and executable inode"
+)

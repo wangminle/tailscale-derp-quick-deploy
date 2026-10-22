@@ -1,0 +1,129 @@
+# 配置、维护入口与检查范围
+
+本指南描述 C 阶段已实现的入口；证书自动轮换和控制面策略写入仍未交付。脚本继续以单文件运行，旧参数保留。
+
+## 命令与兼容
+
+| 子命令 | 旧入口/行为 |
+| --- | --- |
+| deploy | 无主模式 flag 的幂等部署 |
+| check | --check / --dry-run，配置与环境预检 |
+| health / status | --health-check，只读采样；默认文本，可 --format json |
+| repair | --repair |
+| uninstall | --uninstall，原 purge 参数不变 |
+| recover | --recover-interrupted，只恢复持久未完成变更 |
+| derpmap | 从本次已验证的在线身份输出本节点 Regions JSON 片段 |
+
+子命令必须放在选项前。相同模式可以重复表达，相反模式拒绝，例如 `deploy --uninstall`、`status --repair`。`--force` 仍为旧的强制重装/重签路径，保留原换证确认要求；通常升级使用 deploy 并复用有效证书。
+
+```bash
+bash scripts/deploy_derper_ip_selfsigned.sh status --format json
+bash scripts/deploy_derper_ip_selfsigned.sh --health-check
+sudo bash scripts/deploy_derper_ip_selfsigned.sh repair --ip YOUR_PUBLIC_IP
+sudo bash scripts/deploy_derper_ip_selfsigned.sh recover
+```
+
+health/status 的退出码：0 表示所请求范围通过，1 表示确认故障或结果写入失败，2 表示未知、采集受限或旧指标过期。未知优先于同时存在的确认故障；各层状态仍分别保留。0 的检查范围须结合 H3 字段判断。derpmap 在本地身份未验证（未知）时退出 2，身份确认失败时退出 1。
+
+## deploy.conf
+
+只在显式传入 `--config FILE` 时读取，不自动搜索当前目录或加载 shell。配置读取本身不会安装、重启或建立调度。优先级为默认值/环境 → 配置文件 → CLI；健康检查中未指定的参数可从部署 unit 推断。
+
+参考 [配置示例](../examples/deploy.conf.example)。先替换公网 IP/Region/用户等实际值，再安装：
+
+```bash
+sudo install -d -m 0755 /etc/derper
+sudo install -o root -g root -m 0644 examples/deploy.conf.example /etc/derper/deploy.conf
+sudo bash scripts/deploy_derper_ip_selfsigned.sh deploy --config /etc/derper/deploy.conf
+bash scripts/deploy_derper_ip_selfsigned.sh status --config /etc/derper/deploy.conf --format json
+```
+
+格式为逐行 `KEY=value`，必须 `CONFIG_VERSION=1`；支持空行和整行 `#` 注释，不解释引号、变量、命令或行尾注释。未知/重复字段、控制字符/NUL、shell 语法和超过64KiB文件均拒绝。root 使用时文件须归 root 且组/其他用户不可写，符号链接拒绝。业务字段仍经过原 CLI 的校验，例如 RegionName 使用英文、数字、空格、连字符和下划线。
+
+允许的字段：`CONFIG_VERSION`、`IP_ADDR`、`DERP_PORT`、`STUN_PORT`、`CERT_DAYS`、`DERPER_VERSION`、`REGION_ID`、`REGION_CODE`、`REGION_NAME`、`RUN_USER`、`VERIFY_CLIENTS_MODE`、`SECURITY_LEVEL`、`TLS_CONNLIMIT`、`ALLOW_NON_GLOBAL_IP`、`EXTERNAL_PROBE`、`PROBE_TIMEOUT`、`PROBE_MAX_AGE`、`REQUIRE_H3`、`METRICS_MAX_AGE`。
+
+不接受 token/AuthKey/私钥等凭据，也不从配置发起 force、uninstall、轮换或安装调度。探针凭据由适配器在独立受保护位置管理。内网测试需显式 `ALLOW_NON_GLOBAL_IP=1`，公网环境使用0。
+
+## 本地二进制导入
+
+```bash
+sudo bash scripts/deploy_derper_ip_selfsigned.sh deploy \
+  --ip YOUR_PUBLIC_IP --binary /root/artifacts/derper \
+  --derper-version v1.104.1 --binary-sha256 TRUSTED_SHA256
+```
+
+目标版本必须固定，`latest` 拒绝。先复制到 root 受控候选目录，再校验64位小端 Linux ELF 的 amd64/arm64 架构、内嵌 tailscale.com 模块版本、所需帮助能力和可选预期摘要，最后复用 B 的快照、切换和回退。不直接执行原输入路径，不自动安装 Go；本机须已有 openssl/curl/od 等运行依赖。
+
+默认 verify-clients 仍开启，候选还必须通过正在运行的 tailscaled daemon revision 门禁。无法确认时拒绝；某些版本映射需要 Go 模块元数据查询，本地导入不承诺默认鉴权模式下完全离线。关闭校验仅适用于隔离测试。
+
+进程名仅用于定位候选。读取版本要求进程的 real/effective/saved/fs UID 均与部署调用者一致，可执行文件属于 root 或调用者，且无组/其他用户写权限或 setuid/setgid 位；固定文件描述符后才执行版本读取。root 部署不会执行普通用户的同名程序；自定义非 root tailscaled 无法满足该检查时转人工，不自动放宽权限。
+
+回退恢复 unit 和专用节点状态目录中普通文件的内容及存在性，包含隐藏文件和空文件。遇到链接、子目录等不支持条目时拒绝继续清理，不递归删除；清理、摘要复核或 systemd 缓存刷新失败时保留恢复集和未完成标记。
+
+首次安装中断没有上一版二进制可恢复：显式恢复会先停止服务并确认不再运行，再移除候选和标记。无法停止时两者保留，排除拒停原因后可再次执行 `recover`。
+
+自行计算的 SHA256 只能描述所取文件，不能认证来源。预期摘要应通过可信独立渠道获取；操作者仍需信任本地产物。无法识别版本的自编译产物拒绝。正常 deploy 更新不重签有效证书。
+
+## 状态、指标与结果
+
+同一次核心采集供文本、JSON、指标和 derpmap 使用。JSON schema_version=1，包含 sampled_at、last_success_at、result/reason、needs_manual_attention、layers、目标参数、证书摘要、新鲜度及写入结果。缺失摘要/时间等为 null；last_success_at 为当前请求检查范围最近通过的时间，H3 未配置时不代表外部中继最近成功。
+
+```bash
+bash scripts/deploy_derper_ip_selfsigned.sh status --format json
+bash scripts/deploy_derper_ip_selfsigned.sh derpmap --region-id 900
+sudo bash scripts/deploy_derper_ip_selfsigned.sh health \
+  --metrics-textfile /var/lib/node_exporter/textfile_collector/derper.prom \
+  --state-file /var/lib/derper-deploy/health/status.json
+bash scripts/deploy_derper_ip_selfsigned.sh status --format json \
+  --metrics-source /var/lib/node_exporter/textfile_collector/derper.prom --metrics-max-age 900
+```
+
+普通 status 默认不写文件；指标输出和状态持久化由显式参数开启。写入使用同目录临时文件与替换，失败非零并保留旧内容。`--metrics-source` 只读检查旧指标的唯一 `derper_metrics_unixtime`，过期标 stale，无法读取/格式错/未来时间标 unknown；不能同时作为本次指标输出路径。
+
+保留原指标；新增 `derper_h0_status`～`derper_h3_status`（1健康、0故障、-1未知、-2未检查、2不适用）、采样时间、旧指标年龄和最近成功时间。旧指标没有后台进程自行改写 stale 状态，监控端应比较当前时间与 derper_metrics_unixtime，或显式使用 --metrics-source。
+
+原 `--install-healthcheck-cron` 继续作为安装入口，systemd 环境实际生成 timer/oneshot，显式 Bash 调用稳定副本，带默认状态文件 `/var/lib/derper-deploy/health/status.json`；已配置探针/Region/超时/内网许可也会随调度保存。不会在定时任务中自动重启或修复。
+
+```bash
+systemctl status derper-healthcheck.timer
+journalctl -u derper-healthcheck.service
+cat /var/lib/derper-deploy/health/status.json
+```
+
+`journal_storage` 只检查持久目录是否存在，目录存在不证明所有日志已落盘；持久化、磁盘容量和主机离线期间的通知能力须另行运维验证。当前没有站外通知。
+
+## H0～H3 与发布门禁
+
+| 层 | 范围 |
+| --- | --- |
+| H0 | 采集工具是否存在 |
+| H1 | 服务、正确 PID 的 TCP/UDP 监听、证书对/有效期/SAN与在线指纹 |
+| H2 | verify-clients 开启时的 tailscaled/LocalAPI 依赖；关闭时 not_applicable |
+| H3 | 独立合法客户端对指定 Region/节点的真实 DERP 转发和 STUN 检查 |
+
+没有探针时 H3=not_checked，基础0退出码只说明本地范围通过。`--require-h3` 让缺少 H3 的结果返回2，并阻断发布提交。显式配置探针后，其故障或未知也阻断提交。正常启动与门禁通过后才清除变更标记；失败恢复旧版本并复验，恢复失败保留材料。
+
+探针达到超时时先发送 TERM，额外1秒后强制终止，并清理仍处于该进程组的子进程；适配器不得自行脱离进程组运行后台守护进程。缺少观测工具只允许对应能力降级，已确认的端口/PID故障仍阻断发布。
+
+`--state-file` 和指标输出只接受普通文件目标；目标为目录或符号链接时失败。root输出路径的祖先必须归root所有、不可由组/其他用户写入且不能是链接；root所有的sticky目录（如`/tmp`）可以作为上层祖先，但最终输出目录必须受保护。使用root管理的独立结果目录，避免直接写`/tmp/status.json`或服务用户可写目录。状态输出、指标输出和指标输入不得重合，路径别名与现有硬链接也会被拒绝。
+
+JSON新增`scope_id`，用于绑定目标IP/端口、Region、鉴权模式、H3要求、探针和指标新鲜度配置。`last_success_at`仅复用同一范围的成功历史；旧状态缺少该标识或范围改变时，历史值重置，当前检查成功后重新建立记录。
+
+`--external-probe /绝对路径/适配器` 是自定义适配接口，不是内置 derpprobe 部署。适配器应调用位于独立已授权客户端上的真实协议检查，自己管理凭据，不能用固定成功或本地TLS代替。root 执行时适配器及全部父路径须归 root、不可由其他用户写入且无符号链接。
+
+调用参数为 `--region-id N --ip IP --derp-port TCP --stun-port UDP`。stdout 必须仅输出以下白名单字段（以下只是报文示例，**不能当作探针实现**）：
+
+```text
+schema=1
+region_id=900
+ip=YOUR_PUBLIC_IP
+derp_port=30399
+stun_port=3478
+checked_at=本次真实检查的Unix时间
+derp=ok
+stun=ok
+```
+
+DERP/STUN 值为 ok/failed；全通过退出0，确认失败且报告对应failed时退出1。目标、Region、端口必须匹配；重复/未知字段、错误格式、时间过期/明显超前、超时或其他退出码均为 unknown。默认超时15秒，范围1～120；默认最大年龄60秒；需要 timeout 工具，客户端时钟须同步。探针原始 stdout/stderr 不转储日志，避免凭据外泄。
+
+当前隔离 VM 测试验证了协议解析、失败/未知门禁和回退；真实独立 Tailnet 客户端的 H3 验收、生产升级和控制面协调分别待实测，不从本地通过推断它们已完成。

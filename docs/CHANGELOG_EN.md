@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.2.16] - 2026-10-22
+
+- Stop and confirm inactivity before interrupted first-install cleanup (BUG-067), retaining the candidate and marker on failure. Add real systemd RefuseManualStop and independent CLI retry coverage.
+- Bound TERM-resistant probes with a one-second KILL grace period and clean remaining process-group children (BUG-071).
+- Validate trusted ancestors and ordinary-file destinations for state/metrics output; reject input/output aliases, including hard links (BUG-072–074).
+- Bind success history to target/check scope with JSON scope_id (BUG-075), align configured RegionID with the CLI safe-integer range (BUG-076), and block known port failures when only TLS observation is missing (BUG-066). Fix variable boundaries in the new Bash 3.2 degradation message.
+
+- Fix root execution of an untrusted matching process (BUG-080). Validate process credentials and executable ownership/permissions, then pin its inode before reading the running version.
+- Restore unit and node-state file presence during rollback (BUG-081), including hidden/empty ordinary files. Refuse recursive cleanup of unknown directories, verify final digests, reload systemd for inactive/absent intent, and retain the marker on failure. Add regressions, real-user evidence and a disposable-VM absent-unit recovery case.
+
+- Keep prerelease and pseudo-version suffixes when Go is absent (BUG-055, BUG-070). `v1.104.1-rc1` is no longer treated as `v1.104.1`, and a full pseudo-version can match the running tailscaled commit without Go.
+- Read same-origin identity from the running tailscaled process (BUG-077). The script uses the systemd MainPID or the single `tailscaled` process, then runs `/proc/PID/exe --version`. If that identity cannot be confirmed, more than one process matches, or the field is malformed, the switch is refused and tailscaled is not upgraded or downgraded.
+- Save the current node identity before a standalone migration (BUG-078). Rollback restores that config and state. If no current config existed yet, rollback removes the file the migration created and leaves the legacy file in place.
+- Check unit, config, and state digests in the recovery set, including whether each payload was absent (BUG-079). A damaged payload fails verification, is not written back, and both the incomplete marker and the recovery set stay.
+- Stop deployment when local binary import fails (BUG-065). All three `install_derper` call sites now check the return value. Bash 3.2 does not abort the caller under `set -e` when a function fails via `|| return`, so certificate and unit changes could continue after a rejected import.
+- Keep a startup that already passed degraded verification when ss/netstat or openssl is missing (BUG-066). Confirmed failures, unknowns collected with the tools present, and H3 or metrics problems still block the release and roll back.
+- Report a fresh-install rollback as complete after the half-started service is stopped (BUG-067). A previously running service with no unit backup still reports that rollback is incomplete.
+- Explain invalid argument combinations and reject probe or metrics options that check, uninstall, and recover would ignore (BUG-068).
+- Emit legal region IDs through 2^53-1 in status JSON instead of null (BUG-069).
+- Limit the documented 0/1/2 exit codes to health/status (DOC-012). derpmap exits 2 when local identity is unverified and 1 when that check failed.
+- Adds C1–C3: explicit versioned allowlist configuration, compatible commands, local Linux ELF candidate import, single-sample status JSON/derpMap/metrics, H0–H3 checks, freshness, atomic health state and release gates. External checks require an independent authorized-client adapter; missing H3 remains explicitly unverified. No Bash repair loop is installed.
+- Fixes duplicate rollback found in a real VM (BUG-062): after A/B restore and reverification, do not restart again through the legacy unit path. Reset the failed candidate's systemd start counters after restoring previous files and before starting them.
+- Adds C-stage behavior tests, real-systemd full-CLI import/config/JSON/gate-rollback checks, and bilingual maintenance guides. Real external H3, production migration and control-plane maintenance remain separate acceptance work.
+- Preserve explicit `--allow-non-global-ip` in generated health-check timer/cron commands (BUG-061), so private test deployments do not fail scheduled IP validation. Default public-IP validation is unchanged.
+- Keep machine-readable stdout clean: `status --format json` and `derpmap` without `--ip` no longer emit the unit-IP inference notice on stdout (BUG-064); the notice goes to stderr, matching environment checks.
+- Fix Bash 3.2 (UTF-8 locale) aborts where `$VAR` directly followed by full-width punctuation was parsed as a variable name under `set -u`, plus mojibake in `json_quote` for non-ASCII output (BUG-063); tests adapted for macOS portability.
+- Replace the GB integration stubs with real systemd, DERP processes, and TLS checks in a disposable Ubuntu VM. Covers failed-start rollback, explicit recovery after SIGKILL, retained backups on failed recovery, stopped intent, certificate/identity reuse, and execution/cleanup of generated health tasks. Requires explicit VM opt-in and refuses existing deployments.
+- Unify the test harness: the main suite and review regressions now count all failures (instead of stopping at the first) and accept individual test names as arguments; the review-regression case list is a proper array; skip notices use a `skip -` prefix instead of mixing into ok output; add negative cases for external-probe path trust (relative path, symlink, non-executable, directory, missing); CI runs the S2 real-flock/permission evidence suite under sudo and extends ShellCheck to every test file; add `tests/README.md` documenting suite ownership, naming conventions, and the run matrix.
+- Docs adjustment: move the bilingual changelogs from the repository root back into `docs/` (`docs/CHANGELOG_CN.md`, `docs/CHANGELOG_EN.md`); the README now states explicitly that REFERENCE is the detailed user guide, and the documentation-layout notes are updated accordingly.
+
 ## [0.2.15] - 2026-10-21
 
 ### ✨ Features
@@ -756,6 +786,6 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 **Contributors**: Thanks to architects for professional advice
 
-**Update Date**: 2026-10-21
+**Update Date**: 2026-10-22
 
-**Version**: 0.2.15
+**Version**: 0.2.16
