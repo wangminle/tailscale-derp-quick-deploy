@@ -1,6 +1,6 @@
 # 配置、维护入口与检查范围
 
-本指南描述 C 阶段已实现的入口；证书自动轮换和控制面策略写入仍未交付。脚本继续以单文件运行，旧参数保留。
+本指南描述已实现的配置、检查和维护入口。证书轮换提供 prepare/apply/cancel 与同机维护任务；云端策略写入只用合成替身验收，隔离 Tailnet 真写仍待办。脚本继续以单文件运行，旧参数保留。
 
 ## 命令与兼容
 
@@ -13,6 +13,10 @@
 | uninstall | --uninstall，原 purge 参数不变 |
 | recover | --recover-interrupted，只恢复持久未完成变更 |
 | derpmap | 从本次已验证的在线身份输出本节点 Regions JSON 片段 |
+| prepare | 生成候选证书和本节点片段，不切换正在运行的服务 |
+| apply | 确认后切换本地证书；已记录自动维护且写授权就绪时同步 CertName |
+| cancel | 丢弃候选，正式证书不变 |
+| maintain | 同机 timer 入口：到期才换证，缺条件保留旧证书 |
 
 子命令必须放在选项前。相同模式可以重复表达，相反模式拒绝，例如 `deploy --uninstall`、`status --repair`。`--force` 仍为旧的强制重装/重签路径，保留原换证确认要求；通常升级使用 deploy 并复用有效证书。
 
@@ -40,7 +44,7 @@ bash scripts/deploy_derper_ip_selfsigned.sh status --config /etc/derper/deploy.c
 
 格式为逐行 `KEY=value`，必须 `CONFIG_VERSION=1`；支持空行和整行 `#` 注释，不解释引号、变量、命令或行尾注释。未知/重复字段、控制字符/NUL、shell 语法和超过64KiB文件均拒绝。root 使用时文件须归 root 且组/其他用户不可写，符号链接拒绝。业务字段仍经过原 CLI 的校验，例如 RegionName 使用英文、数字、空格、连字符和下划线。
 
-允许的字段：`CONFIG_VERSION`、`IP_ADDR`、`DERP_PORT`、`STUN_PORT`、`CERT_DAYS`、`DERPER_VERSION`、`REGION_ID`、`REGION_CODE`、`REGION_NAME`、`RUN_USER`、`VERIFY_CLIENTS_MODE`、`SECURITY_LEVEL`、`TLS_CONNLIMIT`、`ALLOW_NON_GLOBAL_IP`、`EXTERNAL_PROBE`、`PROBE_TIMEOUT`、`PROBE_MAX_AGE`、`REQUIRE_H3`、`METRICS_MAX_AGE`。
+允许的字段：`CONFIG_VERSION`、`IP_ADDR`、`DERP_PORT`、`STUN_PORT`、`CERT_DAYS`、`CERT_LEAD_DAYS`、`DERPER_VERSION`、`REGION_ID`、`REGION_CODE`、`REGION_NAME`、`RUN_USER`、`VERIFY_CLIENTS_MODE`、`SECURITY_LEVEL`、`TLS_CONNLIMIT`、`ALLOW_NON_GLOBAL_IP`、`EXTERNAL_PROBE`、`PROBE_TIMEOUT`、`PROBE_MAX_AGE`、`REQUIRE_H3`、`METRICS_MAX_AGE`、`TS_TAILNET`、`POLICY_CREDENTIAL_FILE`。后两者只给维护任务保存 Tailnet 名称和凭据文件路径，不保存 client secret。
 
 不接受 token/AuthKey/私钥等凭据，也不从配置发起 force、uninstall、轮换或安装调度。探针凭据由适配器在独立受保护位置管理。内网测试需显式 `ALLOW_NON_GLOBAL_IP=1`，公网环境使用0。
 
@@ -127,3 +131,27 @@ stun=ok
 DERP/STUN 值为 ok/failed；全通过退出0，确认失败且报告对应failed时退出1。目标、Region、端口必须匹配；重复/未知字段、错误格式、时间过期/明显超前、超时或其他退出码均为 unknown。默认超时15秒，范围1～120；默认最大年龄60秒；需要 timeout 工具，客户端时钟须同步。探针原始 stdout/stderr 不转储日志，避免凭据外泄。
 
 当前隔离 VM 测试验证了协议解析、失败/未知门禁和回退；真实独立 Tailnet 客户端的 H3 验收、生产升级和控制面协调分别待实测，不从本地通过推断它们已完成。
+
+## 证书轮换与条件式自动维护
+
+自动维护必须配置非空、非全空白的 `TS_TAILNET`，可由部署配置或独立凭据文件提供；未配置时不请求 OAuth 或策略 API，显式 `--enable-auto-maintain` 会报错且不安装 timer。有效目标会保存到定时配置。
+
+`--lead-days` 或配置文件中的 `CERT_LEAD_DAYS` 都算显式设置，必须在最终证书有效期内，越界会拒绝。CLI 仍可覆盖配置文件中的提前天数或证书有效期；只有没有显式提供提前天数时，默认 30 天才会随短期证书自动收紧。
+
+apply 会在更新云端指纹前检查安装根目录是否为符号链接，正式切换事务前再次检查；目录不安全时拒绝操作，保留原证书、私钥和候选。
+
+维护状态文件单独保存 `scheduler_state`。安装或启用 timer 失败后，后续命令和维护重试仍保持未知，部署收尾返回非零；凭据恢复不会解除调度失败。修复调度条件后再次执行带 `--enable-auto-maintain` 的命令，成功安装并启用后才恢复 ready；也可用 `--disable-auto-maintain` 转回人工维护。旧版未保存独立调度字段的失败记录同样受保护。已成功安装的 timer 遇到临时授权未知时，仍保留启用意图，授权恢复后可继续维护。
+
+`--yes` 不能代替换证确认。人工路径：
+
+```bash
+sudo bash scripts/deploy_derper_ip_selfsigned.sh prepare --ip YOUR_PUBLIC_IP
+sudo bash scripts/deploy_derper_ip_selfsigned.sh apply --ip YOUR_PUBLIC_IP --accept-cert-rotation
+sudo bash scripts/deploy_derper_ip_selfsigned.sh cancel
+```
+
+prepare 只写入 `$DEPLOY_STATE_DIR/cert-rotation/` 的候选和片段，不切换正在运行的服务。apply 在确认后切换本地证书；目标 IP、Region、端口或已记录的 Tailnet 与 prepare 不一致时拒绝，须重新 prepare。成功切换后旧证书归档到 systemd unit 旁的 `.certs-archive`，只有未完成事务才会在下次命令自动恢复。服务原先在运行时，切换后要确认进程仍在运行且实际加载的指纹与新证书一致，否则恢复旧证书并不记为已应用。未配置云端写授权时，部署摘要会说明人工维护步骤，安装本身不失败。
+
+云端 secret 放在独立文件，不写入日志或 derper 环境。默认路径 `/etc/derper/policy-api.env`，root 所有、权限 0600，字段仅 `TS_TAILNET`、`TS_API_CLIENT_ID`、`TS_API_CLIENT_SECRET`、`TS_API_BASE`、`TS_API_TOKEN`、`POLICY_SOURCE`。维护配置可以记录该文件路径，但不记录 secret。`POLICY_SOURCE=gitops` 时脚本拒绝直接写云端，避免与仓库发布双写。GET 或 validate 成功不能证明可写。自动提交要求 GET 带回 ETag，并用 `If-Match` 提交；HTTP 412 或 validate 错误都不会切换本地证书。
+
+显式 `--enable-auto-maintain` 且写授权齐全时，脚本把维护程序原子复制到部署状态目录，写出带节点、端口、有效期、提前天数、内网放行、运行用户、客户端校验和凭据路径的 `target.conf`，再 `daemon-reload` 并 `enable --now`。unit 与脚本副本拒绝符号链接。timer 执行的是部署状态目录里的脚本副本而不是原脚本；升级部署脚本后需再次执行带 `--enable-auto-maintain` 的命令刷新副本，否则定时任务会继续运行旧版脚本。timer 已启用且处于 active 之后，才把自动维护记为 ready。启用失败保持未知，不宣称已就绪。`--disable-auto-maintain` 才撤销登记并删除 timer；一次临时授权未知不会取消已启用意图。`cancel` 只丢弃候选，不要求公网 IP，也不打印部署向导。每天的 `maintain` 不重复打印安装说明。普通卸载保留维护副本；`--purge-all` 才删除该副本和 `target.conf`。卸载 derper 时也会删除维护 unit 和证书归档。每次执行会重验条件；未到期或条件不足不替换旧证书。已成功应用的候选不会在下一周期复用。失败只记本机 journal 和 `$(deploy_state_root)/maintenance/status`。当前没有站外通知。隔离 Tailnet 的真实策略写入与独立客户端复验仍待办。

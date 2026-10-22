@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.2.17] - 2026-10-22
+
+- Fix BUG-101: a missing or whitespace-only `TS_TAILNET` cannot obtain write authorization, and explicit auto-maintenance enablement fails without installing a timer. A valid target from deployment config or credentials is retained in the timer config. Treat configured `CERT_LEAD_DAYS` as explicit, rejecting out-of-range values while preserving CLI overrides and default adjustment for short certificates. Rename seven existing bug regressions to follow the ledger-ID convention and add five target/lead-time regressions.
+- Fix reopened acceptance findings (BUG-104, BUG-107): persist scheduler results separately so installation or activation failures remain unknown across commands, maintenance retries, and authorization recovery, with a nonzero deployment finalization result. Successful re-enabling or explicit disabling clears the failure; legacy failure records remain supported. Rotation rejects a symlinked installation root before updating the cloud fingerprint and before starting the certificate transaction. Add four regressions verified to fail before the fix and pass afterward.
+- Add local S4/D-stage `prepare`/`apply`/`cancel`/`maintain`. Prepare writes a candidate without switching the live service. `--yes` does not replace `--accept-cert-rotation`. Default lifetime stays 365 days.
+- Conditional auto-renewal uses a root credential file and an independent `derper-cert-maintain` timer. `--enable-auto-maintain` persists `mode=ready`; `--disable-auto-maintain` returns to manual and removes the timer. GET/validate success is not write permission. GitOps refuses a dual write.
+- Policy adapter coverage uses HuJSON/HTTP stubs: comments preserved, fingerprint conflicts, ETag conflicts, POST timeout read-back, and foreign-target changes that stop automatic rollback. Isolated Tailnet writes remain outstanding.
+- Fix local certificate-transaction and policy-maintenance defects (BUG-082–095): a successful apply archives the old certificate instead of rolling it back on the next command; first registration keeps existing access policy; OAuth JSON, ETag, and HTTP status stay in the calling shell; read-back selects CertName by node identity; apply is bound to the prepared target; the next cycle issues a new certificate; a switch checks that the service loaded the new fingerprint; the timer is marked ready only after it is enabled, and it keeps the node and maintenance parameters; a transient authorization failure does not cancel an enabled registration.
+- Close the remaining maintenance install boundaries (BUG-096–099): maintenance units and the stable script copy refuse symlinks and are replaced atomically; `target.conf` keeps the private-IP permission, run user, and client verification mode; `cancel` can discard a candidate without a public IP; a daily `maintain` run does not repeat the deployment guide; `--purge-all` removes the maintenance copy.
+- Close more rotation and maintenance boundaries (BUG-100, BUG-102–108): refuse symlinks before copying a live certificate; restart and verify the previous service after a failed switch; `--disable-auto-maintain` overrides a historical grant; an already-healthy deploy still applies enable or disable; a failed timer install is not reported as ready; an expired certificate is due; the default lead time no longer rejects certificates shorter than 30 days unless `--lead-days` is explicit.
+
 ## [0.2.16] - 2026-10-22
 
 - Stop and confirm inactivity before interrupted first-install cleanup (BUG-067), retaining the candidate and marker on failure. Add real systemd RefuseManualStop and independent CLI retry coverage.
@@ -788,4 +799,4 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 **Update Date**: 2026-10-22
 
-**Version**: 0.2.16
+**Version**: 0.2.17

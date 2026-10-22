@@ -1,11 +1,11 @@
 # DERP Deployment Guide with IP-based Self-signed Certificate (User Guide · Detailed Reference)
 
-> For configuration, compatible CLI, local import, JSON and H0–H3, see [the maintenance guide](MAINTENANCE_EN.md).
+> For configuration, compatible CLI, local import, JSON, H0–H3, certificate prepare/apply/cancel and conditional auto-renewal, see [the maintenance guide](MAINTENANCE_EN.md).
 
 > This is the detailed English user guide (technical reference). For the simplified Chinese quickstart now used as the main README, go to `../README.md`. For the Chinese user guide, see `REFERENCE_CN.md` in this folder.
 
 > **Script File**: `deploy_derper_ip_selfsigned.sh`  
-> **Current Version**: 0.2.16 (2026-10-22)\
+> **Current Version**: 0.2.17 (2026-10-22)\
 > **Show version**: `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
@@ -240,6 +240,13 @@ Common paths:
 --dedicated-user          Force a dedicated derper system account (recommended for production)
 --security-level LEVEL    Hardening level: basic|standard|paranoid (default standard)
 --accept-cert-rotation    Acknowledge fingerprint change and ACL cutover (--yes does not replace this)
+prepare | apply | cancel | maintain
+                          Candidate prepare / confirmed switch / discard / on-host maintain; see the maintenance guide
+--enable-auto-maintain    Record automatic renewal and install the independent timer when write scope and a Tailnet target are ready
+--disable-auto-maintain   Return to manual mode and remove the maintain timer
+--lead-days <int>         Days before expiry to rotate; default 30 (shrunk for short-lived certs); explicit values must fit the lifetime
+--policy-credential FILE  Root credential file, default /etc/derper/policy-api.env
+--tailnet NAME            Target Tailnet, required for auto-maintain; a local login is not write permission
 --relax-socket-perms      Temporarily chmod tailscaled socket to 0666 (emergency only; restored on exit)
 --tls-connlimit N         Cap concurrent DERP TLS connections per source IP (nft/iptables connlimit)
                           Explicit 0 removes installed rules; omit the flag to leave existing rules
@@ -424,7 +431,7 @@ For production deployments, consider:
 2. **Deploy on port 443** for better firewall traversal: `--derp-port 443`
 3. **Enable automatic updates** for derper binary and system packages
 4. **Monitor with Prometheus**: Use `--health-check --metrics-textfile` for alerting
-5. **Regular certificate rotation**: Current validity is 365 days by default
+5. **Regular certificate rotation**: Default lifetime is 365 days. Use prepare/apply/cancel for a planned fingerprint change; see the maintenance guide. Isolated Tailnet writes remain outstanding.
 
 ---
 

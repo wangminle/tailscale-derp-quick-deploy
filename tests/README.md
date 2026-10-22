@@ -11,6 +11,7 @@
 | test_s2_fixes.sh | S2 批次修复行为回归（BUG-053/055/059/060/061/070/077～081，20 用例），替身服务管理 | 非 root，需 gcc | ✅ | ✅ | 0 通过 / 1 有失败 |
 | test_s2_evidence.sh | 真实环境证据：flock、服务用户权限、旧用户恢复，以及 root 拒绝低权限同名进程/不可信 inode | 需 root + flock + useradd + gcc | ✅（sudo） | ❌（整文件执行） | 0 通过 / 1 失败 / 2 环境不符 |
 | test_c_stage.sh | C 阶段契约与行为（DEV-011/012/013）：配置白名单、新旧 CLI、ELF 导入、JSON/derpMap、H0～H3、状态与门禁（33 用例）；需 python3，ELF 用例需 gcc | 非 root；2项 root 专属用例退出 77 跳过 | ✅（含 sudo 补跑 root 用例） | ✅ | 0 通过 / 1 有失败 |
+| test_d_stage.sh | D 阶段契约与行为（DEV-008）：prepare/apply/cancel、HuJSON 最小补丁、策略 API 替身、自动/人工/未知三态、启用/停用持久化与维护 unit，以及事务归档、身份绑定、OAuth/ETag/HTTP 状态、timer 参数、符号链接写入、内网放行继承、cancel/maintain 反馈、purge-all、换证回滚重启、停用优先、幂等启停、过期续期、短期证书提前天数、调度失败跨命令持久化和安装根目录链接拒绝、Tailnet 目标和配置提前天数显式校验回归（52 用例）；需 openssl，HuJSON 补丁需 python3 | 非 root | ✅ | ✅ | 0 通过 / 1 有失败 |
 | test_systemd_integration.sh | GB 集成：真实 systemd PID1 的一次性 VM 中执行完整发布/回退/恢复/生成任务 | 仅人工标记的一次性 VM（`DERPER_INTEGRATION_VM=1` + `/root/DERPER_DISPOSABLE_GB_VM`），否则退出 2 | ❌（VM 门禁） | ❌ | 0 通过 / 1 失败 / 2 环境不符 |
 
 ## 命名体系
@@ -42,6 +43,8 @@
 | BUG-081 新增回归入口 | test_bug081_rollback_restores_absent_unit_and_state_set、test_bug081_cleanup_failure_keeps_marker、test_bug081_hidden_state_and_unsafe_entries、test_bug081_unit_cleanup_and_reload_failure_keep_marker；真实unit缺失回退另在test_systemd_integration.sh |
 | 真实 flock/权限/双用户回退证据（TST-014/016） | test_s2_evidence.sh（root） |
 | BUG-062 重复回退、C 阶段全部契约（DEV-011/012/013） | test_c_stage.sh |
+| D 阶段 prepare/apply/cancel、策略替身与维护三态（DEV-008） | test_d_stage.sh |
+| BUG-101～108（BUG-100 与105同源） | test_d_stage.sh 中 test_bug101_～test_bug108_ 入口；目标缺失/来源、配置提前天数、调度跨命令状态与换证边界 |
 | BUG-066/067、071～076 | test_c_stage.sh新增8个test_bug<ID>入口；067直接覆盖rollback_deploy_change首装分支，071含忽略TERM及父进程先退出的子进程清理，072以root补验状态/指标祖先权限，074含词法/符号/硬链接别名，075检查目标/检查范围切换。真实首装拒停及独立CLI重试另在test_systemd_integration.sh |
 | GB 真实 systemd 故障注入（TST-017） | test_systemd_integration.sh（一次性 VM） |
 | BUG-063 Bash 3.2 兼容 | 全部套件须在 macOS Bash 3.2 与 Linux Bash 5 双环境通过 |
@@ -55,6 +58,7 @@ bash tests/test_deploy_script.sh
 bash tests/test_review_regressions.sh
 bash tests/test_s2_fixes.sh
 bash tests/test_c_stage.sh                 # 需 python3；ELF 用例需 gcc
+bash tests/test_d_stage.sh                 # 需 openssl；HuJSON 补丁需 python3
 sudo bash tests/test_s2_evidence.sh        # 需 root + flock
 shellcheck -S error scripts/deploy_derper_ip_selfsigned.sh tests/*.sh
 # 一次性 VM（不接入 CI，见 tests/test_systemd_integration.sh 头部说明）：

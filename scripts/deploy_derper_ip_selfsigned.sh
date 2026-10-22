@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # 脚本自身版本（与 docs/CHANGELOG_*.md、仓库根目录 VERSION 保持同步）
-SCRIPT_VERSION="0.2.16"
+SCRIPT_VERSION="0.2.17"
 SCRIPT_VERSION_DATE="2026-10-22"
 
 # 默认端口
@@ -121,6 +121,23 @@ METRICS_MAX_AGE=900
 METRICS_MAX_AGE_EXPLICIT=0
 HEALTH_STATE_FILE=""
 HEALTH_SNAPSHOT_READY=0
+CERT_PREPARE=0
+CERT_APPLY=0
+CERT_CANCEL=0
+CERT_MAINTAIN=0
+ENABLE_AUTO_MAINTAIN=0
+DISABLE_AUTO_MAINTAIN=0
+CERT_LEAD_DAYS=30
+CERT_LEAD_DAYS_EXPLICIT=0
+POLICY_CREDENTIAL_FILE="${POLICY_CREDENTIAL_FILE:-/etc/derper/policy-api.env}"
+TS_API_BASE="${TS_API_BASE:-https://api.tailscale.com}"
+TS_TAILNET="${TS_TAILNET:-}"
+TS_API_CLIENT_ID=""
+TS_API_CLIENT_SECRET=""
+POLICY_SOURCE=""
+POLICY_TOKEN=""
+POLICY_GRANTED_SCOPE=""
+SYSTEMD_UNIT_DIR="${SYSTEMD_UNIT_DIR:-}"
 
 # 配置是数据，不是 shell；无自动搜索，无凭据字段，无操作模式字段。
 load_deploy_config() {
@@ -143,7 +160,7 @@ load_deploy_config() {
     key=${line%%=*}; value=${line#*=}
     value="${value%"${value##*[![:space:]]}"}"
     case "$key" in
-      CONFIG_VERSION|IP_ADDR|DERP_PORT|STUN_PORT|CERT_DAYS|DERPER_VERSION|REGION_ID|REGION_CODE|REGION_NAME|RUN_USER|VERIFY_CLIENTS_MODE|SECURITY_LEVEL|TLS_CONNLIMIT|ALLOW_NON_GLOBAL_IP|EXTERNAL_PROBE|PROBE_TIMEOUT|PROBE_MAX_AGE|REQUIRE_H3|METRICS_MAX_AGE) ;;
+      CONFIG_VERSION|IP_ADDR|DERP_PORT|STUN_PORT|CERT_DAYS|CERT_LEAD_DAYS|DERPER_VERSION|REGION_ID|REGION_CODE|REGION_NAME|RUN_USER|VERIFY_CLIENTS_MODE|SECURITY_LEVEL|TLS_CONNLIMIT|ALLOW_NON_GLOBAL_IP|EXTERNAL_PROBE|PROBE_TIMEOUT|PROBE_MAX_AGE|REQUIRE_H3|METRICS_MAX_AGE|TS_TAILNET|POLICY_CREDENTIAL_FILE) ;;
       *) echo '[错误] 配置含未知或不允许的字段。' >&2; return 1 ;;
     esac
     [[ "$seen" != *"|$key|"* ]] || { echo '[错误] 配置含重复字段。' >&2; return 1; }
@@ -155,7 +172,7 @@ load_deploy_config() {
       VERIFY_CLIENTS_MODE) [[ "$value" == on || "$value" == off ]] || return 1 ;;
       ALLOW_NON_GLOBAL_IP|REQUIRE_H3) [[ "$value" == 0 || "$value" == 1 ]] || return 1 ;;
       REGION_ID) decimal_in_closed_range "$value" 1 9007199254740991 || return 1 ;;
-      DERP_PORT|STUN_PORT|CERT_DAYS|TLS_CONNLIMIT|PROBE_TIMEOUT|PROBE_MAX_AGE|METRICS_MAX_AGE) [[ "$value" =~ ^[0-9]{1,9}$ ]] || return 1 ;;
+      DERP_PORT|STUN_PORT|CERT_DAYS|CERT_LEAD_DAYS|TLS_CONNLIMIT|PROBE_TIMEOUT|PROBE_MAX_AGE|METRICS_MAX_AGE) [[ "$value" =~ ^[0-9]{1,9}$ ]] || return 1 ;;
     esac
     seen+="$key|"
     keys+=("$key"); values+=("$value")
@@ -169,6 +186,7 @@ load_deploy_config() {
     case "$key" in
       DERP_PORT) DERP_PORT_EXPLICIT=1 ;;
       STUN_PORT) STUN_PORT_EXPLICIT=1 ;;
+      CERT_LEAD_DAYS) CERT_LEAD_DAYS_EXPLICIT=1 ;;
       RUN_USER) RUN_USER_EXPLICIT=1 ;;
       VERIFY_CLIENTS_MODE) VERIFY_CLIENTS_EXPLICIT=1 ;;
       SECURITY_LEVEL) SECURITY_LEVEL_EXPLICIT=1 ;;
@@ -198,8 +216,14 @@ usage() {
 
 脚本版本：${SCRIPT_VERSION}（${SCRIPT_VERSION_DATE}）
 
-C阶段入口（旧参数继续支持）：
+C/D阶段入口（旧参数继续支持）：
   deploy | check | health | status | repair | uninstall | recover | derpmap
+  prepare | apply | cancel | maintain
+  --enable-auto-maintain    在写授权、Tailnet 目标和调度条件齐全时记录本节点自动换证
+  --disable-auto-maintain   关闭自动换证，保留人工路径
+  --lead-days N             到期前提前天数，默认 30（随短期证书收紧），显式值须在有效期内
+  --policy-credential FILE  root 凭据文件，默认 /etc/derper/policy-api.env
+  --tailnet NAME            目标 Tailnet，自动维护必填；不把本机登录当成写授权
   --config FILE             显式读取CONFIG_VERSION=1白名单配置，CLI优先
   --format text|json        health/status输出格式；derpmap输出JSON片段
   --binary FILE             导入本地Linux ELF，须固定--derper-version
@@ -432,7 +456,7 @@ EOT
 parse_args() {
   load_cli_config "$@" || { echo '[错误] 无法解析配置。' >&2; return 1; }
   case "${1:-}" in
-    deploy|check|health|status|repair|uninstall|recover|derpmap)
+    deploy|check|health|status|repair|uninstall|recover|derpmap|prepare|apply|cancel|maintain)
       SUBCOMMAND=$1; shift
       case "$SUBCOMMAND" in
         check) DRY_RUN=1; CHECK_ONLY=1 ;;
@@ -440,6 +464,10 @@ parse_args() {
         repair) REPAIR=1 ;;
         uninstall) UNINSTALL=1 ;;
         recover) RECOVER_INTERRUPTED=1 ;;
+        prepare) CERT_PREPARE=1 ;;
+        apply) CERT_APPLY=1 ;;
+        cancel) CERT_CANCEL=1 ;;
+        maintain) CERT_MAINTAIN=1 ;;
       esac ;;
   esac
   require_arg_value() {
@@ -470,6 +498,21 @@ parse_args() {
         esac
         shift 2 ;;
       --require-h3) REQUIRE_H3=1; shift ;;
+      --enable-auto-maintain) ENABLE_AUTO_MAINTAIN=1; shift ;;
+      --disable-auto-maintain) DISABLE_AUTO_MAINTAIN=1; shift ;;
+      --lead-days)
+        require_arg_value "$1" "${2-}"
+        CERT_LEAD_DAYS="$2"
+        CERT_LEAD_DAYS_EXPLICIT=1
+        shift 2 ;;
+      --policy-credential)
+        require_arg_value "$1" "${2-}"
+        POLICY_CREDENTIAL_FILE="$2"
+        shift 2 ;;
+      --tailnet)
+        require_arg_value "$1" "${2-}"
+        TS_TAILNET="$2"
+        shift 2 ;;
       --ip)
         require_arg_value "$1" "${2-}"
         IP_ADDR="$2"
@@ -627,7 +670,26 @@ validate_arg_combos() {
         err=1
       fi
       ;;
+    prepare|apply|cancel|maintain)
+      if [[ "$FORCE$REPAIR$UNINSTALL$RECOVER_INTERRUPTED$HEALTH_CHECK$CHECK_ONLY" != 000000 ]]; then
+        echo "[错误] ${SUBCOMMAND} 不能与 --force、--repair、--check、--health-check、--uninstall 或 --recover-interrupted 一起使用。" >&2
+        err=1
+      fi
+      ;;
   esac
+  if [[ "${ENABLE_AUTO_MAINTAIN}" -eq 1 && "${DISABLE_AUTO_MAINTAIN}" -eq 1 ]]; then
+    echo "[错误] --enable-auto-maintain 与 --disable-auto-maintain 互斥。" >&2
+    err=1
+  fi
+  if [[ "${CERT_LEAD_DAYS_EXPLICIT:-0}" -ne 1 && "$CERT_DAYS" =~ ^[0-9]+$ && "$CERT_LEAD_DAYS" =~ ^[0-9]+$ ]]; then
+    if ! decimal_in_closed_range "$CERT_LEAD_DAYS" 1 "$CERT_DAYS"; then
+      CERT_LEAD_DAYS=$CERT_DAYS
+    fi
+  fi
+  if [[ ! "$CERT_LEAD_DAYS" =~ ^[0-9]+$ ]] || ! decimal_in_closed_range "$CERT_LEAD_DAYS" 1 "${CERT_DAYS}"; then
+    echo "[错误] --lead-days 必须是 1 到证书有效期 ${CERT_DAYS} 天之间的整数，当前：${CERT_LEAD_DAYS}" >&2
+    err=1
+  fi
   if [[ "$OUTPUT_FORMAT" != text && "$OUTPUT_FORMAT" != json ]]; then
     echo "[错误] --format 只接受 text 或 json，当前：${OUTPUT_FORMAT}" >&2
     err=1
@@ -3250,6 +3312,1323 @@ confirm_cert_rotation() {
   [[ "$answer" == rotate ]]
 }
 
+cert_rotation_root() {
+  printf '%s/cert-rotation\n' "$(deploy_state_root)"
+}
+
+cert_rotation_record_path() {
+  printf '%s/record\n' "$(cert_rotation_root)"
+}
+
+cert_rotation_candidate_cert() {
+  printf '%s/candidate/cert.pem\n' "$(cert_rotation_root)"
+}
+
+cert_rotation_candidate_key() {
+  printf '%s/candidate/key.pem\n' "$(cert_rotation_root)"
+}
+
+cert_rotation_snippet_path() {
+  printf '%s/snippet.json\n' "$(cert_rotation_root)"
+}
+
+maintenance_status_path() {
+  printf '%s/maintenance/status\n' "$(deploy_state_root)"
+}
+
+_read_whitelist_kv() {
+  local file="$1" want="$2" allowed="$3" line key value found=""
+  [[ -f "$file" && ! -L "$file" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" ]] && continue
+    case "$line" in
+      *'`'*|*'$('*|*';'*|*'|'*|*'&'*|*'<'*|*'>'*) echo "[错误] 记录含不可执行内容，已拒绝。" >&2; return 2 ;;
+    esac
+    [[ "$line" == *=* ]] || { echo "[错误] 记录不是白名单键值。" >&2; return 2; }
+    key=${line%%=*}; value=${line#*=}
+    case "|$allowed|" in *"|$key|"*) ;; *) echo "[错误] 记录含未知字段。" >&2; return 2 ;; esac
+    [[ "$key" == "$want" ]] && found=$value
+  done <"$file"
+  [[ -n "$found" ]] || return 1
+  printf '%s\n' "$found"
+}
+
+read_rotation_kv() {
+  _read_whitelist_kv "$(cert_rotation_record_path)" "$1" "kind|phase|old_sha256|new_sha256|region_id|ip|derp_port|stun_port|cert_days|tailnet|etag|policy_mode|lead_days"
+}
+
+read_maintenance_kv() {
+  _read_whitelist_kv "$(maintenance_status_path)" "$1" "mode|result|reason|needs_manual|last_run|next_due|lead_days|intent|scheduler_state"
+}
+
+maintenance_scheduler_state() {
+  local state
+  state=$(read_maintenance_kv scheduler_state 2>/dev/null || true)
+  if [[ -n "$state" ]]; then
+    printf '%s\n' "$state"
+  elif [[ "$(read_maintenance_kv mode 2>/dev/null || true)" == unknown && "$(read_maintenance_kv result 2>/dev/null || true)" == failed ]]; then
+    # 旧版仅在维护任务安装/启用失败时写 unknown+failed，升级后同样保留失败。
+    printf 'failed\n'
+  else
+    printf 'unknown\n'
+  fi
+}
+
+write_rotation_record() {
+  local root rec tmp
+  root=$(cert_rotation_root)
+  rec=$(cert_rotation_record_path)
+  mkdir -p "$root" || return 1
+  chmod 700 "$root" 2>/dev/null || true
+  tmp=$(mktemp "${root}/.record.XXXXXX") || return 1
+  cat >"$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$rec"
+}
+
+write_maintenance_status() {
+  local dir file tmp mode result reason needs due intent scheduler_state
+  mode="${1:-manual}"
+  result="${2:-idle}"
+  reason="${3:-}"
+  needs="${4:-0}"
+  due="${5:-0}"
+  intent="${6-}"
+  scheduler_state="${7-}"
+  if [[ -z "$scheduler_state" ]]; then
+    scheduler_state=$(maintenance_scheduler_state)
+  fi
+  if [[ -z "$intent" ]]; then
+    intent=$(read_maintenance_kv intent 2>/dev/null || true)
+  fi
+  if [[ -z "$intent" ]]; then
+    if [[ "$mode" == ready ]]; then
+      intent=enabled
+    else
+      intent=unset
+    fi
+  fi
+  dir=$(dirname "$(maintenance_status_path)")
+  file=$(maintenance_status_path)
+  mkdir -p "$dir" || return 1
+  chmod 700 "$dir" 2>/dev/null || true
+  tmp=$(mktemp "${dir}/.status.XXXXXX") || return 1
+  {
+    printf 'mode=%s\n' "$mode"
+    printf 'result=%s\n' "$result"
+    printf 'reason=%s\n' "$reason"
+    printf 'needs_manual=%s\n' "$needs"
+    printf 'last_run=%s\n' "$(date +%s 2>/dev/null || echo 0)"
+    printf 'next_due=%s\n' "$due"
+    printf 'lead_days=%s\n' "${CERT_LEAD_DAYS:-30}"
+    printf 'intent=%s\n' "$intent"
+    printf 'scheduler_state=%s\n' "$scheduler_state"
+  } >"$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$file"
+}
+
+write_selfsigned_pair() {
+  local dest_cert="$1" dest_key="$2" dir key_tmp cert_tmp cnf_tmp="" ok=0
+  dir=$(dirname "$dest_cert")
+  mkdir -p "$dir" || return 1
+  key_tmp=$(mktemp "${dir}/.derper-key.XXXXXX") || return 1
+  cert_tmp=$(mktemp "${dir}/.derper-cert.XXXXXX") || { rm -f "$key_tmp"; return 1; }
+  if openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
+      -keyout "$key_tmp" -out "$cert_tmp" -days "${CERT_DAYS}" \
+      -subj "/CN=${IP_ADDR}" -addext "subjectAltName = IP:${IP_ADDR}" >/dev/null 2>&1; then
+    ok=1
+  else
+    rm -f "$key_tmp" "$cert_tmp"
+    key_tmp=$(mktemp "${dir}/.derper-key.XXXXXX") || return 1
+    cert_tmp=$(mktemp "${dir}/.derper-cert.XXXXXX") || { rm -f "$key_tmp"; return 1; }
+    cnf_tmp=$(mktemp "${dir}/.derper-cnf.XXXXXX") || { rm -f "$key_tmp" "$cert_tmp"; return 1; }
+    cat >"$cnf_tmp" <<CONF
+[ req ]
+default_bits = 2048
+distinguished_name = req_distinguished_name
+x509_extensions = v3_req
+prompt = no
+[ req_distinguished_name ]
+CN = ${IP_ADDR}
+[ v3_req ]
+subjectAltName = IP:${IP_ADDR}
+CONF
+    if openssl req -x509 -newkey rsa:2048 -sha256 -nodes \
+      -keyout "$key_tmp" -out "$cert_tmp" -days "${CERT_DAYS}" \
+      -config "$cnf_tmp" >/dev/null 2>&1; then
+      ok=1
+    fi
+  fi
+  rm -f "$cnf_tmp"
+  if [[ "$ok" -ne 1 ]]; then
+    rm -f "$key_tmp" "$cert_tmp"
+    echo "[错误] 自签证书生成失败。" >&2
+    return 1
+  fi
+  chmod 600 "$key_tmp" "$cert_tmp" 2>/dev/null || true
+  mv -f "$key_tmp" "$dest_key" || { rm -f "$key_tmp" "$cert_tmp"; return 1; }
+  mv -f "$cert_tmp" "$dest_cert" || { rm -f "$cert_tmp"; return 1; }
+}
+
+cert_archive_path() {
+  printf '%s.certs-archive\n' "$SERVICE_PATH"
+}
+
+archive_completed_cert_transaction() {
+  local backup="${SERVICE_PATH}.certs-rollback" archive
+  archive=$(cert_archive_path)
+  if [[ ! -e "$backup" && ! -L "$backup" ]]; then
+    CERT_TRANSACTION_ACTIVE=0
+    return 0
+  fi
+  refuse_symlink "$backup" || return 1
+  rm -rf "$archive"
+  mv "$backup" "$archive" || return 1
+  CERT_TRANSACTION_ACTIVE=0
+}
+
+cert_contains_ip_san() {
+  local cert="$1" ip="$2" text
+  text=$(openssl x509 -in "$cert" -noout -text 2>/dev/null) || return 1
+  printf '%s\n' "$text" | grep -F "IP Address:${ip}" >/dev/null && return 0
+  printf '%s\n' "$text" | grep -F "IP:${ip}" >/dev/null && return 0
+  return 1
+}
+
+cert_public_matches_key() {
+  local cert="$1" key="$2" cert_pub key_pub
+  cert_pub=$(openssl x509 -in "$cert" -noout -pubkey 2>/dev/null | openssl sha256 2>/dev/null || true)
+  key_pub=$(openssl pkey -in "$key" -pubout 2>/dev/null | openssl sha256 2>/dev/null || openssl rsa -in "$key" -pubout 2>/dev/null | openssl sha256 2>/dev/null || true)
+  [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]]
+}
+
+rotation_candidate_reusable() {
+  local phase cand key fp rec
+  cand=$(cert_rotation_candidate_cert)
+  key=$(cert_rotation_candidate_key)
+  [[ -f "$cand" && -f "$key" && ! -L "$cand" && ! -L "$key" ]] || return 1
+  [[ -f "$(cert_rotation_record_path)" ]] || return 1
+  phase=$(read_rotation_kv phase 2>/dev/null || true)
+  [[ "$phase" == prepared || "$phase" == needs_coordination ]] || return 1
+  [[ "$(read_rotation_kv ip 2>/dev/null || true)" == "$IP_ADDR" ]] || return 1
+  [[ "$(read_rotation_kv region_id 2>/dev/null || true)" == "$REGION_ID" ]] || return 1
+  [[ "$(read_rotation_kv derp_port 2>/dev/null || true)" == "$DERP_PORT" ]] || return 1
+  [[ "$(read_rotation_kv stun_port 2>/dev/null || true)" == "$STUN_PORT" ]] || return 1
+  cert_contains_ip_san "$cand" "$IP_ADDR" || return 1
+  fp=$(openssl x509 -in "$cand" -outform DER | sha256_hex) || return 1
+  rec=$(read_rotation_kv new_sha256 2>/dev/null || true)
+  [[ "$fp" == "$rec" ]]
+}
+
+retire_unusable_candidate() {
+  local cand key prev
+  cand=$(cert_rotation_candidate_cert)
+  key=$(cert_rotation_candidate_key)
+  [[ -e "$cand" || -e "$key" ]] || return 0
+  prev="$(cert_rotation_root)/previous-candidate"
+  mkdir -p "$prev" || return 1
+  if [[ -e "$cand" ]]; then
+    mv -f "$cand" "$prev/cert.pem" || rm -f "$cand"
+  fi
+  if [[ -e "$key" ]]; then
+    mv -f "$key" "$prev/key.pem" || rm -f "$key"
+  fi
+}
+
+prepare_cert_rotation() {
+  local live candidate_cert candidate_key root old_fp new_fp days
+  [[ -n "$IP_ADDR" ]] || { echo "[错误] prepare 需要公网 IP。" >&2; return 1; }
+  root=$(cert_rotation_root)
+  mkdir -p "${root}/candidate" || return 1
+  chmod 700 "$root" "${root}/candidate" 2>/dev/null || true
+  live=$(resolve_disk_cert_pem || true)
+  old_fp=""
+  if [[ -n "$live" && -f "$live" && ! -L "$live" ]]; then
+    old_fp=$(openssl x509 -in "$live" -outform DER | sha256_hex) || return 1
+  fi
+  candidate_cert=$(cert_rotation_candidate_cert)
+  candidate_key=$(cert_rotation_candidate_key)
+  if rotation_candidate_reusable; then
+    new_fp=$(openssl x509 -in "$candidate_cert" -outform DER | sha256_hex) || return 1
+  else
+    retire_unusable_candidate || return 1
+    write_selfsigned_pair "$candidate_cert" "$candidate_key" || return 1
+    new_fp=$(openssl x509 -in "$candidate_cert" -outform DER | sha256_hex) || return 1
+  fi
+  days=$(cert_days_remaining || true)
+  write_rotation_record <<EOF
+kind=cert-rotation
+phase=prepared
+old_sha256=${old_fp:-none}
+new_sha256=${new_fp}
+region_id=${REGION_ID}
+ip=${IP_ADDR}
+derp_port=${DERP_PORT}
+stun_port=${STUN_PORT}
+cert_days=${CERT_DAYS}
+tailnet=${TS_TAILNET:-unset}
+etag=none
+policy_mode=manual
+lead_days=${CERT_LEAD_DAYS}
+EOF
+  print_acl_snippet_cert "$IP_ADDR" "$DERP_PORT" "$new_fp" >"$(cert_rotation_snippet_path)"
+  echo "[信息] 已准备候选证书，正式服务未切换。片段：$(cert_rotation_snippet_path)" >&2
+  echo "[信息] 旧指纹=${old_fp:-无} 新指纹=${new_fp}" >&2
+}
+
+cancel_cert_rotation() {
+  local root
+  root=$(cert_rotation_root)
+  rm -rf "$root"
+  echo "[信息] 已丢弃候选证书，正式证书未改动。" >&2
+}
+
+verify_switched_derper() {
+  local expect live
+  service_verified_running || return 1
+  expect=$(openssl x509 -in "$(derper_manual_cert_file)" -outform DER | sha256_hex) || return 1
+  live=$(live_cert_sha256_raw) || {
+    echo "[错误] 未能读取服务实际加载的证书指纹。" >&2
+    return 1
+  }
+  [[ "$live" == "$expect" ]] || {
+    echo "[错误] 服务加载的指纹与新证书不一致。" >&2
+    return 1
+  }
+}
+
+restore_service_after_cert_rollback() {
+  local was_running=0
+  [[ -f "${SERVICE_PATH}.certs-rollback/was-running" ]] && was_running=1
+  rollback_cert_update || return 1
+  if [[ "$was_running" -eq 1 ]]; then
+    if ! systemctl restart derper || ! verify_restored_service; then
+      echo "[错误] 旧证书已恢复，但原服务未能重新启动并通过验证。" >&2
+      return 1
+    fi
+  fi
+}
+
+_switch_live_certificate_from_candidate() {
+  local live_cert live_key cand_cert cand_key backup
+  live_cert=$(derper_manual_cert_file)
+  live_key=$(derper_manual_key_file)
+  cand_cert=$(cert_rotation_candidate_cert)
+  cand_key=$(cert_rotation_candidate_key)
+  [[ -f "$cand_cert" && -f "$cand_key" && ! -L "$cand_cert" && ! -L "$cand_key" ]] || return 1
+  refuse_symlink "$INSTALL_DIR" || return 1
+  refuse_symlink "${INSTALL_DIR}/certs" || return 1
+  refuse_symlink "$live_cert" || return 1
+  refuse_symlink "$live_key" || return 1
+  begin_cert_update || return 1
+  backup="${SERVICE_PATH}.certs-rollback"
+  if ! cp -p "$cand_cert" "$live_cert" || ! cp -p "$cand_key" "$live_key"; then
+    restore_service_after_cert_rollback || return 1
+    return 1
+  fi
+  if ! repair_cert_layout; then
+    restore_service_after_cert_rollback || return 1
+    return 1
+  fi
+  if [[ -f "$backup/was-running" ]]; then
+    if ! systemctl restart derper; then
+      restore_service_after_cert_rollback || return 1
+      return 1
+    fi
+    if ! verify_switched_derper; then
+      echo "[错误] 切换后服务未通过运行或指纹核验，已恢复旧证书。" >&2
+      restore_service_after_cert_rollback || return 1
+      return 1
+    fi
+  fi
+  archive_completed_cert_transaction || return 1
+}
+
+hujson_patch_certname() {
+  _hujson_invoke patch "$@"
+}
+
+_hujson_invoke() {
+  local hujson_mode="$1"
+  shift
+  local host="$2" region="$3" new="$4" old="${5:-}"
+  command -v python3 >/dev/null 2>&1 || { echo "[错误] 自动策略补丁需要 python3。" >&2; return 1; }
+  printf '%s' "$1" | env \
+    POLICY_HUJSON_MODE="$hujson_mode" \
+    POLICY_HUJSON_HOST="$host" POLICY_HUJSON_REGION="$region" POLICY_HUJSON_NEW="$new" POLICY_HUJSON_OLD="$old" \
+    POLICY_HUJSON_CODE="${REGION_CODE}" POLICY_HUJSON_NAME="${REGION_NAME}" \
+    POLICY_HUJSON_DERP="${DERP_PORT}" POLICY_HUJSON_STUN="${STUN_PORT}" \
+    python3 -c '
+import os, sys
+s = sys.stdin.read()
+host = os.environ["POLICY_HUJSON_HOST"]
+region = os.environ["POLICY_HUJSON_REGION"]
+new = os.environ["POLICY_HUJSON_NEW"]
+old = os.environ.get("POLICY_HUJSON_OLD") or ""
+code = os.environ.get("POLICY_HUJSON_CODE") or "my-derp"
+name = os.environ.get("POLICY_HUJSON_NAME") or "My IP DERP"
+derp = os.environ.get("POLICY_HUJSON_DERP") or "30399"
+stun = os.environ.get("POLICY_HUJSON_STUN") or "3478"
+
+def skip(t, i):
+    n = len(t)
+    while i < n:
+        if t[i] in " \t\r\n":
+            i += 1
+            continue
+        if t.startswith("//", i):
+            nl = t.find("\n", i)
+            i = n if nl < 0 else nl + 1
+            continue
+        if t.startswith("/*", i):
+            end = t.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+            continue
+        break
+    return i
+
+def parse_str(t, i):
+    assert t[i] == "\""
+    i += 1
+    out = []
+    while i < len(t):
+        c = t[i]
+        if c == "\\":
+            out.append(t[i:i+2]); i += 2; continue
+        if c == "\"":
+            return ("".join(out), i + 1)
+        out.append(c); i += 1
+    raise ValueError("unterminated string")
+
+def match(t, i, open_ch, close_ch):
+    depth = 0
+    n = len(t)
+    while i < n:
+        j = skip(t, i)
+        if j != i:
+            i = j
+            continue
+        if t[i] == "\"":
+            _, i = parse_str(t, i)
+            continue
+        if t[i] == open_ch:
+            depth += 1
+        elif t[i] == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+def object_fields(t, a, b):
+    fields = {}
+    i = a + 1
+    while i < b:
+        i = skip(t, i)
+        if i >= b or t[i] in "}]":
+            break
+        if t[i] != "\"":
+            i += 1
+            continue
+        key, i = parse_str(t, i)
+        i = skip(t, i)
+        if i < b and t[i] == ":":
+            i += 1
+        i = skip(t, i)
+        if i >= b:
+            break
+        if t[i] == "\"":
+            vs = i
+            val, i = parse_str(t, i)
+            fields[key] = ("str", val, vs, i)
+        elif t[i] == "{":
+            e = match(t, i, "{", "}")
+            if e < 0:
+                i = b
+            else:
+                fields[key] = ("obj", "", i, e + 1)
+                i = e + 1
+        elif t[i] == "[":
+            e = match(t, i, "[", "]")
+            if e < 0:
+                i = b
+            else:
+                fields[key] = ("arr", "", i, e + 1)
+                i = e + 1
+        else:
+            vs = i
+            while i < b and t[i] not in ",}":
+                i += 1
+            fields[key] = ("raw", t[vs:i].strip(), vs, i)
+        i = skip(t, i)
+        if i < b and t[i] == ",":
+            i += 1
+    return fields
+
+def iter_objects(t):
+    i = 0
+    n = len(t)
+    while i < n:
+        j = skip(t, i)
+        if j != i:
+            i = j
+            continue
+        if t[i] == "\"":
+            _, i = parse_str(t, i)
+            continue
+        if t[i] == "{":
+            e = match(t, i, "{", "}")
+            if e < 0:
+                break
+            yield i, e
+            i += 1
+            continue
+        i += 1
+
+def last_significant(t, a, b):
+    i = a + 1
+    last = ""
+    while i < b:
+        j = skip(t, i)
+        if j != i:
+            i = j
+            continue
+        if i >= b:
+            break
+        c = t[i]
+        if c == "\"":
+            _, i = parse_str(t, i)
+            last = "\""
+            continue
+        if c == "{":
+            e = match(t, i, "{", "}")
+            if e < 0:
+                break
+            last = "}"
+            i = e + 1
+            continue
+        if c == "[":
+            e = match(t, i, "[", "]")
+            if e < 0:
+                break
+            last = "]"
+            i = e + 1
+            continue
+        last = c
+        i += 1
+    return last
+
+def insert_before_close(t, a, b, payload):
+    last = last_significant(t, a, b)
+    prefix = "" if last in ("", ",") else ","
+    return t[:b] + prefix + payload + t[b:]
+
+def find_root(t):
+    i = skip(t, 0)
+    if i < len(t) and t[i] == "{":
+        e = match(t, i, "{", "}")
+        if e >= 0:
+            return i, e
+    return None
+
+matches = []
+for a, b in iter_objects(s):
+    f = object_fields(s, a, b)
+    if "HostName" not in f:
+        continue
+    hn = f["HostName"][1]
+    if hn != host:
+        continue
+    rid = ""
+    if "RegionID" in f:
+        rid = f["RegionID"][1]
+    matches.append((a, b, f, rid))
+
+host_hits = [m for m in matches if m[2]["HostName"][1] == host]
+tool_mode = os.environ.get("POLICY_HUJSON_MODE") or "patch"
+if tool_mode == "read":
+    scoped = []
+    for item in host_hits:
+        rid = item[3]
+        if (not region) or rid == str(region) or rid == "":
+            scoped.append(item)
+    if len(scoped) == 1 and "CertName" in scoped[0][2]:
+        sys.stdout.write(scoped[0][2]["CertName"][1])
+    sys.exit(0)
+if len(host_hits) > 1:
+    sys.stderr.write("conflict: duplicate HostName\n")
+    sys.exit(2)
+if len(host_hits) == 1:
+    a, b, f, rid = host_hits[0]
+    if rid and rid != str(region):
+        sys.stderr.write("conflict: HostName region mismatch\n")
+        sys.exit(2)
+    if "CertName" not in f:
+        sys.stderr.write("missing CertName\n")
+        sys.exit(2)
+    cur = f["CertName"][1]
+    if old:
+        if cur != old:
+            sys.stderr.write("conflict: old fingerprint\n")
+            sys.exit(2)
+    else:
+        sys.stderr.write("target exists\n")
+        sys.exit(2)
+    vs, ve = f["CertName"][2], f["CertName"][3]
+    sys.stdout.write(s[:vs] + "\"" + new + "\"" + s[ve:])
+    sys.exit(0)
+
+# append
+node = "{\"Name\":\"%sa\",\"RegionID\":%s,\"HostName\":\"%s\",\"DERPPort\":%s,\"STUNPort\":%s,\"CertName\":\"%s\"}" % (
+    region, region, host, derp, stun, new)
+region_obj = "\"%s\":{\"RegionID\":%s,\"RegionCode\":\"%s\",\"RegionName\":\"%s\",\"Nodes\":[%s]}" % (
+    region, region, code.replace("\\", "\\\\").replace("\"", "\\\""), name.replace("\\", "\\\\").replace("\"", "\\\""), node)
+
+# existing region?
+region_span = None
+for a, b in iter_objects(s):
+    f = object_fields(s, a, b)
+    if "RegionID" in f and f["RegionID"][1] == str(region) and "Nodes" in f:
+        region_span = (a, b)
+        break
+if region_span:
+    a, b = region_span
+    rf = object_fields(s, a, b)
+    if "Nodes" not in rf or rf["Nodes"][0] != "arr":
+        sys.stderr.write("nodes array missing\n")
+        sys.exit(2)
+    ns, ne = rf["Nodes"][2], rf["Nodes"][3] - 1
+    insert = node
+    if last_significant(s, ns, ne) not in ("", ","):
+        insert = "," + insert
+    sys.stdout.write(s[:ne] + insert + s[ne:])
+    sys.exit(0)
+
+# insert region into derpMap.Regions or create
+# find object with OmitDefaultRegions or key Regions containing RegionID children — locate "Regions" object by scanning keys of objects that have Regions nested. Simpler: find the substring '"Regions"' as a key outside comments via object_fields of derpMap-like objects.
+regions_obj = None
+for a, b in iter_objects(s):
+    f = object_fields(s, a, b)
+    if "Regions" in f or "OmitDefaultRegions" in f:
+        # the Regions value is nested; find child object after the Regions key
+        i = a + 1
+        while i < b:
+            i = skip(s, i)
+            if i >= b or s[i] != "\"":
+                if i < b:
+                    if s[i] == "{":
+                        i = match(s, i, "{", "}") + 1
+                    else:
+                        i += 1
+                continue
+            key, i = parse_str(s, i)
+            i = skip(s, i)
+            if i < b and s[i] == ":":
+                i += 1
+            i = skip(s, i)
+            if key == "Regions" and i < b and s[i] == "{":
+                e = match(s, i, "{", "}")
+                regions_obj = (i, e)
+                break
+            if i < b and s[i] == "{":
+                i = match(s, i, "{", "}") + 1
+            elif i < b and s[i] == "[":
+                i = match(s, i, "[", "]") + 1
+            elif i < b and s[i] == "\"":
+                _, i = parse_str(s, i)
+            else:
+                while i < b and s[i] not in ",}":
+                    i += 1
+        if regions_obj:
+            break
+if regions_obj:
+    a, b = regions_obj
+    last = last_significant(s, a, b)
+    prefix = "" if last in ("", ",") else ","
+    sys.stdout.write(s[:b] + prefix + region_obj + s[b:])
+    sys.exit(0)
+
+root = find_root(s)
+if not root:
+    sys.stderr.write("policy root is not an object\n")
+    sys.exit(2)
+ra, rb = root
+rf = object_fields(s, ra, rb)
+if "derpMap" not in rf:
+    payload = "\"derpMap\":{\"Regions\":{" + region_obj + "}}"
+    sys.stdout.write(insert_before_close(s, ra, rb, payload))
+    sys.exit(0)
+if rf["derpMap"][0] != "obj":
+    sys.stderr.write("derpMap is not an object\n")
+    sys.exit(2)
+ds, de = rf["derpMap"][2], rf["derpMap"][3] - 1
+df = object_fields(s, ds, de)
+if "Regions" in df:
+    if df["Regions"][0] != "obj":
+        sys.stderr.write("Regions is not an object\n")
+        sys.exit(2)
+    rs, re_ = df["Regions"][2], df["Regions"][3] - 1
+    last = last_significant(s, rs, re_)
+    prefix = "" if last in ("", ",") else ","
+    sys.stdout.write(s[:re_] + prefix + region_obj + s[re_:])
+    sys.exit(0)
+payload = "\"Regions\":{" + region_obj + "}"
+sys.stdout.write(insert_before_close(s, ds, de, payload))
+sys.exit(0)
+' || return 1
+}
+
+load_policy_credentials() {
+  local file="${POLICY_CREDENTIAL_FILE:-}" line key value uid mode
+  TS_API_CLIENT_ID=""; TS_API_CLIENT_SECRET=""; POLICY_SOURCE=""; POLICY_TOKEN=""; POLICY_GRANTED_SCOPE=""
+  [[ -n "${TS_TAILNET:-}" ]] || true
+  [[ -n "$file" && -f "$file" && ! -L "$file" ]] || return 1
+  if [[ "$(id -u 2>/dev/null || true)" == 0 ]]; then
+    uid=$(stat -c %u "$file" 2>/dev/null || stat -f %u "$file") || return 1
+    mode=$(stat -c %a "$file" 2>/dev/null || stat -f %Lp "$file") || return 1
+    [[ "$uid" == 0 ]] && (( (8#$mode & 0077) == 0 )) || { echo "[错误] 策略凭据必须归 root 且权限为 0600。" >&2; return 1; }
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=${line%$'\r'}
+    line="${line#"${line%%[![:space:]]*}"}"
+    [[ -n "$line" && "$line" != \#* ]] || continue
+    [[ "$line" == *=* ]] || return 1
+    key=${line%%=*}; value=${line#*=}
+    case "$value" in *'$'*|*'`'*|*';'*|*'|'*|*'&'*) echo "[错误] 凭据文件不允许 shell 语法。" >&2; return 1 ;; esac
+    case "$key" in
+      TS_TAILNET) TS_TAILNET=$value ;;
+      TS_API_CLIENT_ID) TS_API_CLIENT_ID=$value ;;
+      TS_API_CLIENT_SECRET) TS_API_CLIENT_SECRET=$value ;;
+      TS_API_BASE) TS_API_BASE=$value ;;
+      TS_API_TOKEN) POLICY_TOKEN=$value ;;
+      POLICY_SOURCE) POLICY_SOURCE=$value ;;
+      *) echo "[错误] 凭据文件含未知字段。" >&2; return 1 ;;
+    esac
+  done <"$file"
+  return 0
+}
+
+policy_http_request() {
+  local method="$1" urlpath="$2" body="${3:-}" url out rc=0
+  url="${TS_API_BASE}${urlpath}"
+  if ! command -v curl >/dev/null 2>&1; then
+    echo "[错误] 缺少 curl，无法访问策略 API。" >&2
+    return 1
+  fi
+  local args=(-sS -D - --max-time 20 -X "$method")
+  [[ -n "${POLICY_TOKEN:-}" ]] && args+=(-H "Authorization: Bearer ${POLICY_TOKEN}")
+  case "$urlpath" in
+    */acl|*/acl/validate) args+=(-H "Accept: application/hujson") ;;
+  esac
+  if [[ "$method" == POST && "$urlpath" == */acl/validate ]]; then
+    args+=(-H "Content-Type: application/hujson")
+  fi
+  if [[ "$method" == POST && "$urlpath" == */acl && "$urlpath" != */validate ]]; then
+    [[ -n "${POLICY_IF_MATCH:-}" ]] && args+=(-H "If-Match: ${POLICY_IF_MATCH}")
+    args+=(-H "Content-Type: application/hujson")
+  fi
+  if [[ "$urlpath" == */oauth/token ]]; then
+    args+=(-H "Content-Type: application/x-www-form-urlencoded")
+  fi
+  if [[ -n "$body" ]]; then
+    out=$(curl "${args[@]}" --data-binary "$body" "$url") || rc=$?
+  else
+    out=$(curl "${args[@]}" "$url") || rc=$?
+  fi
+  printf '%s' "$out"
+  return "$rc"
+}
+
+_policy_http_status() {
+  local out="$1" line
+  line=$(printf '%s\n' "$out" | head -n 1 | tr -d '\r')
+  case "$line" in
+    HTTP/*)
+      printf '%s\n' "$line" | awk '{print $2}'
+      ;;
+    *)
+      printf '200\n'
+      ;;
+  esac
+}
+
+_policy_http_body() {
+  local out="$1"
+  if printf '%s\n' "$out" | grep -q $'^etag:'; then
+    printf '%s\n' "$out" | awk 'BEGIN{b=0} /^etag:/{next} /^\r?$/{b=1; next} b{print}'
+    return 0
+  fi
+  printf '%s\n' "$out" | awk 'BEGIN{b=0} /^\r?$/{b=1; next} b{print}'
+}
+
+_policy_http_etag() {
+  local out="$1"
+  printf '%s\n' "$out" | awk 'tolower($1)=="etag:"{sub("\r",""); $1=""; sub(/^ /,""); print; exit}'
+}
+
+obtain_policy_token() {
+  [[ -n "${POLICY_TOKEN:-}" ]] && return 0
+  [[ -n "${TS_API_CLIENT_ID:-}" && -n "${TS_API_CLIENT_SECRET:-}" ]] || return 1
+  local body out rc=0 status parsed token scope
+  body="grant_type=client_credentials&client_id=${TS_API_CLIENT_ID}&client_secret=${TS_API_CLIENT_SECRET}&scope=policy_file"
+  out=$(policy_http_request POST /api/v2/oauth/token "$body") || rc=$?
+  [[ "$rc" -eq 0 ]] || return "$rc"
+  status=$(_policy_http_status "$out")
+  case "$status" in
+    2*) ;;
+    *) return 1 ;;
+  esac
+  command -v python3 >/dev/null 2>&1 || { echo "[错误] 解析 OAuth 响应需要 python3。" >&2; return 1; }
+  parsed=$(printf '%s\n' "$out" | python3 -c '
+import json, sys
+raw = sys.stdin.read()
+if "\r\n\r\n" in raw:
+    raw = raw.split("\r\n\r\n", 1)[1]
+elif "\n\n" in raw:
+    raw = raw.split("\n\n", 1)[1]
+raw = raw.strip()
+token = ""
+scope = ""
+if raw.startswith("{"):
+    try:
+        data = json.loads(raw)
+    except Exception:
+        sys.exit(1)
+    token = data.get("access_token") or ""
+    scope = data.get("scope") or ""
+    if isinstance(scope, list):
+        scope = " ".join(str(item) for item in scope)
+else:
+    text = raw.replace("&", "\n").replace(",", "\n").replace("{", "\n").replace("}", "\n").replace("\"", "")
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("access_token="):
+            token = line.split("=", 1)[1].strip()
+        elif line.startswith("scope="):
+            scope = line.split("=", 1)[1].strip()
+if not token:
+    sys.exit(1)
+sys.stdout.write(token + "\n" + str(scope) + "\n")
+') || return 1
+  token=$(printf '%s\n' "$parsed" | sed -n '1p')
+  scope=$(printf '%s\n' "$parsed" | sed -n '2p')
+  [[ -n "$token" ]] || return 1
+  POLICY_TOKEN=$token
+  POLICY_GRANTED_SCOPE=$scope
+}
+
+policy_target_is_configured() {
+  local tailnet="${TS_TAILNET:-}"
+  [[ -n "${tailnet//[[:space:]]/}" ]]
+}
+
+policy_auth_state() {
+  if ! load_policy_credentials 2>/dev/null; then
+    printf 'none\n'
+    return 0
+  fi
+  if [[ "${POLICY_SOURCE:-}" == gitops ]]; then
+    printf 'gitops\n'
+    return 0
+  fi
+  if ! policy_target_is_configured; then
+    printf 'none\n'
+    return 0
+  fi
+  if [[ -z "$TS_API_CLIENT_ID$POLICY_TOKEN" ]]; then
+    printf 'none\n'
+    return 0
+  fi
+  local rc=0
+  obtain_policy_token || rc=$?
+  if [[ "$rc" -eq 28 ]]; then
+    printf 'unknown\n'
+    return 0
+  fi
+  if [[ "$rc" -ne 0 || -z "$POLICY_TOKEN" ]]; then
+    printf 'none\n'
+    return 0
+  fi
+  local scope="${POLICY_GRANTED_SCOPE:-}"
+  if [[ -z "$scope" ]]; then
+    printf 'unknown\n'
+    return 0
+  fi
+  if printf '%s' "$scope" | grep -Eq '(^|[ ,])policy_file($|[ ,])'; then
+    printf 'write_ready\n'
+  elif printf '%s' "$scope" | grep -q 'policy_file:read'; then
+    printf 'read_only\n'
+  else
+    printf 'unknown\n'
+  fi
+}
+
+auto_maintain_consented() {
+  local intent mode
+  [[ "${DISABLE_AUTO_MAINTAIN:-0}" == 1 ]] && return 1
+  intent=$(read_maintenance_kv intent 2>/dev/null || true)
+  mode=$(read_maintenance_kv mode 2>/dev/null || true)
+  [[ "${ENABLE_AUTO_MAINTAIN:-0}" == 1 ]] && return 0
+  [[ "$intent" == enabled ]] && return 0
+  [[ "$intent" != disabled && "$mode" == ready ]] && return 0
+  return 1
+}
+
+evaluate_auto_maintain_readiness() {
+  local auth
+  if [[ "${DISABLE_AUTO_MAINTAIN:-0}" == 1 ]]; then
+    printf 'manual\n'
+    return 0
+  fi
+  # 用户启用意图与调度安装结果分开保存；授权恢复和维护重试不能抹去调度失败。
+  if [[ "$(maintenance_scheduler_state)" == failed ]]; then
+    printf 'unknown\n'
+    return 0
+  fi
+  auth=$(policy_auth_state)
+  case "$auth" in
+    gitops|none|read_only)
+      printf 'manual\n'
+      ;;
+    unknown)
+      printf 'unknown\n'
+      ;;
+    write_ready)
+      if auto_maintain_consented; then
+        printf 'ready\n'
+      else
+        printf 'manual\n'
+      fi
+      ;;
+    *)
+      printf 'unknown\n'
+      ;;
+  esac
+}
+
+print_auto_maintain_feedback() {
+  local mode="$1" days
+  days=$(cert_days_remaining || true)
+  echo "[信息] 服务器已部署。"
+  case "$mode" in
+    ready)
+      echo "云端授权和维护任务已就绪；已启用本节点自动换证及指纹同步。"
+      echo "当前证书剩余约 ${days:-未知} 天；提前维护 ${CERT_LEAD_DAYS} 天；结果查看：$(maintenance_status_path) 与 journalctl -u derper-cert-maintain。"
+      echo "当前没有站外通知。"
+      ;;
+    unknown)
+      echo "云端检查超时/授权状态无法确认/维护执行条件未就绪，目前不能承诺自动更新。"
+      echo "请查看原因后重试；也可按下面的人工步骤处理。不要把当前状态当成确定的授权结论。"
+      print_client_verify_steps
+      ;;
+    *)
+      echo "未配置云端自动维护授权/当前凭据只读，因此没有启用自动换证。请按以下步骤完成 Tailnet 配置；临期仍会提示。"
+      echo "片段已保存：$(cert_rotation_snippet_path 2>/dev/null || echo 见部署输出)。"
+      print_client_verify_steps
+      ;;
+  esac
+}
+
+policy_get_acl() {
+  local out rc=0
+  out=$(policy_http_request GET "/api/v2/tailnet/${TS_TAILNET}/acl") || rc=$?
+  [[ "$rc" -eq 0 ]] || return "$rc"
+  POLICY_HTTP_STATUS=$(_policy_http_status "$out")
+  POLICY_IF_MATCH=$(_policy_http_etag "$out")
+  _policy_http_body "$out"
+}
+
+policy_load_acl() {
+  local out rc=0
+  out=$(policy_http_request GET "/api/v2/tailnet/${TS_TAILNET}/acl") || rc=$?
+  [[ "$rc" -eq 0 ]] || return "$rc"
+  POLICY_HTTP_STATUS=$(_policy_http_status "$out")
+  case "$POLICY_HTTP_STATUS" in
+    2*) ;;
+    *) echo "[错误] 读取云端策略失败，HTTP ${POLICY_HTTP_STATUS}。" >&2; return 1 ;;
+  esac
+  POLICY_IF_MATCH=$(_policy_http_etag "$out")
+  POLICY_ACL_BODY=$(_policy_http_body "$out")
+  [[ -n "$POLICY_IF_MATCH" ]] || { echo "[错误] 策略响应没有 ETag，拒绝自动提交。" >&2; return 1; }
+}
+
+policy_validate_acl() {
+  local body="$1" out rc=0 status response
+  out=$(policy_http_request POST "/api/v2/tailnet/${TS_TAILNET}/acl/validate" "$body") || rc=$?
+  [[ "$rc" -eq 0 ]] || return "$rc"
+  status=$(_policy_http_status "$out")
+  POLICY_HTTP_STATUS=$status
+  response=$(_policy_http_body "$out")
+  case "$status" in
+    2*) ;;
+    *) echo "[错误] 策略 validate 被拒绝，HTTP ${status}。" >&2; return 1 ;;
+  esac
+  if printf '%s' "$response" | grep -q '"message"'; then
+    echo "[错误] 策略 validate 返回错误。" >&2
+    return 1
+  fi
+}
+
+policy_put_acl() {
+  local body="$1" out rc=0 status
+  out=$(policy_http_request POST "/api/v2/tailnet/${TS_TAILNET}/acl" "$body") || rc=$?
+  status=$(_policy_http_status "$out")
+  POLICY_HTTP_STATUS=$status
+  if [[ "$rc" -ne 0 ]]; then
+    return "$rc"
+  fi
+  case "$status" in
+    2*) printf '%s' "$out" ;;
+    *) return 1 ;;
+  esac
+}
+
+_cloud_certname_from_acl() {
+  local acl="$1" host="$2" region="${3:-${REGION_ID:-}}"
+  _hujson_invoke read "$acl" "$host" "$region" placeholder "" 2>/dev/null || true
+}
+
+sync_policy_for_candidate() {
+  local old_fp new_fp old_name new_name acl patched rc=0 readback current
+  old_fp=$(read_rotation_kv old_sha256)
+  new_fp=$(read_rotation_kv new_sha256)
+  [[ "$old_fp" == none ]] && old_fp=""
+  old_name=""; [[ -n "$old_fp" ]] && old_name="sha256-raw:${old_fp}"
+  new_name="sha256-raw:${new_fp}"
+  if ! policy_load_acl; then
+    echo "[错误] 无法读取云端策略。" >&2
+    return 1
+  fi
+  acl=$POLICY_ACL_BODY
+  patched=$(hujson_patch_certname "$acl" "$IP_ADDR" "$REGION_ID" "$new_name" "$old_name") || {
+    echo "[错误] 云端目标冲突或无法生成最小补丁，已转人工协调。" >&2
+    write_rotation_record <<EOF
+kind=cert-rotation
+phase=needs_coordination
+old_sha256=${old_fp:-none}
+new_sha256=${new_fp}
+region_id=${REGION_ID}
+ip=${IP_ADDR}
+derp_port=${DERP_PORT}
+stun_port=${STUN_PORT}
+cert_days=${CERT_DAYS}
+tailnet=${TS_TAILNET:-unset}
+etag=none
+policy_mode=manual
+lead_days=${CERT_LEAD_DAYS}
+EOF
+    write_maintenance_status unknown needs_coordination "云端目标冲突" 1
+    return 1
+  }
+  policy_validate_acl "$patched" || { echo "[错误] 策略 validate 失败，未提交。" >&2; return 1; }
+  rc=0
+  policy_put_acl "$patched" >/dev/null || rc=$?
+  if [[ "${POLICY_HTTP_STATUS:-}" == 412 ]]; then
+    echo "[错误] 云端 ETag 冲突，其他人可能已修改策略。待协调，未切换本地证书。" >&2
+    write_maintenance_status unknown needs_coordination "ETag冲突" 1
+    write_rotation_record <<EOF
+kind=cert-rotation
+phase=needs_coordination
+old_sha256=${old_fp:-none}
+new_sha256=${new_fp}
+region_id=${REGION_ID}
+ip=${IP_ADDR}
+derp_port=${DERP_PORT}
+stun_port=${STUN_PORT}
+cert_days=${CERT_DAYS}
+tailnet=${TS_TAILNET:-unset}
+etag=none
+policy_mode=manual
+lead_days=${CERT_LEAD_DAYS}
+EOF
+    return 1
+  fi
+  if ! policy_load_acl; then
+    POLICY_ACL_BODY=""
+  fi
+  current=$(_cloud_certname_from_acl "${POLICY_ACL_BODY:-}" "$IP_ADDR")
+  if [[ "$current" == "$new_name" ]]; then
+    return 0
+  fi
+  if [[ "$rc" -eq 28 ]]; then
+    echo "[错误] 策略提交超时且读回未确认新指纹，不把超时当作未写入成功，也不切换本地。" >&2
+    write_maintenance_status unknown needs_coordination "提交超时待确认" 1
+    return 1
+  fi
+  if [[ -n "$current" && "$current" != "$old_name" && "$current" != "$new_name" ]]; then
+    echo "[错误] 云端 CertName 已被他人改动，停止自动回退，待协调。" >&2
+    write_maintenance_status unknown needs_coordination "他人已改目标" 1
+    return 1
+  fi
+  echo "[错误] 云端未接受本次 CertName 更新。" >&2
+  return 1
+}
+
+assert_prepared_identity() {
+  local rec_ip rec_region rec_derp rec_stun rec_tail rec_new rec_old cand live cur
+  rec_ip=$(read_rotation_kv ip) || return 1
+  rec_region=$(read_rotation_kv region_id) || return 1
+  rec_derp=$(read_rotation_kv derp_port) || return 1
+  rec_stun=$(read_rotation_kv stun_port) || return 1
+  rec_tail=$(read_rotation_kv tailnet) || return 1
+  rec_new=$(read_rotation_kv new_sha256) || return 1
+  rec_old=$(read_rotation_kv old_sha256) || return 1
+  if [[ "$rec_ip" != "$IP_ADDR" || "$rec_region" != "$REGION_ID" || "$rec_derp" != "$DERP_PORT" || "$rec_stun" != "$STUN_PORT" ]]; then
+    echo "[错误] 本次参数与 prepare 记录的目标身份不一致，请重新 prepare。" >&2
+    return 1
+  fi
+  if [[ -n "${TS_TAILNET:-}" && "$rec_tail" != unset && "$rec_tail" != "$TS_TAILNET" ]]; then
+    echo "[错误] Tailnet 与 prepare 记录不一致，请重新 prepare。" >&2
+    return 1
+  fi
+  cand=$(cert_rotation_candidate_cert)
+  [[ -f "$cand" && ! -L "$cand" ]] || { echo "[错误] 候选证书不存在，请重新 prepare。" >&2; return 1; }
+  cert_contains_ip_san "$cand" "$IP_ADDR" || { echo "[错误] 候选证书 SAN 与目标 IP 不一致，请重新 prepare。" >&2; return 1; }
+  cert_public_matches_key "$cand" "$(cert_rotation_candidate_key)" || { echo "[错误] 候选证书与私钥不匹配，请重新 prepare。" >&2; return 1; }
+  cur=$(openssl x509 -in "$cand" -outform DER | sha256_hex) || return 1
+  [[ "$cur" == "$rec_new" ]] || { echo "[错误] 候选指纹与 prepare 记录不一致，请重新 prepare。" >&2; return 1; }
+  live=$(resolve_disk_cert_pem || true)
+  if [[ "$rec_old" == none || -z "$rec_old" ]]; then
+    if [[ -n "$live" && -f "$live" ]]; then
+      echo "[错误] prepare 之后出现了正式证书，请重新 prepare。" >&2
+      return 1
+    fi
+  else
+    [[ -n "$live" && -f "$live" && ! -L "$live" ]] || { echo "[错误] 正式证书已变化，请重新 prepare。" >&2; return 1; }
+    cur=$(openssl x509 -in "$live" -outform DER | sha256_hex) || return 1
+    [[ "$cur" == "$rec_old" ]] || { echo "[错误] 正式证书指纹与 prepare 记录不一致，请重新 prepare。" >&2; return 1; }
+  fi
+}
+
+apply_cert_rotation() {
+  local phase auth auto=0 auth_file
+  if [[ "${DISABLE_AUTO_MAINTAIN:-0}" == 1 && "${ACCEPT_CERT_ROTATION:-0}" -ne 1 ]]; then
+    echo "[信息] 已请求停用自动维护，本次不按历史授权切换证书。" >&2
+    return 0
+  fi
+  # 在任何云端指纹变更前拒绝不安全的安装根目录；底层切换仍在事务前复查。
+  refuse_symlink "$INSTALL_DIR" || return 1
+  load_policy_credentials 2>/dev/null || true
+  [[ -f "$(cert_rotation_record_path)" ]] || { echo "[错误] 没有可应用的候选，请先 prepare。" >&2; return 1; }
+  phase=$(read_rotation_kv phase) || return 1
+  [[ "$phase" == prepared || "$phase" == needs_coordination ]] || { echo "[错误] 候选阶段不是 prepared。" >&2; return 1; }
+  assert_prepared_identity || return 1
+  auth_file=$(mktemp)
+  policy_auth_state >"$auth_file"
+  auth=$(cat "$auth_file")
+  rm -f "$auth_file"
+  if auto_maintain_consented; then
+    if [[ "$auth" == write_ready ]]; then
+      auto=1
+    fi
+  fi
+  if [[ "$auto" -eq 1 ]]; then
+    sync_policy_for_candidate || return 1
+  else
+    if [[ "${ACCEPT_CERT_ROTATION:-0}" -ne 1 ]]; then
+      echo "[中止] --yes 不确认指纹轮换；安排变更窗口后使用 --accept-cert-rotation。原证书保持不变。" >&2
+      return 1
+    fi
+  fi
+  _switch_live_certificate_from_candidate || {
+    if [[ "$auto" -eq 1 ]]; then
+      echo "[错误] 本地切换失败。若云端仍指向新指纹，请人工协调，脚本不会回写整份旧策略。" >&2
+      write_maintenance_status ready needs_coordination "本地切换失败待协调" 1
+    fi
+    return 1
+  }
+  write_rotation_record <<EOF
+kind=cert-rotation
+phase=applied
+old_sha256=$(read_rotation_kv old_sha256)
+new_sha256=$(read_rotation_kv new_sha256)
+region_id=${REGION_ID}
+ip=${IP_ADDR}
+derp_port=${DERP_PORT}
+stun_port=${STUN_PORT}
+cert_days=${CERT_DAYS}
+tailnet=${TS_TAILNET:-unset}
+etag=none
+policy_mode=$([[ "$auto" -eq 1 ]] && echo auto || echo manual)
+lead_days=${CERT_LEAD_DAYS}
+EOF
+  echo "[信息] 已切换本地证书。单节点 CertName 更新不是原子操作，不承诺零中断。" >&2
+  echo "[信息] 未验证独立客户端是否已收到新指纹；真实 H3 另验。" >&2
+}
+
+cert_rotation_is_due() {
+  local days lead
+  days=$(cert_days_remaining || true)
+  lead="${CERT_LEAD_DAYS:-30}"
+  [[ "$days" =~ ^-?[0-9]+$ ]] || return 1
+  [[ "$lead" =~ ^[0-9]+$ ]] || return 1
+  [[ "$lead" -lt 1 ]] && return 1
+  if [[ -n "$days" && "$days" -le "$lead" ]]; then
+    return 0
+  fi
+  return 1
+}
+
+run_cert_maintain() {
+  local mode
+  mode=$(evaluate_auto_maintain_readiness)
+  if [[ "$mode" != ready ]]; then
+    write_maintenance_status "$mode" skipped "条件不满足，未更换证书" 1
+    echo "[信息] 维护条件为 ${mode}，保留现有有效证书。" >&2
+    return 1
+  fi
+  if ! cert_rotation_is_due; then
+    write_maintenance_status ready idle "未到提前维护日期" 0
+    return 0
+  fi
+  prepare_cert_rotation || { write_maintenance_status ready failed "prepare失败" 1; return 1; }
+  ENABLE_AUTO_MAINTAIN=1
+  if apply_cert_rotation; then
+    write_maintenance_status ready success_replaced "已按登记策略换证" 0
+    return 0
+  fi
+  write_maintenance_status ready failed "换证失败已保留候选" 1
+  return 1
+}
+
+write_maintain_target_config() {
+  local file="$1" tmp dir
+  dir=$(dirname "$file")
+  mkdir -p "$dir" || return 1
+  tmp=$(mktemp "${dir}/.target.XXXXXX") || return 1
+  {
+    printf 'CONFIG_VERSION=1\n'
+    [[ -n "${IP_ADDR:-}" ]] && printf 'IP_ADDR=%s\n' "$IP_ADDR"
+    printf 'DERP_PORT=%s\n' "$DERP_PORT"
+    printf 'STUN_PORT=%s\n' "$STUN_PORT"
+    printf 'CERT_DAYS=%s\n' "$CERT_DAYS"
+    printf 'CERT_LEAD_DAYS=%s\n' "${CERT_LEAD_DAYS:-30}"
+    printf 'REGION_ID=%s\n' "$REGION_ID"
+    printf 'REGION_CODE=%s\n' "$REGION_CODE"
+    printf 'REGION_NAME=%s\n' "$REGION_NAME"
+    printf 'ALLOW_NON_GLOBAL_IP=%s\n' "${ALLOW_NON_GLOBAL_IP:-0}"
+    printf 'RUN_USER=%s\n' "$RUN_USER"
+    printf 'VERIFY_CLIENTS_MODE=%s\n' "$VERIFY_CLIENTS_MODE"
+    [[ -n "${TS_TAILNET:-}" ]] && printf 'TS_TAILNET=%s\n' "$TS_TAILNET"
+    [[ -n "${POLICY_CREDENTIAL_FILE:-}" ]] && printf 'POLICY_CREDENTIAL_FILE=%s\n' "$POLICY_CREDENTIAL_FILE"
+  } >"$tmp" || { rm -f "$tmp"; return 1; }
+  chmod 600 "$tmp" || { rm -f "$tmp"; return 1; }
+  mv -f "$tmp" "$file"
+}
+
+activate_cert_maintain_timer() {
+  command -v systemctl >/dev/null 2>&1 || { echo "[错误] 未找到 systemctl，不能启用维护 timer。" >&2; return 1; }
+  systemctl daemon-reload || return 1
+  systemctl enable --now derper-cert-maintain.timer || return 1
+  systemctl is-enabled --quiet derper-cert-maintain.timer || return 1
+  systemctl is-active --quiet derper-cert-maintain.timer || return 1
+}
+
+install_cert_maintain_units() {
+  local unit_dir self dest svc timer lib conf prog conf_esc
+  unit_dir="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+  mkdir -p "$unit_dir" || return 1
+  self=$(script_self_path 2>/dev/null || true)
+  [[ -n "$self" && -f "$self" && ! -L "$self" ]] || { echo "[错误] 找不到部署脚本，不能安装维护任务。" >&2; return 1; }
+  lib="$(deploy_state_root)/maintenance"
+  mkdir -p "$lib" || return 1
+  chmod 700 "$lib" 2>/dev/null || true
+  dest="${lib}/deploy_derper_ip_selfsigned.sh"
+  if [[ "$self" != "$dest" ]]; then
+    atomic_copy_file "$self" "$dest" || return 1
+  fi
+  chmod 755 "$dest" || return 1
+  conf="${lib}/target.conf"
+  write_maintain_target_config "$conf" || return 1
+  svc="${unit_dir}/derper-cert-maintain.service"
+  timer="${unit_dir}/derper-cert-maintain.timer"
+  prog=$(systemd_escape_arg "$dest")
+  conf_esc=$(systemd_escape_arg "$conf")
+  atomic_install_file "$svc" <<EOF || return 1
+[Unit]
+Description=DERP certificate maintenance
+After=network-online.target
+[Service]
+Type=oneshot
+ExecStart=/bin/bash ${prog} maintain --config ${conf_esc}
+Nice=10
+EOF
+  atomic_install_file "$timer" <<'EOF' || return 1
+[Unit]
+Description=Periodic DERP certificate maintenance
+[Timer]
+OnCalendar=daily
+Persistent=true
+[Install]
+WantedBy=timers.target
+EOF
+  echo "[信息] 已写出独立维护任务 ${svc} / ${timer}。凭据仍只在 ${POLICY_CREDENTIAL_FILE}。" >&2
+}
+
+remove_cert_maintain_units() {
+  local unit_dir svc timer
+  unit_dir="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}"
+  svc="${unit_dir}/derper-cert-maintain.service"
+  timer="${unit_dir}/derper-cert-maintain.timer"
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl disable --now derper-cert-maintain.timer >/dev/null 2>&1 || true
+    systemctl disable --now derper-cert-maintain.service >/dev/null 2>&1 || true
+  fi
+  rm -f "$svc" "$timer"
+  [[ ! -e "$svc" && ! -e "$timer" ]]
+}
+
+apply_auto_maintain_policy() {
+  if [[ "${DISABLE_AUTO_MAINTAIN:-0}" == 1 ]]; then
+    write_maintenance_status manual disabled "已关闭自动换证" 0 "" disabled disabled || return 1
+    remove_cert_maintain_units || {
+      echo "[警告] 未能完全删除维护 timer，已记录为人工维护。" >&2
+    }
+    return 0
+  fi
+  if [[ "${ENABLE_AUTO_MAINTAIN:-0}" == 1 ]]; then
+    # 在父 shell 中加载有效目标，使定时配置也保存凭据文件提供的 Tailnet。
+    load_policy_credentials 2>/dev/null || true
+    if ! policy_target_is_configured; then
+      echo "[错误] 未配置有效 TS_TAILNET，不能启用自动维护。请在部署配置或独立凭据文件中指定目标。" >&2
+      return 1
+    fi
+  fi
+  if [[ "${ENABLE_AUTO_MAINTAIN:-0}" == 1 && "$(policy_auth_state)" == write_ready ]]; then
+    if ! install_cert_maintain_units; then
+      write_maintenance_status unknown failed "未能安装维护任务" 1 "" "" failed || true
+      echo "[警告] 未能安装维护 timer，未登记为就绪。" >&2
+      return 1
+    fi
+    if ! activate_cert_maintain_timer; then
+      write_maintenance_status unknown failed "未能启用维护 timer" 1 "" "" failed || true
+      echo "[警告] 未能启用维护 timer，未登记为就绪。" >&2
+      return 1
+    fi
+    write_maintenance_status ready recorded "已登记本节点自动换证" 0 "" enabled ready || return 1
+  fi
+}
+
+finish_deploy_auto_maintain() {
+  local rc=0
+  apply_auto_maintain_policy || rc=$?
+  print_auto_maintain_feedback "$(evaluate_auto_maintain_readiness)"
+  [[ "$(maintenance_scheduler_state)" != failed ]] || rc=1
+  return "$rc"
+}
+
+run_d_stage_command() {
+  case "$SUBCOMMAND" in
+    prepare) prepare_cert_rotation ;;
+    apply) apply_cert_rotation ;;
+    cancel) cancel_cert_rotation ;;
+    maintain) run_cert_maintain ;;
+    *) return 1 ;;
+  esac
+}
+
+
 generate_selfsigned_cert() {
   echo "[步骤] 生成基于 IP 的自签临时证书（SAN=IP:${IP_ADDR}）…"
   mkdir -p "${INSTALL_DIR}"
@@ -4966,6 +6345,30 @@ remove_healthcheck_cron() {
   fi
 }
 
+purge_maintain_program() {
+  local dir
+  dir="$(deploy_state_root)/maintenance"
+  [[ -e "$dir" || -L "$dir" ]] || return 0
+  refuse_symlink "$dir" || return 1
+  [[ -d "$dir" ]] || { echo "[错误] 维护副本路径不是目录：${dir}" >&2; return 1; }
+  if ! rm -f -- "${dir}/deploy_derper_ip_selfsigned.sh" "${dir}/target.conf"; then
+    echo "[错误] 无法删除维护脚本或配置：${dir}" >&2
+    return 1
+  fi
+  if [[ -e "${dir}/deploy_derper_ip_selfsigned.sh" || -L "${dir}/deploy_derper_ip_selfsigned.sh" || -e "${dir}/target.conf" || -L "${dir}/target.conf" ]]; then
+    echo "[错误] 维护脚本或配置仍有残留：${dir}" >&2
+    return 1
+  fi
+  if ! rmdir "$dir" 2>/dev/null; then
+    if [[ -z "$(ls -A "$dir" 2>/dev/null)" ]]; then
+      echo "[错误] 无法删除空维护目录：${dir}" >&2
+      return 1
+    fi
+    echo "[信息] 已保留维护目录中的其他文件：${dir}"
+  fi
+  echo "[信息] 已清理维护脚本和配置：${dir}"
+}
+
 purge_healthcheck_program() {
   local stable
   local dirs=(/usr/local/lib/derper-deploy "$(dirname "$HEALTHCHECK_CRON_PATH")/derper-healthcheck-program")
@@ -5501,7 +6904,17 @@ render_status_json() {
   printf ',"region_code":'; json_quote "$REGION_CODE"; printf ',"region_name":'; json_quote "$REGION_NAME"
   printf ',"verify_clients":'; json_quote "$VERIFY_CLIENTS_MODE"; printf '},"certificate":{"disk_sha256":'; json_nullable "${HEALTH_CERT_SHA256:-}"
   printf ',"live_sha256":'; json_nullable "${HEALTH_LIVE_SHA256:-}"; printf ',"days_remaining":'; json_number "${HEALTH_DAYS_LEFT:-}"
-  printf '},"writes":{"metrics_failed":%s,"state_failed":%s}}\n' "${METRICS_WRITE_FAILED:-0}" "${STATE_WRITE_FAILED:-0}"
+  printf '},"writes":{"metrics_failed":%s,"state_failed":%s}' "${METRICS_WRITE_FAILED:-0}" "${STATE_WRITE_FAILED:-0}"
+  printf ',"maintenance":{"mode":'
+  json_quote "$(read_maintenance_kv mode 2>/dev/null || echo manual)"
+  printf ',"result":'
+  json_quote "$(read_maintenance_kv result 2>/dev/null || echo idle)"
+  printf ',"reason":'
+  json_quote "$(read_maintenance_kv reason 2>/dev/null || echo '')"
+  printf ',"needs_manual":%s' "$(read_maintenance_kv needs_manual 2>/dev/null || echo 0)"
+  printf ',"intent":'
+  json_quote "$(read_maintenance_kv intent 2>/dev/null || echo unset)"
+  printf '}}\n'
 }
 
 render_derpmap_json() {
@@ -5959,6 +7372,7 @@ uninstall_derper() {
   require_root
   echo "[步骤] 停止并卸载 derper systemd 服务…"
   remove_healthcheck_cron
+  remove_cert_maintain_units || true
   remove_tls_connlimit
 
   # 在移除单元前尽力识别当前服务运行用户
@@ -5977,7 +7391,7 @@ uninstall_derper() {
     rm -f "${SERVICE_PATH}"
     systemctl daemon-reload 2>/dev/null || true
   fi
-  rm -rf "${SERVICE_PATH}.certs-rollback" 2>/dev/null || true
+  rm -rf "${SERVICE_PATH}.certs-rollback" "${SERVICE_PATH}.certs-archive" 2>/dev/null || true
   echo "[信息] 已卸载 service：${SERVICE_PATH}"
 
   if [[ ${PURGE} -eq 1 ]]; then
@@ -5987,6 +7401,7 @@ uninstall_derper() {
   fi
 
   if [[ ${PURGE_ALL} -eq 1 ]]; then
+    purge_maintain_program || return 1
     purge_healthcheck_program || return 1
     if [[ -x "${BIN_PATH}" ]]; then
       echo "[步骤] 删除 derper 二进制：${BIN_PATH} …"
@@ -6314,7 +7729,7 @@ main() {
   fi
 
   # 明确缺少探针的变更在取锁/切换前拒绝；健康查询仍输出unknown及缺失原因。
-  if [[ "$wizard_mode" == 0 && "$HEALTH_CHECK$CHECK_ONLY" == 00 && "$UNINSTALL$RECOVER_INTERRUPTED" == 00 ]]; then
+  if [[ "$wizard_mode" == 0 && "$HEALTH_CHECK$CHECK_ONLY$CERT_PREPARE$CERT_APPLY$CERT_CANCEL$CERT_MAINTAIN" == 000000 && "$UNINSTALL$RECOVER_INTERRUPTED" == 00 ]]; then
     if [[ "$REQUIRE_H3" == 1 && -z "$EXTERNAL_PROBE" ]]; then echo '[错误] 请求H3发布门禁但未配置外部合法客户端探针，未开始变更。' >&2; exit 1; fi
     if [[ -n "$EXTERNAL_PROBE" ]] && { ! probe_path_is_trusted "$EXTERNAL_PROBE" || ! command -v timeout >/dev/null 2>&1; }; then echo '[错误] 外部探针路径或超时工具未就绪，未开始变更。' >&2; exit 1; fi
   fi
@@ -6373,11 +7788,28 @@ main() {
   fi
   if ! validate_settings; then
     check_validate_failed=1
-    if [[ "${DRY_RUN}" -ne 1 && "${CHECK_ONLY}" -ne 1 && "${HEALTH_CHECK}" -ne 1 ]]; then
+    if [[ "${CERT_CANCEL}" -eq 1 ]]; then
+      echo "[信息] cancel 只丢弃候选证书，不依赖公网 IP 校验。" >&2
+    elif [[ "${DRY_RUN}" -ne 1 && "${CHECK_ONLY}" -ne 1 && "${HEALTH_CHECK}" -ne 1 ]]; then
       echo "[错误] 参数校验失败，请检查 IP、端口等配置" >&2
       exit 1
+    else
+      echo "[警告] 参数校验失败；检查模式将继续输出状态，但最终退出码为失败。" >&2
     fi
-    echo "[警告] 参数校验失败；检查模式将继续输出状态，但最终退出码为失败。" >&2
+  fi
+
+  if [[ "$CERT_PREPARE$CERT_APPLY$CERT_CANCEL$CERT_MAINTAIN" != 0000 ]]; then
+    run_d_stage_command || exit 1
+    if [[ "$CERT_CANCEL" -eq 1 ]]; then
+      exit 0
+    fi
+    if [[ "${ENABLE_AUTO_MAINTAIN:-0}" -eq 1 || "${DISABLE_AUTO_MAINTAIN:-0}" -eq 1 ]]; then
+      apply_auto_maintain_policy
+    fi
+    if [[ "$CERT_MAINTAIN" -ne 1 ]]; then
+      print_auto_maintain_feedback "$(evaluate_auto_maintain_readiness)"
+    fi
+    exit 0
   fi
 
   # 健康检查模式（仅输出状态/指标，不变更系统；单次采集）
@@ -6530,6 +7962,7 @@ main() {
       echo "✅ 已就绪：检测到 derper 正在以纯 IP 模式运行，跳过安装。"
       commit_cert_update || exit 1
       run_post_deploy_extras || exit 1
+      finish_deploy_auto_maintain || exit 1
       exit 0
     fi
     print_firewall_tips
@@ -6566,6 +7999,7 @@ finalize_deployment_report() {
 在 Tailscale 后台粘贴 derpMap 后，客户端数十秒内会自动下发。
 若本次重签了证书，请立即用新的 CertName 更新 ACL，避免短暂中断后无法接入。
 INFO
+    finish_deploy_auto_maintain || return 1
     return 0
   fi
 

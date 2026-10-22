@@ -1,11 +1,11 @@
 # DERP 基于 IP 的自签名部署指南（用户指南 · 技术参考）
 
-> 配置、兼容CLI、本地导入、JSON与H0～H3用法见[维护指南](MAINTENANCE_CN.md)。
+> 配置、兼容CLI、本地导入、JSON与H0～H3、证书 prepare/apply/cancel 与条件式自动维护见[维护指南](MAINTENANCE_CN.md)。
 
 > 本文是中文的详细用户指南（技术参考）。主仓库首页 `README.md` 为精简版中文快速上手；英文用户指南见同目录的 `REFERENCE_EN.md`。
 
 > **脚本文件**：`deploy_derper_ip_selfsigned.sh`  
-> **当前版本**：0.2.16（2026-10-22）\
+> **当前版本**：0.2.17（2026-10-22）\
 > **查看版本**：`bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
@@ -275,6 +275,13 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 --dedicated-user          强制创建专用 derper 系统账户（生产推荐）
 --security-level LEVEL    安全加固级别：basic|standard|paranoid（默认 standard）
 --accept-cert-rotation    确认已有证书换指纹及 ACL 更新窗口（--yes 不代替此确认）
+prepare | apply | cancel | maintain
+                          候选证书准备/确认切换/丢弃/同机维护；详见维护指南
+--enable-auto-maintain    写授权与 Tailnet 目标就绪时登记本节点自动换证并安装独立 timer
+--disable-auto-maintain   关闭自动换证、改回人工并删除维护 timer
+--lead-days <int>         到期前提前天数，默认 30（随短期证书收紧），显式值须在有效期内
+--policy-credential FILE  独立 root 凭据文件，默认 /etc/derper/policy-api.env
+--tailnet NAME            目标 Tailnet，自动维护必填；本机登录不能当成写授权
 --relax-socket-perms      临时放宽 tailscaled socket 到 0666（不推荐，仅紧急情况；脚本退出时恢复）
 --tls-connlimit N         单 IP 并发 DERP TLS 连接上限（nft/iptables connlimit）
                           显式传 0 移除已装规则；省略该选项则不改动已有规则
@@ -456,7 +463,7 @@ SystemCallErrorNumber=EPERM       # 拒绝返回 EPERM 而非杀死进程
 2. **部署在 443 端口**以获得更好的防火墙穿透性：`--derp-port 443`
 3. **启用自动更新**：derper 二进制和系统包
 4. **使用 Prometheus 监控**：使用 `--health-check --metrics-textfile` 进行告警
-5. **定期证书轮换**：当前默认有效期为 365 天
+5. **定期证书轮换**：默认有效期 365 天；计划换证用 prepare/apply/cancel，详见维护指南。隔离 Tailnet 真写仍待办。
 
 ---
 

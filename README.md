@@ -1,9 +1,9 @@
 # Tailscale DERP Quick Deploy Script
 
 > **Language / 语言**: [English](#english) | [中文](#中文)  
-> **Version / 版本**: `0.2.16` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
+> **Version / 版本**: `0.2.17` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
-维护入口 / Maintenance: [配置、CLI、本地导入、JSON 与 H0～H3](docs/MAINTENANCE_CN.md) · [English guide](docs/MAINTENANCE_EN.md)。测试套件分工与命名约定见 [tests/README.md](tests/README.md)；生产迁移和真实外部客户端验收单独记录。
+维护入口 / Maintenance: [配置、CLI、本地导入、JSON、H0～H3 与证书轮换](docs/MAINTENANCE_CN.md) · [English guide](docs/MAINTENANCE_EN.md)。测试套件分工与命名约定见 [tests/README.md](tests/README.md)；生产迁移、隔离 Tailnet 真写和真实外部客户端验收单独记录。
 
 ---
 
@@ -232,6 +232,8 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # Use current login user
 | `--install-healthcheck-cron` | Install a 5-minute health check: with systemd a `derper-healthcheck.timer` (oneshot service that calls a root-owned stable copy via `bash`; the old cron is removed), otherwise `/etc/cron.d/derper-healthcheck`. A failed install rolls back and keeps the existing schedule | systemd timer or cron file | Hands-off health + metrics; not with `--health-check`/`--check` |
 | `--tls-connlimit <N>` | Cap concurrent DERP TLS connections per source IP (explicit `0` removes installed rules; omit to leave them) | nftables/iptables rule | Soften TLS handshake floods; not with `--health-check`/`--check` |
 | `--recover-interrupted` | Explicitly roll back an unfinished upgrade/migration from the saved recovery set; interrupted steps are never resumed automatically | Text + exit code | Recovering after an interrupted change; not with install/repair/check/uninstall |
+| `prepare` / `apply` / `cancel` | Prepare a candidate certificate, switch it after `--accept-cert-rotation`, or discard it. `--yes` does not confirm rotation | Candidate files under the deploy-state directory; live service unchanged until apply | Planned fingerprint rotation; see [the maintenance guide](docs/MAINTENANCE_EN.md) |
+| `--enable-auto-maintain` / `--disable-auto-maintain` | Record or clear on-host automatic renewal. Credentials stay in `/etc/derper/policy-api.env` (root, mode 0600), never in `deploy.conf` | Independent `derper-cert-maintain` timer, or its removal | Conditional auto-renewal when write scope and a Tailnet target are ready; GET/validate is not write permission |
 
 `--uninstall` also removes the health-check timer/cron and `--tls-connlimit` rules (the stable copy under `/usr/local/lib/derper-deploy` is kept). `--relax-socket-perms` restores the original socket mode when the script exits.
 
@@ -256,9 +258,9 @@ derper_process_rss_bytes 3145728     # Process memory usage (bytes)
 
 | Parameter | Description | Deleted Content | Retained Content |
 |-----------|-------------|-----------------|------------------|
-| `--uninstall` | Stop and remove service | systemd unit, health-check timer/cron, `--tls-connlimit` rules | Binary, certificates, health-check stable copy |
+| `--uninstall` | Stop and remove service | systemd unit, health-check timer/cron, cert-maintain timer, `--tls-connlimit` rules | Binary, certificates, health-check stable copy, policy credential file |
 | `--uninstall --purge` | + Remove installation directory | + `/opt/derper` | Binary |
-| `--uninstall --purge-all` | + Remove binary and script-created config | + `/usr/local/bin/derper`, `/etc/derper/derper.env`, DERP tailscaled socket drop-in, health-check stable program/status | Firewall rules, user/group accounts, unrelated files in the stable program directory |
+| `--uninstall --purge-all` | + Remove binary and script-created config | + `/usr/local/bin/derper`, `/etc/derper/derper.env`, DERP tailscaled socket drop-in, health-check stable program/status, maintenance script copy and `target.conf` | Firewall rules, user/group accounts, unrelated files in the stable program directory |
 
 ---
 
@@ -751,6 +753,8 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # 使用当前登录用户
 | `--install-healthcheck-cron` | 安装每 5 分钟的健康检查：有 systemd 时写 `derper-healthcheck.timer`（oneshot 服务以 `bash` 调用 root 管理的稳定副本，并删除旧 cron），否则写 `/etc/cron.d/derper-healthcheck`。安装失败会回滚并保留原调度 | systemd timer 或 cron 文件 | 无人值守健康检查与指标；不能与 `--health-check`/`--check` 同用 |
 | `--tls-connlimit <N>` | 限制单 IP 并发 DERP TLS 连接（显式 `0` 移除已装规则；省略则不改动） | nftables/iptables 规则 | 缓解 TLS 握手洪水；不能与 `--health-check`/`--check` 同用 |
 | `--recover-interrupted` | 用保存的恢复集显式回退未完成的升级/迁移；不会自动继续中断的步骤 | 文本 + 退出码 | 中断后的显式恢复；不能与安装/修复/检查/卸载同用 |
+| `prepare` / `apply` / `cancel` | 生成候选证书、确认后切换，或丢弃候选。`--yes` 不能代替 `--accept-cert-rotation` | 部署状态目录中的候选；apply 前不切换正在运行的服务 | 计划内指纹轮换；详见 [维护指南](docs/MAINTENANCE_CN.md) |
+| `--enable-auto-maintain` / `--disable-auto-maintain` | 登记或关闭同机自动换证。凭据只放 `/etc/derper/policy-api.env`（root、0600），不进入 deploy.conf | 独立 `derper-cert-maintain` timer，或将其删除 | 写授权与 Tailnet 目标就绪时的条件式自动维护；GET/validate 成功不能证明可写 |
 
 `--uninstall` 会同时删除健康检查 timer/cron 与 `--tls-connlimit` 规则（`/usr/local/lib/derper-deploy` 下的稳定副本保留）。`--relax-socket-perms` 在脚本退出时恢复 socket 原权限。
 
@@ -775,9 +779,9 @@ derper_process_rss_bytes 3145728     # 进程内存占用（字节）
 
 | 参数 | 说明 | 删除内容 | 保留内容 |
 |------|------|----------|----------|
-| `--uninstall` | 停止并删除服务 | systemd 单元、健康检查 timer/cron、`--tls-connlimit` 规则 | 二进制、证书、健康检查稳定副本 |
+| `--uninstall` | 停止并删除服务 | systemd 单元、健康检查 timer/cron、证书维护 timer、`--tls-connlimit` 规则 | 二进制、证书、健康检查稳定副本、策略凭据文件 |
 | `--uninstall --purge` | + 删除安装目录 | + `/opt/derper` | 二进制 |
-| `--uninstall --purge-all` | + 删除二进制和脚本生成配置 | + `/usr/local/bin/derper`、`/etc/derper/derper.env`、DERP 创建的 tailscaled socket drop-in、健康检查稳定程序及状态 | 防火墙规则、用户/组账户、稳定副本目录中的其他用户文件 |
+| `--uninstall --purge-all` | + 删除二进制和脚本生成配置 | + `/usr/local/bin/derper`、`/etc/derper/derper.env`、DERP 创建的 tailscaled socket drop-in、健康检查稳定程序及状态、维护脚本副本及 `target.conf` | 防火墙规则、用户/组账户、稳定副本目录中的其他用户文件 |
 
 ---
 

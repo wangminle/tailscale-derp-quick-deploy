@@ -29,5 +29,7 @@ jobs:
         run: |
           bash tests/test_c_stage.sh
           sudo bash tests/test_c_stage.sh test_root_probe_path_trust test_bug072_root_rejects_untrusted_state_ancestors
+      - name: D stage contracts and behavior
+        run: bash tests/test_d_stage.sh
       - name: ShellCheck errors
         run: shellcheck -S error scripts/deploy_derper_ip_selfsigned.sh tests/*.sh
