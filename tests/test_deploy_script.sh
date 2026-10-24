@@ -1243,6 +1243,124 @@ test_tls_connlimit_parse_and_reject() {
   ok "tls-connlimit is parsed and validated"
 }
 
+test_progress_preserves_streams_status_and_traps() {
+  DERPER_TEST_MODE=1 source "$SCRIPT"
+  local out rc=0 saved_traps
+  local_tmp=$(mktemp -d)
+  trap 'rm -rf "$local_tmp"' EXIT
+  saved_traps=$(trap -p EXIT INT TERM)
+  out=$(_run_with_progress '测试成功任务' "$local_tmp/command.err" 5 bash -c 'printf result; printf diagnostic >&2' 2>"$local_tmp/progress") || fail "successful task must succeed"
+  [[ "$out" == result && "$(cat "$local_tmp/command.err")" == diagnostic ]] || fail "progress must preserve command streams"
+  grep -q '\[完成\]' "$local_tmp/progress" || fail "successful task must report completion"
+  if LC_ALL=C grep -q $'\r\|\033' "$local_tmp/progress"; then fail "non-TTY logs must not contain animation controls"; fi
+  _run_with_progress '测试失败任务' "$local_tmp/command.err" 5 bash -c 'echo failure >&2; exit 23' 2>"$local_tmp/progress" || rc=$?
+  [[ "$rc" == 23 && "$(cat "$local_tmp/command.err")" == failure ]] || fail "failed task must preserve exit status and diagnostic"
+  grep -q '退出码 23' "$local_tmp/progress" || fail "failure status must be visible"
+  rc=0
+  _run_with_progress '测试超时任务' "$local_tmp/command.err" 1 bash -c 'sleep 5' 2>"$local_tmp/progress" || rc=$?
+  [[ "$rc" == 124 || "$rc" == 143 ]] || fail "timeout must remain effective, got $rc"
+  [[ "$(trap -p EXIT INT TERM)" == "$saved_traps" ]] || fail "progress must preserve deployment traps"
+  ok "progress preserves stdout, diagnostics, exit codes, timeout and deployment traps"
+}
+
+test_install_progress_is_live_in_terminal() {
+  if ! command -v python3 >/dev/null 2>&1; then echo 'skip - terminal progress needs python3/pty'; return 0; fi
+  PROGRESS_TEST_BASH="$BASH" PROGRESS_TEST_SCRIPT="$SCRIPT" python3 - <<'PY'
+import errno
+import os
+import pty
+import select
+import subprocess
+import tempfile
+import time
+
+prefix = '''set -euo pipefail
+DERPER_TEST_MODE=1 source "$1"
+DEPLOY_STATE_DIR="$2/deploy-state"
+_tmpdir="$2"
+BIN_PATH="$2/derper"
+precheck_go_network() { :; }
+ensure_go() { :; }
+go() { :; }
+'''
+fallback = '''command() {
+  if [[ "$1" == -v && "$2" == timeout ]]; then return 1; fi
+  builtin command "$@"
+}
+'''
+query = '''result=$(resolve_derper_module_version abcdef123456)
+[[ "$result" == v1.104.1 ]]
+printf 'RESULT=%s\\n' "$result"
+'''
+build = 'install_derper\n'
+
+def run(body, label, status, expected_rc, animate=True, term='xterm'):
+    with tempfile.TemporaryDirectory() as tmp:
+        go_path = os.path.join(tmp, 'go')
+        with open(go_path, 'w') as go_file:
+            go_file.write('#!/bin/sh\nsleep 2.2\n' + (
+                'printf v1.104.1\n' if expected_rc == 0 else
+                'echo deliberate-build-error >&2\nexit 23\n'))
+        os.chmod(go_path, 0o755)
+        master, slave = pty.openpty()
+        proc = subprocess.Popen(
+            [os.environ['PROGRESS_TEST_BASH'], '-c', prefix + body, 'progress-test',
+             os.environ['PROGRESS_TEST_SCRIPT'], tmp],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=slave,
+            env=dict(os.environ, TERM=term, PATH=tmp + os.pathsep + os.environ['PATH']))
+        os.close(slave)
+        data = b''
+        live = False
+        deadline = time.monotonic() + 15
+        try:
+            while True:
+                assert time.monotonic() < deadline, 'terminal progress hung'
+                if not select.select([master], [], [], 0.1)[0]:
+                    continue
+                try:
+                    chunk = os.read(master, 65536)
+                except OSError as exc:
+                    if exc.errno != errno.EIO:
+                        raise
+                    break
+                if not chunk:
+                    break
+                data += chunk
+                if '已等待 1 秒'.encode() in data and proc.poll() is None:
+                    live = True
+            stdout, _ = proc.communicate(timeout=3)
+            text = data.decode()
+            assert proc.returncode == expected_rc, (proc.returncode, text)
+            assert label in text and status in text, text
+            assert b'\x1b' not in stdout, stdout
+            if animate:
+                assert live, 'progress must update before command finishes: ' + text
+                assert (label + '.  ').encode() in data and (label + '.. ').encode() in data, text
+                assert '\r\x1b[2K[' + status + ']' in text, 'last frame must be cleared: ' + text
+            else:
+                assert b'\x1b' not in data and '已等待' not in text, text
+            if expected_rc == 0:
+                assert stdout == b'RESULT=v1.104.1\n', stdout
+            else:
+                assert 'deliberate-build-error' in text and '退出码 23' in text, text
+                assert not os.path.exists(os.path.join(tmp, 'derper'))
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
+            os.close(master)
+
+for mode in ('', fallback):
+    run(mode + query, '解析 derper 同源版本', '完成', 0)
+    run(mode + build, '下载/编译 derper', '未完成', 1)
+run(query, '解析 derper 同源版本', '完成', 0, animate=False, term='dumb')
+run('OUTPUT_FORMAT=json\n' + query, '解析 derper 同源版本', '完成', 0, animate=False)
+run('DERPMAP_ONLY=1\n' + query, '解析 derper 同源版本', '完成', 0, animate=False)
+PY
+  [[ "$?" == 0 ]] || fail "live terminal progress contract failed"
+  ok "both install stages show live dots and elapsed time; failure diagnostics and quiet terminal modes work"
+}
+
 test_module_query_survives_missing_timeout() {
   (
     DERPER_TEST_MODE=1 source "$SCRIPT"
@@ -2952,6 +3070,8 @@ cases=(
   test_uninstall_removes_healthcheck_cron
   test_healthcheck_cron_conflicts_with_uninstall
   test_tls_connlimit_parse_and_reject
+  test_progress_preserves_streams_status_and_traps
+  test_install_progress_is_live_in_terminal
   test_module_query_survives_missing_timeout
   test_install_derper_survives_missing_timeout
   test_healthcheck_cron_conflicts_with_health_check

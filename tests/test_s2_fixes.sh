@@ -40,6 +40,90 @@ setup_install() {
   verify_restored_service() { [[ "$runtime" == active ]]; }
 }
 
+record_migration_service_calls() {
+  : >"$case_tmp/service-calls"
+  runtime=active
+  systemctl() {
+    case "$1" in
+      is-active) [[ "$runtime" == active ]] ;;
+      stop) printf 'stop\n' >>"$case_tmp/service-calls"; runtime=inactive ;;
+      start|restart) printf '%s\n' "$1" >>"$case_tmp/service-calls"; runtime=active ;;
+      *) return 0 ;;
+    esac
+  }
+}
+
+prepare_ready_node_state() {
+  printf 'current-node-identity\n' >"$NODE_STATE_DIR/derper.json"
+  chmod 700 "$NODE_STATE_DIR"
+  chmod 600 "$NODE_STATE_DIR/derper.json"
+}
+
+test_bug110_ready_state_skips_migration_and_keeps_outer_recovery() {
+  setup_install
+  prepare_ready_node_state
+  record_migration_service_calls
+  migrate_node_state || fail "就绪配置应直接成功"
+  [[ ! -s "$case_tmp/service-calls" ]] || fail "配置已就绪不得停启服务"
+  [[ ! -e "$DEPLOY_STATE_DIR/incomplete" ]] || fail "无状态变更不得建立迁移标记"
+  [[ "$(cat "$INSTALL_DIR/derper.json")" == '{"PrivateKey":"stable-node-key"}' ]] || fail "不得清理遗留私钥副本"
+  capture_and_promote_recovery || fail "外层发布应能建立恢复集"
+  write_incomplete_marker switch || fail "应能写入外层标记"
+  local marker_sum manifest_sum
+  marker_sum=$(file_sha256 "$DEPLOY_STATE_DIR/incomplete")
+  manifest_sum=$(file_sha256 "$DEPLOY_STATE_DIR/recovery/manifest")
+  migrate_node_state && migrate_node_state || fail "重复准备应成功"
+  [[ ! -s "$case_tmp/service-calls" ]] || fail "外层发布期间也不得重复停启"
+  [[ "$(file_sha256 "$DEPLOY_STATE_DIR/incomplete")" == "$marker_sum" && "$(file_sha256 "$DEPLOY_STATE_DIR/recovery/manifest")" == "$manifest_sum" ]] || fail "跳过迁移必须原样保留外层恢复材料"
+  [[ "$(cat "$NODE_STATE_DIR/derper.json")" == current-node-identity ]] || fail "遗留文件不得覆盖当前身份"
+}
+
+test_bug110_first_migration_stops_once_and_keeps_recovery() {
+  setup_install
+  chmod 700 "$NODE_STATE_DIR"
+  record_migration_service_calls
+  migrate_node_state || fail "首次迁移必须成功"
+  [[ "$(cat "$case_tmp/service-calls")" == $'stop\nstart' ]] || fail "首次迁移必须停服一次并恢复运行"
+  [[ -f "$DEPLOY_STATE_DIR/incomplete" && -f "$DEPLOY_STATE_DIR/recovery/manifest" ]] || fail "服务最终验收前必须保留首次迁移恢复集"
+  migrate_node_state || fail "同一事务内重复迁移应成功"
+  [[ "$(cat "$case_tmp/service-calls")" == $'stop\nstart' ]] || fail "首次迁移完成后不得再停启"
+  rollback_deploy_change || fail "跳过重复迁移后仍应能回退"
+  [[ ! -e "$NODE_STATE_DIR/derper.json" ]] || fail "回退必须恢复当前配置原先不存在的状态"
+}
+
+test_bug110_permission_repair_still_migrates() {
+  setup_install
+  prepare_ready_node_state
+  chmod 644 "$NODE_STATE_DIR/derper.json"
+  record_migration_service_calls
+  migrate_node_state || fail "配置权限不符仍需修复"
+  [[ "$(cat "$case_tmp/service-calls")" == $'stop\nstart' ]] || fail "权限修复必须保留停服保护"
+  node_config_readable_by_run_user "$NODE_STATE_DIR/derper.json" || fail "修复后配置应为运行用户所有且0600"
+  [[ -f "$DEPLOY_STATE_DIR/incomplete" ]] || fail "权限修复必须保留恢复材料"
+  migrate_node_state || fail "修复后再次准备应成功"
+  [[ "$(cat "$case_tmp/service-calls")" == $'stop\nstart' ]] || fail "权限修复完成后不得重复停启"
+}
+
+test_bug110_unit_write_has_only_final_restart() {
+  setup_install
+  prepare_ready_node_state
+  record_migration_service_calls
+  # 保留实际配置准备和用户布局入口；只替换root权限及最终发布的外部副作用。
+  chown() { :; }
+  harden_cert_dir() { :; }
+  configure_service_user_and_socket() { setup_service_user; SERVICE_RUN_GROUP="$RUN_USER"; }
+  prepare_derper_exec_start_line() { DERPER_EXEC_START_LINE="$BIN_PATH -c $NODE_STATE_DIR/derper.json"; }
+  deploy_and_verify_derper_service() { systemctl restart derper; }
+  write_systemd_service || fail "unit编排应成功"
+  [[ "$(cat "$case_tmp/service-calls")" == restart ]] || fail "配置和布局不得额外停启，只允许最终unit发布重启"
+  local victim="$case_tmp/victim"
+  printf 'unchanged\n' >"$victim"
+  rm "$NODE_STATE_DIR/derper.json"
+  ln -s "$victim" "$NODE_STATE_DIR/derper.json"
+  if migrate_node_state >/dev/null 2>&1; then fail "就绪优化不得放行符号链接配置"; fi
+  [[ "$(cat "$victim")" == unchanged ]] || fail "不得修改链接目标"
+}
+
 test_bug055_standard_daemon_identity() {
   VERIFY_CLIENTS_MODE=on
   local canary="$case_tmp/disk-tailscaled-called"
@@ -405,6 +489,7 @@ if [[ "$#" -gt 0 ]]; then
   selected=("$@")
 else
   selected=(test_bug055_standard_daemon_identity test_bug070_offline_version_keeps_suffix test_bug077_running_exe_not_disk_binary test_bug077_ambiguous_daemon_pid_is_refused test_bug078_rollback_restores_current_identity test_bug078_rollback_removes_created_config test_bug079_corrupt_payload_is_not_restored test_bug080_untrusted_executable_is_not_run test_bug081_rollback_restores_absent_unit_and_state_set test_bug081_cleanup_failure_keeps_marker test_bug081_hidden_state_and_unsafe_entries test_bug081_unit_cleanup_and_reload_failure_keep_marker test_bug059_upgrade_migration_keeps_snapshot test_bug059_migration_failure_preserves_outer_marker test_bug059_standalone_migration_waits_for_service_commit test_bug060_rollback_uses_saved_user test_bug053_purge_all_removes_stable_copy test_bug053_cleanup_failure_is_not_success test_bug053_empty_directory_failure_is_not_success test_bug061_scheduled_healthcheck_keeps_non_global_ip_opt_in)
+  selected+=(test_bug110_ready_state_skips_migration_and_keeps_outer_recovery test_bug110_first_migration_stops_once_and_keeps_recovery test_bug110_permission_repair_still_migrates test_bug110_unit_write_has_only_final_restart)
 fi
 failed=0
 for test_name in "${selected[@]}"; do

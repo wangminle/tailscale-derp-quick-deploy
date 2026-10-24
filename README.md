@@ -1,7 +1,7 @@
 # Tailscale DERP Quick Deploy Script
 
 > **Language / 语言**: [English](#english) | [中文](#中文)  
-> **Version / 版本**: `0.2.17` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
+> **Version / 版本**: `0.2.18` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 维护入口 / Maintenance: [配置、CLI、本地导入、JSON、H0～H3 与证书轮换](docs/MAINTENANCE_CN.md) · [English guide](docs/MAINTENANCE_EN.md)。测试套件分工与命名约定见 [tests/README.md](tests/README.md)；生产迁移、隔离 Tailnet 真写和真实外部客户端验收单独记录。
 
@@ -170,6 +170,8 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # Use current login user
 - **443**: Best firewall traversal, but check for HTTPS service conflicts
 
 ##### Go Build Configuration (Required for China Mainland)
+
+While resolving the same-origin module version and downloading/building derper, the terminal refreshes animated dots and elapsed seconds every second and shows the stage time limit (60 and 900 seconds respectively). The dots mean the task is still running; the first dependency or toolchain download may take a while. The result and total duration are printed when a stage ends, and a build failure prints the error details. Redirected logs, `TERM=dumb`, and JSON mode keep only the static start/end messages; progress output goes to stderr.
 
 | Parameter | Description | Default | Recommended (China) |
 |-----------|-------------|---------|---------------------|
@@ -691,6 +693,8 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # 使用当前登录用户
 - **443**：防火墙穿透性最佳，但需注意是否与 HTTPS 服务冲突
 
 ##### Go 构建配置（国内必备）
+
+同源模块版本解析和下载/编译 derper 时，终端每秒刷新跳点与已等待秒数，并显示阶段时限（分别为 60 秒和 900 秒）。跳点表示任务仍在执行；首次下载依赖或工具链可能较慢。结束后显示结果与耗时，构建失败会输出错误详情。重定向日志、`TERM=dumb` 或 JSON 模式只保留静态起止提示，进度信息写入 stderr。
 
 | 参数 | 说明 | 默认值 | 推荐值（国内） |
 |------|------|--------|----------------|

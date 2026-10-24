@@ -9,8 +9,8 @@
 set -euo pipefail
 
 # 脚本自身版本（与 docs/CHANGELOG_*.md、仓库根目录 VERSION 保持同步）
-SCRIPT_VERSION="0.2.17"
-SCRIPT_VERSION_DATE="2026-10-22"
+SCRIPT_VERSION="0.2.18"
+SCRIPT_VERSION_DATE="2026-10-24"
 
 # 默认端口
 DERP_PORT="30399"        # DERP TLS 端口
@@ -988,7 +988,7 @@ resolve_derper_module_version() {
   local envs=("GO111MODULE=on" "GOTOOLCHAIN=${GOTOOLCHAIN_ARG}" "GIT_TERMINAL_PROMPT=0")
   [[ -z "$GOPROXY_ARG" ]] || envs+=("GOPROXY=$GOPROXY_ARG")
   [[ -z "$GOSUMDB_ARG" ]] || envs+=("GOSUMDB=$GOSUMDB_ARG")
-  _timeout_run 60 env "${envs[@]}" go list -m -f '{{.Version}}' "tailscale.com@$1" 2>/dev/null
+  _run_with_progress '解析 derper 同源版本' /dev/null 60 env "${envs[@]}" go list -m -f '{{.Version}}' "tailscale.com@$1"
 }
 
 # 判断是否需要安装/重装 derper：缺失、或目标版本（非 latest）与已安装不一致。
@@ -1288,8 +1288,43 @@ infer_healthcheck_settings_from_unit() {
   fi
 }
 
+# 长任务提示只写 stderr；命令的 stdout 与错误文件保持原样。
+# 通过局部变量把显示信息传给 timeout 的等待函数，不启动额外的动画后台进程，
+# 也不改写部署事务的 trap。fd 3 在重定向命令错误前保留终端输出。
+_run_with_progress() {
+  local _progress_label="$1" error_file="$2" limit="$3"; shift 3
+  local _progress_started=$SECONDS _progress_tty=0 rc=0
+  if [[ -t 2 && "${TERM:-dumb}" != dumb && "${OUTPUT_FORMAT:-text}" != json && "${DERPMAP_ONLY:-0}" != 1 ]]; then
+    _progress_tty=1
+  fi
+  printf '[进行中] %s（最长 %s 秒）\n' "$_progress_label" "$limit" >&2
+  _timeout_run "$limit" "$@" 3>&2 2>"$error_file" || rc=$?
+  if [[ "$rc" == 0 ]]; then
+    printf '[完成] %s（用时 %s 秒）\n' "$_progress_label" "$((SECONDS - _progress_started))" >&2
+  else
+    printf '[未完成] %s（退出码 %s，用时 %s 秒）\n' "$_progress_label" "$rc" "$((SECONDS - _progress_started))" >&2
+  fi
+  return "$rc"
+}
+
+_wait_with_progress() {
+  local child="$1" dots='.' rc=0
+  if [[ "${_progress_tty:-0}" != 1 ]]; then
+    wait "$child"
+    return $?
+  fi
+  while kill -0 "$child" 2>/dev/null; do
+    printf '\r\033[2K[进行中] %s%-3s 已等待 %s 秒' "$_progress_label" "$dots" "$((SECONDS - _progress_started))" >&3
+    case "$dots" in ... ) dots='.' ;; * ) dots="${dots}." ;; esac
+    sleep 1
+  done
+  wait "$child" || rc=$?
+  printf '\r\033[2K' >&3
+  return "$rc"
+}
+
 # 兼容 timeout：优先使用系统 timeout，缺失时用后台进程模拟。
-# killer 必须重定向 stdout/stderr：否则在 $( ) 中调用时，命令提前结束后
+# killer 必须重定向 stdout/stderr 并关闭进度 fd 3：否则在 $( ) 中调用时，命令提前结束后
 # kill killer 只杀掉子 shell，其子进程 sleep 被孤儿化并继续持有管道写端，
 # 调用方会阻塞满整个超时（无 timeout 主机每次模块查询必卡 60 秒）。
 _timeout_run() {
@@ -1297,17 +1332,17 @@ _timeout_run() {
   if command -v timeout >/dev/null 2>&1; then
     timeout --kill-after=1 "$secs" "$@" &
     local timed_pid=$! timed_rc=0
-    wait "$timed_pid" || timed_rc=$?
+    _wait_with_progress "$timed_pid" || timed_rc=$?
     # timeout默认建立独立进程组；主进程提前响应TERM时，也清理仍留在该组中的子进程。
     kill -KILL -- "-$timed_pid" 2>/dev/null || true
     return "$timed_rc"
   else
     "$@" &
     local pid=$!
-    ( sleep "$secs"; kill -TERM "$pid" 2>/dev/null || exit 0; sleep 1; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+    ( sleep "$secs"; kill -TERM "$pid" 2>/dev/null || exit 0; sleep 1; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 3>&- &
     local killer=$!
     local rc=0
-    wait "$pid" 2>/dev/null || rc=$?
+    _wait_with_progress "$pid" 2>/dev/null || rc=$?
     kill "$killer" 2>/dev/null || true
     wait "$killer" 2>/dev/null || true
     return $rc
@@ -2874,6 +2909,23 @@ migration_fail() {
   return 1
 }
 
+# 当前身份已经位于目标状态目录时，不因遗留副本仍在而再次停服。
+# 只核对路径、属主/组、最小权限与可读性；内容仍由derper加载，运行状态由发布门禁验证。
+node_state_is_ready() {
+  local config="$1" state="$2" uid gid config_meta state_meta
+  [[ -f "$config" && -s "$config" && ! -L "$config" && -d "$state" && ! -L "$state" ]] || return 1
+  uid=$(id -u "$RUN_USER") && gid=$(id -g "$RUN_USER") || return 1
+  config_meta=$(stat -c '%u:%g:%a' "$config" 2>/dev/null || stat -f '%u:%g:%Lp' "$config") || return 1
+  state_meta=$(stat -c '%u:%g:%a' "$state" 2>/dev/null || stat -f '%u:%g:%Lp' "$state") || return 1
+  [[ "$config_meta" == "${uid}:${gid}:600" && "$state_meta" == "${uid}:${gid}:700" ]] || return 1
+  if running_as_root && [[ "$uid" != 0 ]]; then
+    command -v runuser >/dev/null 2>&1 || return 1
+    runuser -u "$RUN_USER" -- test -r "$config" || return 1
+  else
+    [[ -r "$config" && -x "$state" ]] || return 1
+  fi
+}
+
 migrate_node_state() {
   local legacy config state trim a b intent before after group
   legacy="${INSTALL_DIR}/derper.json"
@@ -2883,6 +2935,10 @@ migrate_node_state() {
   if [[ -L "$legacy" || -L "$config" || -L "$state" ]]; then
     echo "[错误] 节点配置路径是符号链接，拒绝迁移。" >&2
     return 1
+  fi
+  # 不清除外层发布/首次迁移的恢复集或未完成标记，也不删除遗留私钥副本。
+  if node_state_is_ready "$config" "$state"; then
+    return 0
   fi
   if [[ ! -f "$legacy" ]]; then
     return 0
@@ -3054,7 +3110,7 @@ install_derper() {
   if [[ -n "${GOPROXY_ARG}" ]]; then envs+=("GOPROXY=${GOPROXY_ARG}"); fi
   if [[ -n "${GOSUMDB_ARG}" ]]; then envs+=("GOSUMDB=${GOSUMDB_ARG}"); fi
   echo "[信息] 安装 derper 版本：${DERPER_VERSION}"
-  if ! _timeout_run 900 env "${envs[@]}" go install "tailscale.com/cmd/derper@${DERPER_VERSION}" 2>"${_tmpdir}/derper_install.err"; then
+  if ! _run_with_progress '下载/编译 derper' "${_tmpdir}/derper_install.err" 900 env "${envs[@]}" go install "tailscale.com/cmd/derper@${DERPER_VERSION}"; then
     echo "[错误] go install 失败；请检查模块代理/校验数据库连通性。国内网络可显式使用 --goproxy https://goproxy.cn,direct；脚本保留现有代理设置，不自动切换第三方代理或关闭校验。" >&2
     sed -n '1,160p' "${_tmpdir}/derper_install.err" >&2 || true
     exit 1
@@ -6613,15 +6669,18 @@ check_port_conflicts() {
 check_extra_attack_surface() {
   EXTRA_LISTENERS=""
   local listening=""
+  # ss/netstat 可输出 %lo 等接口后缀；IPv6 后缀可位于方括号内或外。
+  # 完整匹配地址与端口，避免把 ::1:2 等非回环 IPv6 地址当成 ::1。
+  local loopback_endpoint_re='^(127(\.[0-9]{1,3}){3}(%[^:]+)?|\[::1(%[^]:]+)?\](%[^:]+)?|::1(%[^:]+)?):[0-9]+$'
   if command -v ss >/dev/null 2>&1; then
     listening=$(ss -ltn 2>/dev/null | awk 'NR>1 {print $4}' \
       | grep -E ':[0-9]+$' \
-      | grep -vE '^127(\.[0-9]{1,3}){3}:|^\[::1\]:|^::1:' \
+      | grep -vE "$loopback_endpoint_re" \
       | grep -vE ":${DERP_PORT}$" || true)
   elif command -v netstat >/dev/null 2>&1; then
     listening=$(netstat -ltn 2>/dev/null | awk 'NR>2 && $1 ~ /^tcp6?/ {print $4}' \
       | grep -E ':[0-9]+$' \
-      | grep -vE '^127(\.[0-9]{1,3}){3}:|^\[::1\]:|^::1:' \
+      | grep -vE "$loopback_endpoint_re" \
       | grep -vE ":${DERP_PORT}$" || true)
   fi
   EXTRA_LISTENERS=$(printf '%s\n' "$listening" | sort -u | grep -v '^$' || true)

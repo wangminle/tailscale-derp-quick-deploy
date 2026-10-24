@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.2.18] - 2026-10-24
+
+- Fix redundant migration stop/start cycles caused by retained legacy node configuration (BUG-110). Reuse ready node state after checking ownership/group, 0600/0700 modes, and readability; retain the legacy copy and outer recovery material. First migration, permission repair, and run-user changes keep their protected path. Writing a unit with ready state now only performs the final release restart. Adds four S2 regressions verified to fail before the fix and pass afterward.
+- Fix loopback listener false positives with interface suffixes (BUG-109): recognize `127.0.0.53%lo:53` and scoped IPv6 loopback forms in ss/netstat output while retaining non-loopback warnings. Update both REFERENCE guides with node-state paths, AF_UNIX hardening, and retained legacy node-key guidance (DOC-015). Adds three review-suite regressions.
+- Show animated dots, elapsed seconds, and stage time limits while resolving the same-origin module version and downloading/building derper, followed by the result and duration. Redirected logs, dumb terminals, and JSON mode use static messages. Command stdout, diagnostics, and exit status remain separate. Adds two main-suite regressions, including a real pseudo-terminal frame check.
+
 ## [0.2.17] - 2026-10-22
 
 - Fix BUG-101: a missing or whitespace-only `TS_TAILNET` cannot obtain write authorization, and explicit auto-maintenance enablement fails without installing a timer. A valid target from deployment config or credentials is retained in the timer config. Treat configured `CERT_LEAD_DAYS` as explicit, rejecting out-of-range values while preserving CLI overrides and default adjustment for short certificates. Rename seven existing bug regressions to follow the ledger-ID convention and add five target/lead-time regressions.
@@ -797,6 +803,6 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 **Contributors**: Thanks to architects for professional advice
 
-**Update Date**: 2026-10-22
+**Update Date**: 2026-10-24
 
-**Version**: 0.2.17
+**Version**: 0.2.18

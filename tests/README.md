@@ -6,10 +6,10 @@
 
 | 文件 | 职责 | 运行环境 | CI | 传参单跑 | 退出码 |
 | --- | --- | --- | --- | --- | --- |
-| test_deploy_script.sh | 主回归套件：参数解析、环境检查、证书、unit、防火墙、健康检查、向导、main 编排与底层辅助函数（约 101 用例，按领域组织） | 非 root（root 专属断言自动跳过） | ✅ | ✅ | 0 通过 / 1 有失败 |
-| test_review_regressions.sh | 审查回归：历次审查反例的先红后绿用例（BUG-014～058 主要条目）与 B 阶段 b1/b2/b3 工作包行为（65 用例） | 非 root（root/工具缺失场景输出 skip） | ✅ | ✅ | 0 通过 / 1 有失败 |
-| test_s2_fixes.sh | S2 批次修复行为回归（BUG-053/055/059/060/061/070/077～081，20 用例），替身服务管理 | 非 root，需 gcc | ✅ | ✅ | 0 通过 / 1 有失败 |
-| test_s2_evidence.sh | 真实环境证据：flock、服务用户权限、旧用户恢复，以及 root 拒绝低权限同名进程/不可信 inode | 需 root + flock + useradd + gcc | ✅（sudo） | ❌（整文件执行） | 0 通过 / 1 失败 / 2 环境不符 |
+| test_deploy_script.sh | 主回归套件：参数解析、环境检查、证书、unit、防火墙、健康检查、向导、main 编排与底层辅助函数（104 用例，含安装进度的伪终端验证，按领域组织） | 非 root（root 专属断言自动跳过） | ✅ | ✅ | 0 通过 / 1 有失败 |
+| test_review_regressions.sh | 审查回归：历次审查反例的先红后绿用例（BUG-014～058 主要条目）、B 阶段 b1/b2/b3 行为、BUG-109 回环接口后缀及中英文加固示例与实际 unit 一致性（68 用例） | 非 root（root/工具缺失场景输出 skip） | ✅ | ✅ | 0 通过 / 1 有失败 |
+| test_s2_fixes.sh | S2 批次修复行为回归（BUG-053/055/059/060/061/070/077～081/110，24 用例），替身服务管理，含已就绪跳过、首次迁移/权限修复/恢复集保护及unit仅最终重启 | 非 root，需 gcc | ✅ | ✅ | 0 通过 / 1 有失败 |
+| test_s2_evidence.sh | 真实环境证据：flock、服务用户权限、旧用户恢复、BUG-110就绪跳过/换用户/不可读拒绝，以及 root 拒绝低权限同名进程/不可信 inode | 需 root + flock + useradd + gcc | ✅（sudo） | ❌（整文件执行） | 0 通过 / 1 失败 / 2 环境不符 |
 | test_c_stage.sh | C 阶段契约与行为（DEV-011/012/013）：配置白名单、新旧 CLI、ELF 导入、JSON/derpMap、H0～H3、状态与门禁（33 用例）；需 python3，ELF 用例需 gcc | 非 root；2项 root 专属用例退出 77 跳过 | ✅（含 sudo 补跑 root 用例） | ✅ | 0 通过 / 1 有失败 |
 | test_d_stage.sh | D 阶段契约与行为（DEV-008）：prepare/apply/cancel、HuJSON 最小补丁、策略 API 替身、自动/人工/未知三态、启用/停用持久化与维护 unit，以及事务归档、身份绑定、OAuth/ETag/HTTP 状态、timer 参数、符号链接写入、内网放行继承、cancel/maintain 反馈、purge-all、换证回滚重启、停用优先、幂等启停、过期续期、短期证书提前天数、调度失败跨命令持久化和安装根目录链接拒绝、Tailnet 目标和配置提前天数显式校验回归（52 用例）；需 openssl，HuJSON 补丁需 python3 | 非 root | ✅ | ✅ | 0 通过 / 1 有失败 |
 | test_systemd_integration.sh | GB 集成：真实 systemd PID1 的一次性 VM 中执行完整发布/回退/恢复/生成任务 | 仅人工标记的一次性 VM（`DERPER_INTEGRATION_VM=1` + `/root/DERPER_DISPOSABLE_GB_VM`），否则退出 2 | ❌（VM 门禁） | ❌ | 0 通过 / 1 失败 / 2 环境不符 |

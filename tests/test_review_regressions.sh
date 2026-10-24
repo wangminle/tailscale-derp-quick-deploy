@@ -434,6 +434,84 @@ test_bug039_mismatched_key_blocks_restart() {
   chmod 600 "${INSTALL_DIR}/certs/${IP_ADDR}.key" || true
 }
 
+assert_interface_scoped_listener_classification() {
+  local backend="$1" expected
+  DERP_PORT=30399
+  command() {
+    if [[ "$1" == -v && "$2" == ss ]]; then [[ "$backend" == ss ]]; return $?; fi
+    if [[ "$1" == -v && "$2" == netstat ]]; then [[ "$backend" == netstat ]]; return $?; fi
+    builtin command "$@"
+  }
+  ss() {
+    printf '%s\n' 'State Recv-Q Send-Q Local Address:Port Peer Address:Port'
+    awk '{print "LISTEN 0 4096 " $0 " 0.0.0.0:*"}' "$case_tmp/listeners"
+  }
+  netstat() {
+    printf '%s\n' 'Active Internet connections (only servers)' 'Proto Recv-Q Send-Q Local Address Foreign Address State'
+    awk '{proto=($0 ~ /^\[|^::/) ? "tcp6" : "tcp"; print proto " 0 0 " $0 " :::* LISTEN"}' "$case_tmp/listeners"
+  }
+  cat >"$case_tmp/listeners" <<'ENDPOINTS'
+127.0.0.1:9090
+127.0.0.53:53
+127.0.0.53%lo:53
+127.8.9.10%lo:4000
+[::1]:631
+[::1%lo]:53
+[::1]%lo:5353
+::1:9001
+::1%lo:9002
+ENDPOINTS
+  check_extra_attack_surface 2>"$case_tmp/warnings"
+  [[ -z "$EXTRA_LISTENERS" && ! -s "$case_tmp/warnings" ]] || fail "$backend 不得对回环监听告警：${EXTRA_LISTENERS}"
+
+  cat >"$case_tmp/external" <<'ENDPOINTS'
+0.0.0.0:22
+0.0.0.0:8080
+[::]:22
+100.90.1.2%tailscale0:443
+[fe80::1%eth0]:5353
+[2001:db8::1%eth0]:8080
+::1:2:9090
+ENDPOINTS
+  cat "$case_tmp/external" >>"$case_tmp/listeners"
+  printf '%s\n' '0.0.0.0:30399' '[::]:30399' >>"$case_tmp/listeners"
+  expected=$(sort -u "$case_tmp/external")
+  check_extra_attack_surface 2>"$case_tmp/warnings"
+  [[ "$EXTRA_LISTENERS" == "$expected" ]] || fail "$backend 必须保留非回环地址且只排除本服务端口：${EXTRA_LISTENERS}"
+  grep -q '非回环' "$case_tmp/warnings" || fail "$backend 必须保留非回环监听告警"
+}
+
+test_bug109_ss_interface_scoped_loopback() {
+  assert_interface_scoped_listener_classification ss
+}
+
+test_bug109_netstat_interface_scoped_loopback() {
+  assert_interface_scoped_listener_classification netstat
+}
+
+test_reference_hardening_matches_generated_unit() {
+  local unit doc fragment directive key expected
+  SECURITY_LEVEL=standard
+  unit=$(render_derper_service_unit '/usr/local/bin/derper -c /var/lib/derper/derper.json' derper derper '' "$(get_security_hardening_options)" /var/lib/derper)
+  for doc in "$ROOT_DIR/docs/REFERENCE_CN.md" "$ROOT_DIR/docs/REFERENCE_EN.md"; do
+    fragment=$(awk '
+      /^### systemd/ {section=1; next}
+      section && /^### / {exit}
+      section && /^```ini/ {in_ini=1; next}
+      section && /^```/ {in_ini=0; next}
+      in_ini && /^[A-Za-z][A-Za-z0-9]*=/ {print}
+    ' "$doc")
+    [[ -n "$fragment" ]] || fail "$doc 缺少加固示例"
+    while IFS= read -r directive; do
+      printf '%s\n' "$unit" | grep -Fxq -- "$directive" || fail "$doc 中的指令与实际unit不符：$directive"
+    done <<<"$fragment"
+    for key in StateDirectory StateDirectoryMode ReadWritePaths RestrictAddressFamilies; do
+      expected=$(printf '%s\n' "$unit" | grep "^${key}=")
+      printf '%s\n' "$fragment" | grep -Fxq -- "$expected" || fail "$doc 必须包含实际unit的 $key"
+    done
+  done
+}
+
 test_doc007_008_wording() {
   local advice listeners
   advice=$(print_server_node_acl_advice)
@@ -1628,6 +1706,9 @@ tests=(
   test_bug038_localapi_403_is_unhealthy
   test_bug039_mismatched_key_blocks_restart
   test_doc007_008_wording
+  test_bug109_ss_interface_scoped_loopback
+  test_bug109_netstat_interface_scoped_loopback
+  test_reference_hardening_matches_generated_unit
   test_doc008_unsearchable_cert_dir_is_unknown
   test_bug034_generated_task_survives_unexecutable_source
   test_bug034_timer_replaces_cron_once

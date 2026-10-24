@@ -5,7 +5,7 @@
 > 本文是中文的详细用户指南（技术参考）。主仓库首页 `README.md` 为精简版中文快速上手；英文用户指南见同目录的 `REFERENCE_EN.md`。
 
 > **脚本文件**：`deploy_derper_ip_selfsigned.sh`  
-> **当前版本**：0.2.17（2026-10-22）\
+> **当前版本**：0.2.18（2026-10-24）\
 > **查看版本**：`bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
@@ -423,25 +423,34 @@ openssl x509 -in /opt/derper/certs/fullchain.pem -outform DER | sha256sum | awk 
 
 ### systemd 安全加固
 
-生成的 systemd 服务包含多层保护：
+以下是默认节点状态目录、`standard` 安全级别的 `[Service]` 加固片段。完整服务还包含运行用户、`ExecStart` 等设置：
 
 ```ini
+[Service]
 # 防止权限提升
 NoNewPrivileges=true
 
-# 文件系统保护
-ProtectSystem=strict        # /usr, /boot, /efi 只读
-ProtectHome=true            # /home, /root, /run/user 不可访问
-PrivateTmp=true             # 私有 /tmp 和 /var/tmp
-ReadWritePaths=/opt/derper  # 仅允许写入安装目录
+# 文件系统默认只读；隐藏用户主目录，隔离临时目录
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
 
-# 网络限制
-RestrictAddressFamilies=AF_INET AF_INET6  # 仅 IPv4/IPv6
+# systemd 管理可写节点状态目录；安装树与证书保持只读
+StateDirectory=derper
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/derper
 
-# 系统调用过滤
-SystemCallFilter=@system-service  # 仅白名单安全系统调用
-SystemCallErrorNumber=EPERM       # 拒绝返回 EPERM 而非杀死进程
+# AF_UNIX 用于访问 tailscaled 的本地认证 socket
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# 仅允许服务所需的系统调用；拒绝时返回 EPERM
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 ```
+
+默认 unit 用 `-c /var/lib/derper/derper.json` 保存节点身份；自定义 `NODE_STATE_DIR` 时以实际生成的 `ReadWritePaths` 和 `-c` 路径为准。`-verify-clients -socket /run/tailscale/tailscaled.sock` 需要 `AF_UNIX`。
+
+旧安装迁移后，`/opt/derper/derper.json` 可能仍保留为节点私钥副本。先核对当前 unit 的 `-c`、运行用户可读性及服务健康，再按备份策略人工归档或清理旧文件；不能仅因旧路径存在就直接删除。
 
 ### 证书安全
 

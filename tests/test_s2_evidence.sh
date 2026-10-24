@@ -54,6 +54,51 @@ fi
 runuser -u derper-s2 -- touch "$state/probe" || fail "服务用户必须能写自己的状态目录"
 echo "ok - service user cannot rename or recreate certs and can write state"
 
+# BUG-110：真实用户/权限下确认就绪跳过、换用户仍迁移、不可读不冒充就绪。
+(
+  DEPLOY_STATE_DIR="$tmp/bug110-deploy"
+  SERVICE_PATH="$tmp/bug110.service"
+  BIN_PATH="$tmp/bug110-no-binary"
+  printf '[Service]\nUser=derper-s2\n' >"$SERVICE_PATH"
+  : >"$tmp/bug110-service-calls"
+  runtime=active
+  systemctl() {
+    case "$1" in
+      is-active) [[ "$runtime" == active ]] ;;
+      stop)
+        [[ -f "$DEPLOY_STATE_DIR/incomplete" ]] || fail "换用户前必须先保存恢复集和标记"
+        printf 'stop\n' >>"$tmp/bug110-service-calls"; runtime=inactive ;;
+      start) printf 'start\n' >>"$tmp/bug110-service-calls"; runtime=active ;;
+      *) return 0 ;;
+    esac
+  }
+  migrate_node_state || fail "真实服务用户已就绪时应成功"
+  [[ ! -s "$tmp/bug110-service-calls" && ! -e "$DEPLOY_STATE_DIR/incomplete" ]] || fail "真实就绪状态不得停启或新建恢复标记"
+  if ! id derper-s2-next >/dev/null 2>&1; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin derper-s2-next
+  fi
+  RUN_USER=derper-s2-next
+  migrate_node_state || fail "运行用户变化必须修复属主并保留保护"
+  [[ "$(cat "$tmp/bug110-service-calls")" == $'stop\nstart' ]] || fail "换用户应停启一次"
+  [[ "$(stat -c %U "$NODE_STATE_DIR/derper.json")" == derper-s2-next ]] || fail "配置属主必须改为新用户"
+  runuser -u derper-s2-next -- test -r "$NODE_STATE_DIR/derper.json" || fail "新用户必须可读"
+  migrate_node_state || fail "换用户完成后重复调用应成功"
+  [[ "$(cat "$tmp/bug110-service-calls")" == $'stop\nstart' && -f "$DEPLOY_STATE_DIR/incomplete" ]] || fail "跳过重复迁移必须保留恢复材料且不重启"
+
+  DEPLOY_STATE_DIR="$tmp/bug110-unreadable-deploy"
+  local_parent="$tmp/bug110-private-parent"
+  mkdir -p "$local_parent/state"
+  chmod 700 "$local_parent"
+  NODE_STATE_DIR="$local_parent/state"
+  printf 'node-identity\n' >"$NODE_STATE_DIR/derper.json"
+  chown -R derper-s2-next:derper-s2-next "$NODE_STATE_DIR"
+  chmod 700 "$NODE_STATE_DIR"
+  chmod 600 "$NODE_STATE_DIR/derper.json"
+  if migrate_node_state >/dev/null 2>&1; then fail "祖先目录不可遍历时不得把配置报成就绪"; fi
+  [[ -f "$DEPLOY_STATE_DIR/incomplete" ]] || fail "无法交给运行用户读取时必须保留标记"
+)
+echo "ok - BUG-110 skips ready state, protects user changes and refuses unreadable configuration"
+
 # BUG-060：真实双用户，验证回退后旧服务能遍历状态目录并读取身份/私钥。
 if ! id derper-s2-next >/dev/null 2>&1; then
   useradd --system --no-create-home --shell /usr/sbin/nologin derper-s2-next

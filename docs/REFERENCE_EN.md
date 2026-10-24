@@ -5,7 +5,7 @@
 > This is the detailed English user guide (technical reference). For the simplified Chinese quickstart now used as the main README, go to `../README.md`. For the Chinese user guide, see `REFERENCE_CN.md` in this folder.
 
 > **Script File**: `deploy_derper_ip_selfsigned.sh`  
-> **Current Version**: 0.2.17 (2026-10-22)\
+> **Current Version**: 0.2.18 (2026-10-24)\
 > **Show version**: `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
@@ -391,25 +391,34 @@ The script implements several security hardening measures by default:
 
 ### systemd Security Hardening
 
-The generated systemd service includes multiple protection layers:
+The following `[Service]` excerpt shows hardening for the default node-state directory at the `standard` security level. The complete unit also includes the run user, `ExecStart`, and other settings:
 
 ```ini
+[Service]
 # Prevent privilege escalation
 NoNewPrivileges=true
 
-# Filesystem protection
-ProtectSystem=strict        # Read-only /usr, /boot, /efi
-ProtectHome=true            # Inaccessible /home, /root, /run/user
-PrivateTmp=true             # Private /tmp and /var/tmp
-ReadWritePaths=/opt/derper  # Only allow writes to installation dir
+# Read-only filesystem by default; hide home directories and isolate temporary files
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
 
-# Network restrictions
-RestrictAddressFamilies=AF_INET AF_INET6  # Only IPv4/IPv6
+# systemd manages writable node state; the installation tree and certificates stay read-only
+StateDirectory=derper
+StateDirectoryMode=0700
+ReadWritePaths=/var/lib/derper
 
-# System call filtering
-SystemCallFilter=@system-service  # Whitelist safe syscalls only
-SystemCallErrorNumber=EPERM       # Deny with EPERM instead of killing
+# AF_UNIX is needed for the local tailscaled authentication socket
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+# Allow service system calls; return EPERM when denied
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
 ```
+
+The default unit stores node identity with `-c /var/lib/derper/derper.json`. With a custom `NODE_STATE_DIR`, follow the generated unit's `ReadWritePaths` and `-c` paths. `-verify-clients -socket /run/tailscale/tailscaled.sock` requires `AF_UNIX`.
+
+Migration may leave `/opt/derper/derper.json` as a copy of the node's private key. Confirm the current unit's `-c` path, readability by the run user, and service health before manually archiving or removing the old file under your backup policy. Its presence alone is not a reason to delete it.
 
 ### Certificate Security
 
