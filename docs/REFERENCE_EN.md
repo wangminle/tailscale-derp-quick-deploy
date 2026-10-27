@@ -5,7 +5,7 @@
 > This is the detailed English user guide (technical reference). For the simplified Chinese quickstart now used as the main README, go to `../README.md`. For the Chinese user guide, see `REFERENCE_CN.md` in this folder.
 
 > **Script File**: `deploy_derper_ip_selfsigned.sh`  
-> **Current Version**: 0.2.18 (2026-10-24)\
+> **Current Version**: 0.2.19 (2026-10-27)\
 > **Show version**: `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
@@ -276,10 +276,11 @@ prepare | apply | cancel | maintain
                           Cannot be combined with --check/--dry-run/--repair/--force/--uninstall/--recover-interrupted
 --metrics-textfile <P>    Export health check as Prometheus text metrics to path P
                           (requires --health-check or --install-healthcheck-cron; use with node_exporter)
---uninstall               Stop and uninstall derper systemd service (keep binary and certificates; also removes the health-check timer/cron and --tls-connlimit rules;
-                          the health-check stable copy under /usr/local/lib/derper-deploy is kept and can be removed manually)
+--uninstall               Stop and uninstall derper systemd service (keep binary and certificates; also removes the health-check timer/cron, certificate-maintain service/timer, and --tls-connlimit rules;
+                          the health-check stable copy under /usr/local/lib/derper-deploy is kept and can be removed manually).
+                          Remaining maintain unit files, enabled state, or running state exit non-zero and do not report completion
 --purge                   With --uninstall: additionally delete installation directory (/opt/derper)
---purge-all               With --uninstall: on top of --purge, also delete binary, /etc/derper/derper.env, the health-check stable program/status, and the script-created tailscaled socket drop-in; firewall rules and user/group accounts require manual confirmation
+--purge-all               With --uninstall: on top of --purge, also delete binary, /etc/derper/derper.env, the health-check stable program/status, the maintenance script copy and target.conf, and the script-created tailscaled socket drop-in; firewall rules and user/group accounts require manual confirmation
 --recover-interrupted     Explicitly recover an unfinished upgrade/migration. Interrupted steps are never continued automatically.
                           While an incomplete marker exists, ordinary install/repair/rotation/uninstall are blocked; the recovery
                           set and marker live under /var/lib/derper-deploy (root-owned). Not with install, repair, check, or uninstall.
@@ -572,9 +573,9 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 Exit code semantics (for shell/monitoring decision):
 
 ```text
-0  All key health items normal (service, listeners, desired configuration, and certificates are healthy, the live certificate matches the on-disk certificate; with -verify-clients on, tailscaled is running and LocalAPI is reachable)
+0  All key health items normal (service, listeners, desired configuration, and certificates are healthy, the live certificate matches the on-disk certificate; with -verify-clients on, tailscaled is running and the derper service user can reach LocalAPI)
 1  At least one critical health check is a confirmed failure, or --metrics-textfile could not be written
-2  Result unknown: the caller cannot read the certificate directory, or the tailscaled LocalAPI state cannot be confirmed; unknown is never reported as healthy
+2  Result unknown: the caller cannot read the certificate directory, or it cannot be confirmed that the derper service user can reach tailscaled LocalAPI; unknown is never reported as healthy
 ```
 
 Any non-zero status means not healthy, so an existing `if ! --health-check` guard keeps working unchanged.
@@ -609,7 +610,7 @@ Example output (excerpt):
 ℹ️  Resource: derper memory RSS ~3 MiB
 ```
 
-An unknown result is shown as a ⚠️ line (for example "Certificate: no permission to confirm" or "Client verification: enabled, but the current identity cannot confirm tailscaled LocalAPI") and returns exit code 2.
+An unknown result is shown as a ⚠️ line (for example "Certificate: no permission to confirm" or "Client verification: enabled, but it cannot be confirmed that the derper service user can reach tailscaled LocalAPI") and returns exit code 2. The caller (often root) reaching LocalAPI does not prove that the unit `User=` can.
 
 Prometheus metrics sample (text file content):
 
@@ -672,7 +673,7 @@ If temporarily unable to login, can append `--no-verify-clients` when running sc
 ## Uninstall
 
 ```bash
-# Stop and uninstall systemd service (keep binary and certificates; also removes the health-check timer/cron and --tls-connlimit rules)
+# Stop and uninstall systemd service (keep binary and certificates; also removes the health-check timer/cron, certificate-maintain service/timer, and --tls-connlimit rules)
 sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall
 
 # Uninstall and cleanup installation directory (certificates etc.)
@@ -682,7 +683,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall --purge
 sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall --purge-all
 ```
 
-Note: Uninstall doesn't affect Tailscale itself (tailscaled, clients etc.). To remove together, use the distro's normal method. Ordinary uninstall and `--purge` keep the health-check stable copy. `--purge-all` removes the stable program and status (default directory `/usr/local/lib/derper-deploy/`, including the cron fallback directory) and removes empty directories. Unrelated user files remain; a symlink program directory or failed deletion returns non-zero.
+Note: Uninstall doesn't affect Tailscale itself (tailscaled, clients etc.). To remove together, use the distro's normal method. Ordinary uninstall and `--purge` keep the health-check stable copy and the maintenance script copy. `--purge-all` removes the stable program and status (default directory `/usr/local/lib/derper-deploy/`, including the cron fallback directory), plus the maintenance script copy and `target.conf`, and removes empty directories. Unrelated user files remain; a symlink program directory or failed deletion returns non-zero. If a maintain service/timer file, enabled state, or running state remains, the rest of cleanup still continues, but the command exits non-zero and does not report completion.
 
 ---
 

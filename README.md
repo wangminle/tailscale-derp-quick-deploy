@@ -1,7 +1,7 @@
 # Tailscale DERP Quick Deploy Script
 
 > **Language / 语言**: [English](#english) | [中文](#中文)  
-> **Version / 版本**: `0.2.18` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
+> **Version / 版本**: `0.2.19` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 维护入口 / Maintenance: [配置、CLI、本地导入、JSON、H0～H3 与证书轮换](docs/MAINTENANCE_CN.md) · [English guide](docs/MAINTENANCE_EN.md)。测试套件分工与命名约定见 [tests/README.md](tests/README.md)；生产迁移、隔离 Tailnet 真写和真实外部客户端验收单独记录。
 
@@ -237,7 +237,7 @@ While resolving the same-origin module version and downloading/building derper, 
 | `prepare` / `apply` / `cancel` | Prepare a candidate certificate, switch it after `--accept-cert-rotation`, or discard it. `--yes` does not confirm rotation | Candidate files under the deploy-state directory; live service unchanged until apply | Planned fingerprint rotation; see [the maintenance guide](docs/MAINTENANCE_EN.md) |
 | `--enable-auto-maintain` / `--disable-auto-maintain` | Record or clear on-host automatic renewal. Credentials stay in `/etc/derper/policy-api.env` (root, mode 0600), never in `deploy.conf` | Independent `derper-cert-maintain` timer, or its removal | Conditional auto-renewal when write scope and a Tailnet target are ready; GET/validate is not write permission |
 
-`--uninstall` also removes the health-check timer/cron and `--tls-connlimit` rules (the stable copy under `/usr/local/lib/derper-deploy` is kept). `--relax-socket-perms` restores the original socket mode when the script exits.
+`--uninstall` also removes the health-check timer/cron, certificate-maintain service/timer, and `--tls-connlimit` rules (the stable copy under `/usr/local/lib/derper-deploy` is kept). Remaining maintain unit files, enabled state, or running state exit non-zero and do not report completion. `--relax-socket-perms` restores the original socket mode when the script exits.
 
 **Prometheus Metrics Example:**
 
@@ -760,7 +760,7 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # 使用当前登录用户
 | `prepare` / `apply` / `cancel` | 生成候选证书、确认后切换，或丢弃候选。`--yes` 不能代替 `--accept-cert-rotation` | 部署状态目录中的候选；apply 前不切换正在运行的服务 | 计划内指纹轮换；详见 [维护指南](docs/MAINTENANCE_CN.md) |
 | `--enable-auto-maintain` / `--disable-auto-maintain` | 登记或关闭同机自动换证。凭据只放 `/etc/derper/policy-api.env`（root、0600），不进入 deploy.conf | 独立 `derper-cert-maintain` timer，或将其删除 | 写授权与 Tailnet 目标就绪时的条件式自动维护；GET/validate 成功不能证明可写 |
 
-`--uninstall` 会同时删除健康检查 timer/cron 与 `--tls-connlimit` 规则（`/usr/local/lib/derper-deploy` 下的稳定副本保留）。`--relax-socket-perms` 在脚本退出时恢复 socket 原权限。
+`--uninstall` 会同时删除健康检查 timer/cron、证书维护 service/timer 与 `--tls-connlimit` 规则（`/usr/local/lib/derper-deploy` 下的稳定副本保留）。维护 unit 文件、启用或运行状态残留时退出非零，不报告完成。`--relax-socket-perms` 在脚本退出时恢复 socket 原权限。
 
 **Prometheus 指标示例：**
 

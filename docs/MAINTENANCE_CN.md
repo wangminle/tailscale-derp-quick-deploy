@@ -102,7 +102,7 @@ cat /var/lib/derper-deploy/health/status.json
 | --- | --- |
 | H0 | 采集工具是否存在 |
 | H1 | 服务、正确 PID 的 TCP/UDP 监听、证书对/有效期/SAN与在线指纹 |
-| H2 | verify-clients 开启时的 tailscaled/LocalAPI 依赖；关闭时 not_applicable |
+| H2 | verify-clients 开启时的 tailscaled/LocalAPI 依赖（按 derper unit 的 `User=` 判断，不是调用者身份）；关闭时 not_applicable |
 | H3 | 独立合法客户端对指定 Region/节点的真实 DERP 转发和 STUN 检查 |
 
 没有探针时 H3=not_checked，基础0退出码只说明本地范围通过。`--require-h3` 让缺少 H3 的结果返回2，并阻断发布提交。显式配置探针后，其故障或未知也阻断提交。正常启动与门禁通过后才清除变更标记；失败恢复旧版本并复验，恢复失败保留材料。
@@ -132,6 +132,8 @@ DERP/STUN 值为 ok/failed；全通过退出0，确认失败且报告对应faile
 
 当前隔离 VM 测试验证了协议解析、失败/未知门禁和回退；真实独立 Tailnet 客户端的 H3 验收、生产升级和控制面协调分别待实测，不从本地通过推断它们已完成。
 
+可选的独立 Linux 客户端适配器为 `scripts/h3_probe.py`（Python3 标准库）。它使用现有 tailscaled LocalAPI 的合法节点身份，核对单节点 Region/地址/端口、下发指纹与服务证书、真实指定 Region 往返及 STUN 响应；无需读取私钥。直连、其他 Region、多节点歧义或传播未确认返回未知，适配器不会自动强制改路由。具体部署、可信 SSH wrapper 和真实 VM/GD/长效兼容步骤见[真实验收操作包](../tests/REAL_ACCEPTANCE.md)。本地适配器回归不代表真实 H3 已通过。
+
 ## 证书轮换与条件式自动维护
 
 自动维护必须配置非空、非全空白的 `TS_TAILNET`，可由部署配置或独立凭据文件提供；未配置时不请求 OAuth 或策略 API，显式 `--enable-auto-maintain` 会报错且不安装 timer。有效目标会保存到定时配置。
@@ -150,8 +152,10 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh apply --ip YOUR_PUBLIC_IP --acc
 sudo bash scripts/deploy_derper_ip_selfsigned.sh cancel
 ```
 
-prepare 只写入 `$DEPLOY_STATE_DIR/cert-rotation/` 的候选和片段，不切换正在运行的服务。apply 在确认后切换本地证书；目标 IP、Region、端口或已记录的 Tailnet 与 prepare 不一致时拒绝，须重新 prepare。成功切换后旧证书归档到 systemd unit 旁的 `.certs-archive`，只有未完成事务才会在下次命令自动恢复。服务原先在运行时，切换后要确认进程仍在运行且实际加载的指纹与新证书一致，否则恢复旧证书并不记为已应用。未配置云端写授权时，部署摘要会说明人工维护步骤，安装本身不失败。
+prepare 只写入 `$DEPLOY_STATE_DIR/cert-rotation/` 的候选和片段，不切换正在运行的服务。改变 `--cert-days` 不会复用旧有效期的候选。apply 在确认后切换本地证书；目标 IP、Region、端口、证书有效期或已记录的 Tailnet 与 prepare 不一致，或候选已过期、剩余不足 1 小时时拒绝，须重新 prepare。成功切换后旧证书归档到 systemd unit 旁的 `.certs-archive`，只有未完成事务才会在下次命令自动恢复。服务原先在运行时，切换后要确认进程仍在运行且实际加载的指纹与新证书一致，否则恢复旧证书并不记为已应用。未配置云端写授权时，部署摘要会说明人工维护步骤，安装本身不失败。
+
+自动模式下，本地切换失败后，只有确认磁盘旧证书与原运行服务的实际旧指纹都已恢复，才基于最新策略和 ETag 反向撤回本节点 CertName；原先停止的服务保持停止。若无法确认旧服务恢复，脚本保留云端指纹并记录 `unknown / needs_coordination / needs_manual=1`，定时入口也保留该原因，需人工协调。云端只有在策略可解析且确认没有本节点时才跳过补偿；重复 HostName、Region 不匹配、CertName 缺失或策略无法解析一律转人工，不把空值当成“无需补偿”。证书归档失败时同样先处理本地恢复，再决定云端补偿，不等到退出清理才恢复。
 
 云端 secret 放在独立文件，不写入日志或 derper 环境。默认路径 `/etc/derper/policy-api.env`，root 所有、权限 0600，字段仅 `TS_TAILNET`、`TS_API_CLIENT_ID`、`TS_API_CLIENT_SECRET`、`TS_API_BASE`、`TS_API_TOKEN`、`POLICY_SOURCE`。维护配置可以记录该文件路径，但不记录 secret。`POLICY_SOURCE=gitops` 时脚本拒绝直接写云端，避免与仓库发布双写。GET 或 validate 成功不能证明可写。自动提交要求 GET 带回 ETag，并用 `If-Match` 提交；HTTP 412 或 validate 错误都不会切换本地证书。
 
-显式 `--enable-auto-maintain` 且写授权齐全时，脚本把维护程序原子复制到部署状态目录，写出带节点、端口、有效期、提前天数、内网放行、运行用户、客户端校验和凭据路径的 `target.conf`，再 `daemon-reload` 并 `enable --now`。unit 与脚本副本拒绝符号链接。timer 执行的是部署状态目录里的脚本副本而不是原脚本；升级部署脚本后需再次执行带 `--enable-auto-maintain` 的命令刷新副本，否则定时任务会继续运行旧版脚本。timer 已启用且处于 active 之后，才把自动维护记为 ready。启用失败保持未知，不宣称已就绪。`--disable-auto-maintain` 才撤销登记并删除 timer；一次临时授权未知不会取消已启用意图。`cancel` 只丢弃候选，不要求公网 IP，也不打印部署向导。每天的 `maintain` 不重复打印安装说明。普通卸载保留维护副本；`--purge-all` 才删除该副本和 `target.conf`。卸载 derper 时也会删除维护 unit 和证书归档。每次执行会重验条件；未到期或条件不足不替换旧证书。已成功应用的候选不会在下一周期复用。失败只记本机 journal 和 `$(deploy_state_root)/maintenance/status`。当前没有站外通知。隔离 Tailnet 的真实策略写入与独立客户端复验仍待办。
+显式 `--enable-auto-maintain` 且写授权齐全时，脚本把维护程序原子复制到部署状态目录，写出带节点、端口、有效期、提前天数、内网放行、运行用户、客户端校验和凭据路径的 `target.conf`，再 `daemon-reload` 并 `enable --now`。unit 与脚本副本拒绝符号链接。timer 执行的是部署状态目录里的脚本副本而不是原脚本；升级部署脚本后需再次执行带 `--enable-auto-maintain` 的命令刷新副本，否则定时任务会继续运行旧版脚本。timer 已启用且处于 active 之后，才把自动维护记为 ready。启用失败保持未知，不宣称已就绪。`--disable-auto-maintain` 才撤销登记并删除 timer；删除失败返回非零并记录 `scheduler_state=failed`。一次临时授权未知不会取消已启用意图。`cancel` 只丢弃候选，不要求公网 IP，也不打印部署向导。每天的 `maintain` 不重复打印安装说明，成功换证后也不重新登记调度或覆盖 `success_replaced`。普通卸载保留维护副本；`--purge-all` 才删除该副本和 `target.conf`。卸载 derper 时也会删除维护 unit 和证书归档；`daemon-reload` 失败，或 unit 文件、启用、运行状态残留时退出非零，不报告完成。每次执行会重验条件；确定未到期或条件不足不替换旧证书。无法计算到期时间时非零退出，记录原因并标记需人工，不写成 `idle`。已成功应用的候选不会在下一周期复用。失败只记本机 journal 和 `$(deploy_state_root)/maintenance/status`。当前没有站外通知。隔离 Tailnet 的真实策略写入与独立客户端复验仍待办。

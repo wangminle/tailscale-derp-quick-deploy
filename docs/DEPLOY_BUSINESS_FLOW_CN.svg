@@ -1,0 +1,395 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="3200" height="3700" viewBox="0 0 3200 3700" role="img" aria-labelledby="title desc">
+  <title id="title">Tailscale DERP 部署脚本业务执行全流程与判断分支</title>
+  <desc id="desc">deploy_derper_ip_selfsigned.sh 的主入口、部署发布、证书轮换、自动维护、健康检查、恢复和卸载全流程图。</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#43536a"/>
+    </marker>
+    <marker id="arrow-red" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#b63b45"/>
+    </marker>
+    <style><![CDATA[
+      svg { background:#f4f7fb; font-family:"PingFang SC","Microsoft YaHei","Noto Sans CJK SC",Arial,sans-serif; }
+      .title { font-size:38px; font-weight:700; fill:#15263e; }
+      .subtitle { font-size:19px; fill:#52647a; }
+      .lane { fill:#ffffff; stroke:#d4ddea; stroke-width:2; }
+      .lane-title { font-size:27px; font-weight:700; fill:#17385d; }
+      .section { font-size:21px; font-weight:700; fill:#46617d; }
+      .process,.decision,.success,.failure,.state,.external,.note { stroke-width:2; }
+      .process { fill:#eaf3ff; stroke:#6e9bd2; }
+      .decision { fill:#fff4d8; stroke:#d39a27; }
+      .success { fill:#e7f6ec; stroke:#4d9a68; }
+      .failure { fill:#ffeaec; stroke:#c9646d; }
+      .state { fill:#f1ebff; stroke:#9071c1; }
+      .external { fill:#e9f5f6; stroke:#55a0a6; }
+      .note { fill:#f1f4f8; stroke:#9aaabc; }
+      .text { font-size:18px; fill:#172b42; text-anchor:middle; }
+      .small { font-size:16px; fill:#42556c; text-anchor:middle; }
+      .branch { font-size:16px; font-weight:700; fill:#885f0c; }
+      .flow { fill:none; stroke:#43536a; stroke-width:2.4; marker-end:url(#arrow); }
+      .failflow { fill:none; stroke:#b63b45; stroke-width:2.2; marker-end:url(#arrow-red); }
+      .dash { stroke-dasharray:7 6; }
+      .code { font-family:Menlo,Consolas,monospace; font-size:16px; fill:#25476c; text-anchor:middle; }
+      .legend { font-size:17px; fill:#31465e; }
+    ]]></style>
+  </defs>
+
+  <text x="1600" y="62" class="title" text-anchor="middle">DERP 部署脚本：业务执行全流程与判断分支</text>
+  <text x="1600" y="102" class="subtitle" text-anchor="middle">scripts/deploy_derper_ip_selfsigned.sh · 主入口 / 部署发布 / 证书轮换与维护 / 健康检查与恢复卸载</text>
+  <text x="1600" y="132" class="subtitle" text-anchor="middle">橙色＝判断　蓝色＝执行　紫色＝事务/持久状态　绿色＝成功或提交　红色＝失败/回滚　青色＝外部系统</text>
+
+  <!-- 四条泳道 -->
+  <rect x="30" y="160" width="770" height="3500" class="lane" rx="22"/>
+  <rect x="820" y="160" width="770" height="3500" class="lane" rx="22"/>
+  <rect x="1610" y="160" width="770" height="3500" class="lane" rx="22"/>
+  <rect x="2400" y="160" width="770" height="3500" class="lane" rx="22"/>
+
+  <text x="415" y="207" class="lane-title" text-anchor="middle">A. 主入口与模式分派</text>
+  <text x="1205" y="207" class="lane-title" text-anchor="middle">B. 部署、服务发布与提交</text>
+  <text x="1995" y="207" class="lane-title" text-anchor="middle">C. 证书轮换与自动维护</text>
+  <text x="2785" y="207" class="lane-title" text-anchor="middle">D. 健康门禁、恢复与卸载</text>
+
+  <!-- A 主入口 -->
+  <rect x="65" y="245" width="700" height="76" class="process"/>
+  <text x="415" y="278" class="text"><tspan x="415">启动 main</tspan><tspan x="415" dy="24">mktemp 安全临时目录；注册 EXIT cleanup</tspan></text>
+  <path d="M415 321 V345" class="flow"/>
+
+  <rect x="65" y="345" width="700" height="92" class="process"/>
+  <text x="415" y="375" class="text"><tspan x="415">parse_args + 显式 --config</tspan><tspan x="415" dy="24">配置为白名单数据；文件先加载，CLI 后覆盖</tspan><tspan x="415" dy="22">识别 wizard / 子命令 / 旧 flags</tspan></text>
+  <path d="M415 437 V461" class="flow"/>
+
+  <rect x="65" y="461" width="700" height="92" class="decision"/>
+  <text x="415" y="491" class="text"><tspan x="415">参数和主模式组合合法？</tspan><tspan x="415" dy="24">互斥、依赖、取值范围、输出路径是否冲突</tspan></text>
+  <path d="M415 553 V577" class="flow"/>
+  <path d="M765 507 H785 V735 H765" class="failflow"/>
+  <text x="776" y="496" class="branch">否：exit 1</text>
+
+  <rect x="65" y="577" width="700" height="100" class="decision"/>
+  <text x="415" y="606" class="text"><tspan x="415">变更模式的 H3 前置条件满足？</tspan><tspan x="415" dy="24">require-h3 必须有探针；路径可信且 timeout 存在</tspan><tspan x="415" dy="22">只读健康查询不在此阻断，改报 unknown</tspan></text>
+  <path d="M415 677 V701" class="flow"/>
+  <path d="M765 627 H785 V735 H765" class="failflow"/>
+  <text x="776" y="616" class="branch">否：变更前 exit 1</text>
+
+  <rect x="65" y="701" width="700" height="82" class="decision"/>
+  <text x="415" y="731" class="text"><tspan x="415">wizard 模式？</tspan><tspan x="415" dy="24">交互选择场景/账户/端口/校验/代理</tspan></text>
+  <path d="M415 783 V807" class="flow"/>
+  <path d="M65 742 H45 V1160 H65" class="flow"/>
+  <text x="49" y="731" class="branch">是：生成并可选执行命令</text>
+
+  <rect x="65" y="807" width="700" height="88" class="process"/>
+  <text x="415" y="837" class="text"><tspan x="415">resolve_run_user + 默认 NODE_STATE_DIR</tspan><tspan x="415" dy="24">显式用户 &gt; 已部署 unit User= &gt; 首次非交互 derper</tspan></text>
+  <path d="M415 895 V919" class="flow"/>
+
+  <rect x="65" y="919" width="700" height="88" class="decision"/>
+  <text x="415" y="949" class="text"><tspan x="415">recover / --recover-interrupted？</tspan><tspan x="415" dy="24">root + 取锁后仅显式恢复，不自动续做</tspan></text>
+  <path d="M415 1007 V1031" class="flow"/>
+  <path d="M65 963 H45 V2430 H65" class="flow"/>
+  <text x="49" y="952" class="branch">是：转 D-恢复</text>
+
+  <rect x="65" y="1031" width="700" height="92" class="state"/>
+  <text x="415" y="1061" class="text"><tspan x="415">非只读：ordinary_change_allowed + flock</tspan><tspan x="415" dy="24">有 incomplete 或锁被占用则阻断</tspan><tspan x="415" dy="22">check / health 不取变更锁</tspan></text>
+  <path d="M415 1123 V1147" class="flow"/>
+  <path d="M765 1077 H785 V1160 H765" class="failflow"/>
+  <text x="776" y="1066" class="branch">失败：exit 1</text>
+
+  <rect x="65" y="1147" width="700" height="82" class="decision"/>
+  <text x="415" y="1177" class="text"><tspan x="415">uninstall？</tspan><tspan x="415" dy="24">卸载优先，不依赖 OS/IP/参数探测</tspan></text>
+  <path d="M415 1229 V1253" class="flow"/>
+  <path d="M65 1188 H45 V4490 H65" class="flow"/>
+  <text x="49" y="1177" class="branch">是：转 D-卸载</text>
+
+  <rect x="65" y="1253" width="700" height="100" class="process"/>
+  <text x="415" y="1283" class="text"><tspan x="415">check_os_environment</tspan><tspan x="415" dy="24">仅 Linux；拒绝 macOS / WSL / 未知环境</tspan><tspan x="415" dy="22">有副作用则 require_root + recover_cert_update</tspan></text>
+  <path d="M415 1353 V1377" class="flow"/>
+
+  <rect x="65" y="1377" width="700" height="104" class="decision"/>
+  <text x="415" y="1407" class="text"><tspan x="415">IP 与参数校验结果？</tspan><tspan x="415" dy="24">health 从 unit 推断；其他模式自动探测公网 IP</tspan><tspan x="415" dy="22">IP 分类、端口、Region、用户、证书天数等</tspan></text>
+  <path d="M415 1481 V1505" class="flow"/>
+  <path d="M765 1429 H785 V1660 H765" class="failflow"/>
+  <text x="776" y="1418" class="branch">变更模式失败：exit 1</text>
+  <text x="776" y="1440" class="branch">check/health 记录后继续教育</text>
+  <text x="776" y="1462" class="branch">cancel 可继续</text>
+
+  <rect x="65" y="1505" width="700" height="92" class="decision"/>
+  <text x="415" y="1535" class="text"><tspan x="415">prepare / apply / cancel / maintain？</tspan><tspan x="415" dy="24">进入 D 阶段命令</tspan></text>
+  <path d="M415 1597 V1621" class="flow"/>
+  <path d="M65 1551 H45 V1690 H65" class="flow"/>
+  <text x="49" y="1540" class="branch">是：转 C</text>
+
+  <rect x="65" y="1621" width="700" height="92" class="decision"/>
+  <text x="415" y="1651" class="text"><tspan x="415">health / status / derpmap？</tspan><tspan x="415" dy="24">单次采集，不修改系统</tspan></text>
+  <path d="M415 1713 V1737" class="flow"/>
+  <path d="M65 1667 H45 V2640 H65" class="flow"/>
+  <text x="49" y="1656" class="branch">是：转 D-健康</text>
+
+  <rect x="65" y="1737" width="700" height="96" class="decision"/>
+  <text x="415" y="1767" class="text"><tspan x="415">check / --dry-run？</tspan><tspan x="415" dy="24">汇总环境、配置、证书、用户、端口与修复建议</tspan><tspan x="415" dy="22">参数校验失败则返回 1，否则 0</tspan></text>
+  <path d="M415 1833 V1857" class="flow"/>
+  <path d="M65 1785 H45 V5350 H65" class="flow"/>
+  <text x="49" y="1774" class="branch">是：只读结束</text>
+
+  <rect x="65" y="1857" width="700" height="108" class="process"/>
+  <text x="415" y="1887" class="text"><tspan x="415">正式部署前置检查</tspan><tspan x="415" dy="24">root → 重新探测/校验 IP → precheck_verify_clients</tspan><tspan x="415" dy="22">verify=on 要求 tailscaled 运行且已登录</tspan><tspan x="415" dy="22">align_derper_version_with_tailscale</tspan></text>
+  <path d="M415 1965 V1989" class="flow"/>
+
+  <rect x="65" y="1989" width="700" height="100" class="decision"/>
+  <text x="415" y="2019" class="text"><tspan x="415">derper_binary_needs_install？</tspan><tspan x="415" dy="24">缺二进制、目标版本漂移或本地导入必须更新</tspan><tspan x="415" dy="22">随后选择 FORCE / REPAIR / 默认幂等</tspan></text>
+  <path d="M415 2089 V2113" class="flow"/>
+  <text x="425" y="2100" class="branch">转 B-部署</text>
+
+  <rect x="65" y="2160" width="700" height="100" class="state"/>
+  <text x="415" y="2190" class="text"><tspan x="415">部署收尾 finalize_deployment_report</tspan><tspan x="415" dy="24">指纹：在线 TLS → journal → 磁盘证书</tspan><tspan x="415" dy="22">输出 derpMap / 验证步骤 / 自动维护反馈</tspan></text>
+  <path d="M415 2260 V2284" class="flow"/>
+  <path d="M765 2210 H785 V2280 H765" class="failflow"/>
+  <text x="776" y="2199" class="branch">无指纹：非零</text>
+  <text x="776" y="2221" class="branch">绝不降级 InsecureForTests</text>
+
+  <rect x="65" y="2284" width="700" height="96" class="note"/>
+  <text x="415" y="2314" class="text"><tspan x="415">EXIT cleanup（所有出口）</tspan><tspan x="415" dy="24">恢复临时放宽的 socket 权限</tspan><tspan x="415" dy="22">失败且证书事务未提交则恢复证书/旧服务；删临时目录</tspan></text>
+
+  <!-- B 部署与发布 -->
+  <text x="1205" y="255" class="section" text-anchor="middle">B1. 三种部署模式（三选一）</text>
+
+  <rect x="855" y="285" width="700" height="118" class="decision"/>
+  <text x="1205" y="315" class="text"><tspan x="1205">FORCE：全量重装</tspan><tspan x="1205" dy="24">依赖 → 安装 derper → 强制重签 → 端口预检</tspan><tspan x="1205" dy="22">→ 写 unit → 防火墙/运行时检查</tspan></text>
+  <path d="M1205 403 V445" class="flow"/>
+
+  <rect x="855" y="445" width="700" height="118" class="decision"/>
+  <text x="1205" y="475" class="text"><tspan x="1205">REPAIR：修复配置</tspan><tspan x="1205" dy="24">版本漂移才重装；ensure_compatible_certs</tspan><tspan x="1205" dy="22">→ 端口预检 → 写 unit → 检查</tspan></text>
+  <path d="M1205 563 V605" class="flow"/>
+
+  <rect x="855" y="605" width="700" height="150" class="decision"/>
+  <text x="1205" y="635" class="text"><tspan x="1205">默认幂等：按需变更</tspan><tspan x="1205" dy="24">二进制/证书需要才安装；service_needs_reconcile 才写 unit</tspan><tspan x="1205" dy="22">changed=0 且 health_is_ok：门禁 → 就绪退出</tspan><tspan x="1205" dy="22">changed=0 但不健康：仍调用门禁，禁止假成功</tspan></text>
+  <path d="M1205 755 V797" class="flow"/>
+
+  <rect x="855" y="797" width="700" height="124" class="process"/>
+  <text x="1205" y="827" class="text"><tspan x="1205">候选二进制发布 publish_derper_candidate</tspan><tspan x="1205" dy="24">go install 到候选目录，或导入固定版本 Linux ELF</tspan><tspan x="1205" dy="22">校验摘要/架构/模块版本/帮助能力/-a</tspan><tspan x="1205" dy="22">verify=on 时与运行中 tailscaled revision 同源</tspan></text>
+  <path d="M1205 921 V963" class="flow"/>
+  <path d="M1555 859 H1575 V1080 H1575" class="failflow"/>
+  <text x="1566" y="848" class="branch">校验失败：旧二进制不动</text>
+
+  <rect x="855" y="963" width="700" height="116" class="state"/>
+  <text x="1205" y="993" class="text"><tspan x="1205">保存恢复集并写 incomplete</tspan><tspan x="1205" dy="24">旧二进制/unit/config/state + 摘要 + run_intent</tspan><tspan x="1205" dy="22">候选原子替换 BIN_PATH；首装记 first-install</tspan></text>
+  <path d="M1205 1079 V1121" class="flow"/>
+
+  <text x="1205" y="1150" class="section" text-anchor="middle">B2. 证书与节点状态</text>
+
+  <rect x="855" y="1180" width="700" height="146" class="decision"/>
+  <text x="1205" y="1210" class="text"><tspan x="1205">ensure_compatible_certs</tspan><tspan x="1205" dy="24">不可读→阻断；证书私钥错配→优先恢复备份</tspan><tspan x="1205" dy="22">有效且命名正确→仅修权限/兼容链接</tspan><tspan x="1205" dy="22">旧命名→复制保留指纹；其他→确认后重签</tspan></text>
+  <path d="M1205 1326 V1368" class="flow"/>
+
+  <rect x="855" y="1368" width="700" height="126" class="state"/>
+  <text x="1205" y="1398" class="text"><tspan x="1205">证书事务 begin_cert_update</tspan><tspan x="1205" dy="24">备份 certs/unit/was-running；原子替换与权限加固</tspan><tspan x="1205" dy="22">已有证书换指纹需 rotate 或 --accept-cert-rotation</tspan><tspan x="1205" dy="22">失败→恢复证书和旧服务；成功后才 commit</tspan></text>
+  <path d="M1205 1494 V1536" class="flow"/>
+
+  <rect x="855" y="1536" width="700" height="132" class="process"/>
+  <text x="1205" y="1566" class="text"><tspan x="1205">migrate_node_state</tspan><tspan x="1205" dy="24">状态已就绪则跳过，避免重复停启</tspan><tspan x="1205" dy="22">遗留非空身份→建恢复快照→停服→复制/chown 0600</tspan><tspan x="1205" dy="22">核对字节、证书未变、运行用户可读→按原意图恢复</tspan></text>
+  <path d="M1205 1668 V1710" class="flow"/>
+  <path d="M1555 1602 H1575 V1810 H1575" class="failflow"/>
+  <text x="1566" y="1591" class="branch">失败：保留恢复集和标记</text>
+
+  <rect x="855" y="1710" width="700" height="116" class="decision"/>
+  <text x="1205" y="1740" class="text"><tspan x="1205">check_port_conflicts</tspan><tspan x="1205" dy="24">TCP 与 UDP 分开；按 MainPID 核对端口归属</tspan><tspan x="1205" dy="22">外部进程占用→中止；本 derper 占用→允许修复</tspan></text>
+  <path d="M1205 1826 V1868" class="flow"/>
+
+  <text x="1205" y="1897" class="section" text-anchor="middle">B3. systemd 写入与发布门禁</text>
+
+  <rect x="855" y="1927" width="700" height="138" class="process"/>
+  <text x="1205" y="1957" class="text"><tspan x="1205">write_systemd_service</tspan><tspan x="1205" dy="24">配置用户/socket 访问 → 选择 -a 或 -https-port</tspan><tspan x="1205" dy="22">生成 ExecStart、StateDirectory、basic/standard/paranoid</tspan><tspan x="1205" dy="22">原子写 unit → daemon-reload → enable/start 或 restart</tspan></text>
+  <path d="M1205 2065 V2107" class="flow"/>
+
+  <rect x="855" y="2107" width="700" height="126" class="decision"/>
+  <text x="1205" y="2137" class="text"><tspan x="1205">service_verified_running + publish_verification_gate</tspan><tspan x="1205" dy="24">active/MainPID、TCP/UDP 监听、TLS 握手</tspan><tspan x="1205" dy="22">H0～H2、证书与配置；请求时包含 H3 与指标新鲜度</tspan><tspan x="1205" dy="22">缺工具仅允许对应观测降级，已知故障不得放行</tspan></text>
+  <path d="M1205 2233 V2275" class="flow"/>
+  <path d="M1555 2170 H1575 V2380 H1575" class="failflow"/>
+  <text x="1566" y="2159" class="branch">门禁失败</text>
+
+  <rect x="855" y="2275" width="700" height="104" class="decision"/>
+  <text x="1205" y="2305" class="text"><tspan x="1205">paranoid 启动失败？</tspan><tspan x="1205" dy="24">删除 MemoryDenyWriteExecute 并标记降级后重试一次</tspan><tspan x="1205" dy="22">其他级别或降级仍失败→进入回滚</tspan></text>
+  <path d="M1205 2379 V2421" class="flow"/>
+
+  <rect x="855" y="2421" width="700" height="126" class="failure"/>
+  <text x="1205" y="2451" class="text"><tspan x="1205">rollback_failed_release</tspan><tspan x="1205" dy="24">证书事务回滚 + A/B 恢复旧二进制/unit/config/state</tspan><tspan x="1205" dy="22">原 active 才重启并复验；原停止保持停止</tspan><tspan x="1205" dy="22">恢复失败→保留恢复集/incomplete，转显式 recover</tspan></text>
+  <path d="M1205 2547 V2589" class="failflow"/>
+
+  <rect x="855" y="2589" width="700" height="96" class="success"/>
+  <text x="1205" y="2619" class="text"><tspan x="1205">验证通过：commit_deploy_change</tspan><tspan x="1205" dy="24">删除 incomplete；证书事务 commit 后才执行 extras</tspan></text>
+  <path d="M1205 2685 V2727" class="flow"/>
+
+  <rect x="855" y="2727" width="700" height="130" class="decision"/>
+  <text x="1205" y="2757" class="text"><tspan x="1205">run_post_deploy_extras</tspan><tspan x="1205" dy="24">tls-connlimit：安装/更新；显式 0 删除；省略则不动</tspan><tspan x="1205" dy="22">healthcheck：优先 timer，否则 cron；失败回滚旧调度</tspan><tspan x="1205" dy="22">extras 失败只报非零，不回滚已验证的服务和证书</tspan></text>
+  <path d="M1205 2857 V2899" class="flow"/>
+
+  <rect x="855" y="2899" width="700" height="104" class="decision"/>
+  <text x="1205" y="2929" class="text"><tspan x="1205">finish_deploy_auto_maintain</tspan><tspan x="1205" dy="24">应用启用/停用策略并打印 ready / manual / unknown</tspan><tspan x="1205" dy="22">scheduler_state=failed 时部署收尾非零</tspan></text>
+  <path d="M1205 3003 V3045" class="flow"/>
+  <text x="1215" y="3014" class="branch">维护细节转 C4</text>
+
+  <!-- C 证书轮换与维护 -->
+  <text x="1995" y="255" class="section" text-anchor="middle">C1. prepare：只准备，不切正式证书</text>
+
+  <rect x="1645" y="285" width="700" height="138" class="process"/>
+  <text x="1995" y="315" class="text"><tspan x="1995">prepare_cert_rotation</tspan><tspan x="1995" dy="24">读取正式证书旧指纹与候选记录</tspan><tspan x="1995" dy="22">候选可复用：phase、IP、Region、端口、cert_days 全匹配</tspan><tspan x="1995" dy="22">且 SAN 正确、指纹匹配、剩余有效期 ≥ 1 小时</tspan></text>
+  <path d="M1995 423 V465" class="flow"/>
+
+  <rect x="1645" y="465" width="700" height="106" class="decision"/>
+  <text x="1995" y="495" class="text"><tspan x="1995">候选可复用？</tspan><tspan x="1995" dy="24">是→沿用同一轮候选；否→归档旧候选并生成新 RSA 自签对</tspan><tspan x="1995" dy="22">记录 old/new 指纹、目标、有效期并输出片段</tspan></text>
+  <path d="M1995 571 V613" class="flow"/>
+
+  <rect x="1645" y="613" width="700" height="76" class="success"/>
+  <text x="1995" y="646" class="text"><tspan x="1995">phase=prepared</tspan><tspan x="1995" dy="24">正式证书与运行服务不变</tspan></text>
+  <path d="M1995 689 V713" class="flow"/>
+
+  <text x="1995" y="742" class="section" text-anchor="middle">C2. apply：身份、云端与本地切换</text>
+
+  <rect x="1645" y="772" width="700" height="112" class="decision"/>
+  <text x="1995" y="802" class="text"><tspan x="1995">是否 disable 且未显式接受轮换？</tspan><tspan x="1995" dy="24">是→不沿用历史授权，不写云端、不切换</tspan><tspan x="1995" dy="22">INSTALL_DIR 为符号链接→云端操作前拒绝</tspan></text>
+  <path d="M1995 884 V926" class="flow"/>
+
+  <rect x="1645" y="926" width="700" height="138" class="decision"/>
+  <text x="1995" y="956" class="text"><tspan x="1995">assert_prepared_identity 全部一致？</tspan><tspan x="1995" dy="24">phase、IP、Region、DERP/STUN 端口、cert_days、Tailnet</tspan><tspan x="1995" dy="22">候选 SAN、有效期、公私钥、指纹；正式旧指纹未漂移</tspan><tspan x="1995" dy="22">任一不符→重新 prepare，云端和正式证书不动</tspan></text>
+  <path d="M1995 1064 V1106" class="flow"/>
+
+  <rect x="1645" y="1106" width="700" height="104" class="decision"/>
+  <text x="1995" y="1136" class="text"><tspan x="1995">自动授权有效？</tspan><tspan x="1995" dy="24">auto_maintain_consented 且 policy_auth_state=write_ready</tspan><tspan x="1995" dy="22">否则人工路径必须 --accept-cert-rotation；--yes 不够</tspan></text>
+  <path d="M1995 1210 V1252" class="flow"/>
+
+  <rect x="1645" y="1252" width="700" height="142" class="external"/>
+  <text x="1995" y="1282" class="text"><tspan x="1995">自动路径：sync_policy_for_candidate</tspan><tspan x="1995" dy="24">GET 最新 HuJSON + ETag → 仅修改本节点 CertName</tspan><tspan x="1995" dy="22">validate → If-Match POST → GET 读回确认</tspan><tspan x="1995" dy="22">冲突/412/他人改目标/超时未确认→不切换并转协调</tspan></text>
+  <path d="M1995 1394 V1436" class="flow"/>
+
+  <rect x="1645" y="1436" width="700" height="128" class="state"/>
+  <text x="1995" y="1466" class="text"><tspan x="1995">_switch_live_certificate_from_candidate</tspan><tspan x="1995" dy="24">拒绝目录/正式文件链接；备份旧证书事务</tspan><tspan x="1995" dy="22">复制候选 → 修权限/链接 → 原 active 则 restart</tspan><tspan x="1995" dy="22">核验 active/端口/TLS/实际新指纹 → 归档旧证书</tspan></text>
+  <path d="M1995 1564 V1606" class="flow"/>
+
+  <rect x="1645" y="1606" width="700" height="98" class="decision"/>
+  <text x="1995" y="1636" class="text"><tspan x="1995">本地切换与核验成功？</tspan><tspan x="1995" dy="24">成功→phase=applied + success_replaced（maintain）</tspan><tspan x="1995" dy="22">候选不再用于下一轮；不承诺零中断</tspan></text>
+  <path d="M1995 1704 V1746" class="flow"/>
+  <path d="M2345 1655 H2365 V1870 H2365" class="failflow"/>
+  <text x="2356" y="1644" class="branch">失败</text>
+
+  <rect x="1645" y="1746" width="700" height="124" class="failure"/>
+  <text x="1995" y="1776" class="text"><tspan x="1995">恢复本地旧身份</tspan><tspan x="1995" dy="24">恢复旧证书；原运行则重启并核对实际旧指纹</tspan><tspan x="1995" dy="22">原停止保持停止；恢复未确认→保留云端新指纹</tspan><tspan x="1995" dy="22">并写 unknown / needs_coordination / needs_manual=1</tspan></text>
+  <path d="M1995 1870 V1912" class="flow"/>
+
+  <rect x="1645" y="1912" width="700" height="126" class="decision"/>
+  <text x="1995" y="1942" class="text"><tspan x="1995">旧磁盘与旧运行身份均确认？</tspan><tspan x="1995" dy="24">是→reverse_compensate_certname：最新 ETag 最小反向补丁</tspan><tspan x="1995" dy="22">只有完整策略解析且无同 HostName 才可跳过</tspan><tspan x="1995" dy="22">歧义/他人改动/读回失败→不自动回写，转人工</tspan></text>
+  <path d="M1995 2038 V2080" class="flow"/>
+
+  <text x="1995" y="2109" class="section" text-anchor="middle">C3. maintain：每日条件式执行</text>
+
+  <rect x="1645" y="2139" width="700" height="112" class="decision"/>
+  <text x="1995" y="2169" class="text"><tspan x="1995">evaluate_auto_maintain_readiness</tspan><tspan x="1995" dy="24">scheduler_state=failed→unknown；GitOps/无授权/只读→manual</tspan><tspan x="1995" dy="22">授权未知→unknown；写授权+用户同意→ready</tspan></text>
+  <path d="M1995 2251 V2293" class="flow"/>
+  <path d="M2345 2195 H2365 V2350 H2365" class="failflow"/>
+  <text x="2356" y="2184" class="branch">非 ready：保留旧证书并非零</text>
+
+  <rect x="1645" y="2293" width="700" height="104" class="decision"/>
+  <text x="1995" y="2323" class="text"><tspan x="1995">cert_rotation_is_due 三态</tspan><tspan x="1995" dy="24">到期或剩余为负→prepare + apply；确定未到→idle/0</tspan><tspan x="1995" dy="22">到期日/提前天数未知→failed + needs_manual + 非零</tspan></text>
+  <path d="M1995 2397 V2439" class="flow"/>
+
+  <rect x="1645" y="2439" width="700" height="88" class="success"/>
+  <text x="1995" y="2469" class="text"><tspan x="1995">maintain 成功</tspan><tspan x="1995" dy="24">保留 success_replaced 与 intent=enabled</tspan><tspan x="1995" dy="22">不被 main 重新登记为 recorded，也不重装 unit</tspan></text>
+  <path d="M1995 2527 V2569" class="flow"/>
+
+  <text x="1995" y="2598" class="section" text-anchor="middle">C4. 自动维护启停与 cancel</text>
+
+  <rect x="1645" y="2628" width="700" height="132" class="decision"/>
+  <text x="1995" y="2658" class="text"><tspan x="1995">--enable-auto-maintain</tspan><tspan x="1995" dy="24">必须有非空 TS_TAILNET + write_ready</tspan><tspan x="1995" dy="22">复制稳定脚本/0600 target.conf → daemon-reload</tspan><tspan x="1995" dy="22">enable --now 并核验 enabled+active 后才 ready/recorded</tspan></text>
+  <path d="M1995 2760 V2802" class="flow"/>
+
+  <rect x="1645" y="2802" width="700" height="116" class="decision"/>
+  <text x="1995" y="2832" class="text"><tspan x="1995">--disable-auto-maintain</tspan><tspan x="1995" dy="24">撤销 intent → 删除 service/timer → daemon-reload</tspan><tspan x="1995" dy="22">核对文件、enabled、active；删除/reload 失败均非零</tspan><tspan x="1995" dy="22">并记录 scheduler_state=failed + needs_manual=1</tspan></text>
+  <path d="M1995 2918 V2960" class="flow"/>
+
+  <rect x="1645" y="2960" width="700" height="82" class="process"/>
+  <text x="1995" y="2990" class="text"><tspan x="1995">cancel</tspan><tspan x="1995" dy="24">只删除 cert-rotation 候选/记录/片段</tspan><tspan x="1995" dy="22">正式证书不变；无 IP 也可执行；不重复部署向导</tspan></text>
+
+  <!-- D 健康检查 -->
+  <text x="2785" y="255" class="section" text-anchor="middle">D1. 单次健康采集与 H0～H3</text>
+
+  <rect x="2435" y="285" width="700" height="120" class="process"/>
+  <text x="2785" y="315" class="text"><tspan x="2785">collect_health_status</tspan><tspan x="2785" dy="24">推断 unit 参数 → 校验 → tailscale/derper/证书/在线指纹</tspan><tspan x="2785" dy="22">采集端口/PID、剩余天数、RSS、journal 与维护状态</tspan></text>
+  <path d="M2785 405 V447" class="flow"/>
+
+  <rect x="2435" y="447" width="700" height="92" class="decision"/>
+  <text x="2785" y="477" class="text"><tspan x="2785">H0：采集工具</tspan><tspan x="2785" dy="24">openssl、systemctl、ss/netstat 缺失→unknown</tspan></text>
+  <path d="M2785 539 V581" class="flow"/>
+
+  <rect x="2435" y="581" width="700" height="118" class="decision"/>
+  <text x="2785" y="611" class="text"><tspan x="2785">H1：本地服务与身份</tspan><tspan x="2785" dy="24">运行状态、正确 PID 的 TCP/UDP、纯 IP 与目标配置</tspan><tspan x="2785" dy="22">证书命名/SAN/有效期/私钥/在线指纹</tspan><tspan x="2785" dy="22">无权限或无法采集→unknown，不伪装确认故障</tspan></text>
+  <path d="M2785 699 V741" class="flow"/>
+
+  <rect x="2435" y="741" width="700" height="124" class="decision"/>
+  <text x="2785" y="771" class="text"><tspan x="2785">H2：verify-clients 的 LocalAPI 依赖</tspan><tspan x="2785" dy="24">调用者 HTTP 2xx 后再按 unit User= 检查 socket 访问</tspan><tspan x="2785" dy="22">服务用户被拒/不存在→确认故障；无法证明→unknown</tspan><tspan x="2785" dy="22">verify=off→not_applicable</tspan></text>
+  <path d="M2785 865 V907" class="flow"/>
+
+  <rect x="2435" y="907" width="700" height="132" class="external"/>
+  <text x="2785" y="937" class="text"><tspan x="2785">H3：独立合法客户端探针（可选/必需）</tspan><tspan x="2785" dy="24">可信绝对路径 → TERM/KILL 有界执行与进程组清理</tspan><tspan x="2785" dy="22">白名单报告：目标/Region/端口/时间必须匹配且新鲜</tspan><tspan x="2785" dy="22">通过→healthy；确认失败→failed；其他→unknown</tspan></text>
+  <path d="M2785 1039 V1081" class="flow"/>
+
+  <rect x="2435" y="1081" width="700" height="100" class="decision"/>
+  <text x="2785" y="1111" class="text"><tspan x="2785">指标与状态</tspan><tspan x="2785" dy="24">旧指标唯一时间戳：fresh / stale / unknown</tspan><tspan x="2785" dy="22">scope_id 绑定目标与检查范围；输出路径必须安全且互不覆盖</tspan></text>
+  <path d="M2785 1181 V1223" class="flow"/>
+
+  <rect x="2435" y="1223" width="700" height="112" class="decision"/>
+  <text x="2785" y="1253" class="text"><tspan x="2785">health / status 与 derpmap 输出</tspan><tspan x="2785" dy="24">文本/JSON/Prometheus/状态文件共享同一快照</tspan><tspan x="2785" dy="22">derpmap 另要求 H1=healthy 且有已验证在线指纹</tspan></text>
+  <path d="M2785 1335 V1377" class="flow"/>
+
+  <rect x="2435" y="1377" width="700" height="116" class="success"/>
+  <text x="2785" y="1407" class="text"><tspan x="2785">退出码</tspan><tspan x="2785" dy="24">0＝请求范围通过；1＝确认故障或结果写失败</tspan><tspan x="2785" dy="22">2＝未知/权限受限/旧指标，未知优先于故障</tspan><tspan x="2785" dy="22">derpmap：0 可信 / 1 确认失败 / 2 身份未知</tspan></text>
+  <path d="M2785 1493 V1535" class="flow"/>
+
+  <!-- D 恢复 -->
+  <text x="2785" y="1564" class="section" text-anchor="middle">D2. 显式中断恢复</text>
+
+  <rect x="2435" y="1594" width="700" height="116" class="state"/>
+  <text x="2785" y="1624" class="text"><tspan x="2785">recover_interrupted_change</tspan><tspan x="2785" dy="24">只接受固定 recovery 路径与白名单 incomplete</tspan><tspan x="2785" dy="22">核对 binary/unit/config/state 摘要及 absent 状态</tspan></text>
+  <path d="M2785 1710 V1752" class="flow"/>
+  <path d="M3135 1652 H3155 V1810 H3155" class="failflow"/>
+  <text x="3146" y="1641" class="branch">无标记/校验失败：非零</text>
+
+  <rect x="2435" y="1752" width="700" height="112" class="decision"/>
+  <text x="2785" y="1782" class="text"><tspan x="2785">phase=first-install？</tspan><tspan x="2785" dy="24">先停止并确认 derper 不活跃，再删除候选与标记</tspan><tspan x="2785" dy="22">拒停→保留候选和标记，可排除原因后重试</tspan></text>
+  <path d="M2785 1864 V1906" class="flow"/>
+
+  <rect x="2435" y="1906" width="700" height="132" class="state"/>
+  <text x="2785" y="1936" class="text"><tspan x="2785">switch / migrate 回滚</tspan><tspan x="2785" dy="24">先停服 → 恢复旧二进制/unit/config/state 及 absent 存在性</tspan><tspan x="2785" dy="22">按旧 unit 恢复 User/IP、状态目录和证书组权限</tspan><tspan x="2785" dy="22">daemon-reload；原 active 才 reset-failed + start + 复验</tspan></text>
+  <path d="M2785 2038 V2080" class="flow"/>
+
+  <rect x="2435" y="2080" width="700" height="92" class="success"/>
+  <text x="2785" y="2110" class="text"><tspan x="2785">恢复复核通过才删除 incomplete</tspan><tspan x="2785" dy="24">启动/停止/写回/摘要/复验失败均保留恢复材料</tspan></text>
+  <path d="M2785 2172 V2214" class="flow"/>
+
+  <!-- D 卸载 -->
+  <text x="2785" y="2243" class="section" text-anchor="middle">D3. 卸载与分级清理</text>
+
+  <rect x="2435" y="2273" width="700" height="134" class="process"/>
+  <text x="2785" y="2303" class="text"><tspan x="2785">uninstall_derper</tspan><tspan x="2785" dy="24">删除健康 timer/cron → 删除维护 service/timer</tspan><tspan x="2785" dy="22">reload 并核对 unit 文件、enabled、active</tspan><tspan x="2785" dy="22">移除 connlimit → disable derper → 删除 unit 与证书事务/归档</tspan></text>
+  <path d="M2785 2407 V2449" class="flow"/>
+
+  <rect x="2435" y="2449" width="700" height="126" class="decision"/>
+  <text x="2785" y="2479" class="text"><tspan x="2785">清理级别</tspan><tspan x="2785" dy="24">普通：保留二进制、证书、稳定副本、凭据</tspan><tspan x="2785" dy="22">--purge：另删 INSTALL_DIR</tspan><tspan x="2785" dy="22">--purge-all：再删二进制、derper.env、稳定副本、socket drop-in</tspan></text>
+  <path d="M2785 2575 V2617" class="flow"/>
+
+  <rect x="2435" y="2617" width="700" height="106" class="decision"/>
+  <text x="2785" y="2647" class="text"><tspan x="2785">维护调度删除或 reload 失败？</tspan><tspan x="2785" dy="24">继续其余清理，但最终非零且不输出“完成”</tspan><tspan x="2785" dy="22">防止仍活跃的自动换证任务被静默遗留</tspan></text>
+  <path d="M2785 2723 V2765" class="flow"/>
+
+  <!-- 底部契约说明 -->
+  <rect x="65" y="3180" width="3060" height="236" class="note"/>
+  <text x="90" y="3216" class="legend">关键不变量与阅读说明</text>
+  <text x="90" y="3250" class="legend">1. 变更前：参数/锁/候选/路径信任先校验；正常部署、恢复、迁移、轮换和卸载共用 flock。只读 check/health 不取锁。</text>
+  <text x="90" y="3282" class="legend">2. 提交点：服务与 H0～H3 门禁通过后才清除 incomplete；证书事务提交后才安装 extras；恢复复核通过后才删除恢复标记。</text>
+  <text x="90" y="3314" class="legend">3. 指纹边界：prepare 不动正式证书；apply 绑定 prepare 全部目标参数；自动换证需要写授权、ETag 和读回；恢复未确认不得反向撤回云端。</text>
+  <text x="90" y="3346" class="legend">4. 结果语义：健康 0/故障 1/未知 2；缺 H3 不代表真实中继通过。图中“非零”表示明确失败，不把采集未知当作健康。</text>
+  <text x="90" y="3378" class="legend">5. 本图是当前脚本业务逻辑地图，不代表真实 Ubuntu VM、隔离 Tailnet 写策略、独立客户端 H3 或长效证书矩阵已经验收。</text>
+
+  <!-- 小型分支索引 -->
+  <rect x="65" y="3460" width="3060" height="190" class="external"/>
+  <text x="90" y="3496" class="legend">外部依赖：tailscaled LocalAPI / Tailscale 策略 API / systemd / Go 模块与工具链 / 外部合法客户端 H3 / 防火墙与云安全组</text>
+  <text x="90" y="3530" class="legend">持久状态：/var/lib/derper-deploy（锁、恢复集、候选、健康状态、维护状态）　/var/lib/derper（节点身份）　/opt/derper/certs（正式证书）</text>
+  <text x="90" y="3564" class="legend">稳定副本：/var/lib/derper-deploy/maintenance（证书维护）　/usr/local/lib/derper-deploy（健康检查）　凭据独立保存于 /etc/derper/policy-api.env</text>
+  <text x="90" y="3598" class="legend">输出：derpMap + CertName、文本/JSON 健康状态、Prometheus 指标、maintenance/status、journal；失败不会用 InsecureForTests 伪造可用配置。</text>
+</svg>

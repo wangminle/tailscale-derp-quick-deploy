@@ -1,0 +1,12 @@
+# Keep the two shared files consistent across Windows and macOS editors.
+# Git attributes normalize checkout; these rules also guide direct editor saves.
+
+[task-list.md]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+
+[tests/test_systemd_integration.sh]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true

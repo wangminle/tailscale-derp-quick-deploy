@@ -3,6 +3,12 @@ name: tests
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      run_systemd_vm:
+        description: 在一次性 VM runner 上跑 test_systemd_integration.sh（需自托管 disposable VM runner）
+        required: false
+        default: 'false'
 
 jobs:
   bash5:
@@ -33,3 +39,70 @@ jobs:
         run: bash tests/test_d_stage.sh
       - name: ShellCheck errors
         run: shellcheck -S error scripts/deploy_derper_ip_selfsigned.sh tests/*.sh
+
+  # WBS §7：固定 Ubuntu 22.04/24.04 上的 Bash 回归矩阵。
+  # 只跑不依赖 PID1/真实 systemd 的 shell 套件；test_systemd_integration.sh 另由 systemd_vm 手动任务在一次性 VM 上执行。
+  bash_fixed_matrix:
+    name: Bash regression (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Confirm Bash 5
+        run: |
+          bash --version | head -1
+          bash -c '[[ ${BASH_VERSINFO[0]} -ge 5 ]]'
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc shellcheck
+      - name: Main suite
+        run: bash tests/test_deploy_script.sh
+      - name: Review regressions
+        run: bash tests/test_review_regressions.sh
+      - name: S2 failure-path regressions
+        run: bash tests/test_s2_fixes.sh
+      - name: S2 real flock and permission evidence
+        run: sudo bash tests/test_s2_evidence.sh
+      - name: C stage contracts and behavior
+        run: |
+          bash tests/test_c_stage.sh
+          sudo bash tests/test_c_stage.sh test_root_probe_path_trust test_bug072_root_rejects_untrusted_state_ancestors
+      - name: D stage contracts and behavior
+        run: bash tests/test_d_stage.sh
+      - name: Acceptance adapters and assets
+        run: python3 -m unittest discover -s tests -p 'test_*.py'
+      - name: ShellCheck errors
+        run: shellcheck -S error scripts/deploy_derper_ip_selfsigned.sh tests/*.sh
+
+  # GB及D本地真实 systemd PID1 集成（不含真实GD）：仅人工在一次性 disposable VM 上执行。
+  # test_systemd_integration.sh 自身有门禁（root、/proc/1/comm=systemd、/root/DERPER_DISPOSABLE_GB_VM 标记、systemd-detect-virt --vm），
+  # 不具备条件时以退出码 2 自跳过；不得把普通容器当 VM 验收。需自托管 disposable-vm runner。
+  systemd_vm:
+    name: systemd PID1 integration (manual, disposable VM)
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.run_systemd_vm == 'true'
+    runs-on: [self-hosted, disposable-vm]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run systemd integration suite
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/vm-artifacts"
+          export DERPER_TEST_ARTIFACTS="$GITHUB_WORKSPACE/vm-artifacts"
+          export DERPER_TEST_BINARY="${DERPER_TEST_BINARY:-/root/derper}"
+          if [[ ! -x "$DERPER_TEST_BINARY" ]]; then
+            echo 'not verified - 缺少 DERPER_TEST_BINARY 真实 derper 二进制，未执行验收' | tee "$DERPER_TEST_ARTIFACTS/status.txt"
+            exit 2
+          fi
+          set -o pipefail
+          DERPER_INTEGRATION_VM=1 DERPER_INTEGRATION_C=1 DERPER_INTEGRATION_D=1 bash tests/test_systemd_integration.sh 2>&1 | tee "$DERPER_TEST_ARTIFACTS/run.log"
+      - name: Preserve VM evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: systemd-vm-${{ github.run_id }}-${{ github.run_attempt }}
+          path: vm-artifacts/
+          if-no-files-found: warn
+      # cleanup.txt 必须在下载证据后人工核对；环境不符/缺fixture均不是验收通过。

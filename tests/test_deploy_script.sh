@@ -2676,7 +2676,8 @@ test_health_check_report_expiry_tiers_and_uninstall_purge_modes() {
     require_root() { :; }
     remove_healthcheck_cron() { :; }
     remove_tls_connlimit() { :; }
-    systemctl() { return 0; }
+    # 卸载核验维护 unit 已不再启用/运行：is-* 返回非零表示已停用
+    systemctl() { case "$1" in is-enabled|is-active) return 1 ;; *) return 0 ;; esac; }
     SERVICE_PATH="${local_tmp}/derper.service"
     INSTALL_DIR="${local_tmp}/install"
     BIN_PATH="${local_tmp}/derper"
@@ -2996,18 +2997,45 @@ PY
 # main 编排与底层辅助函数。按领域组织用例；非 root 可运行（root 专属断言自动跳过）。
 # 用例子 shell 隔离；可传测试函数名单独运行。退出码 0=全部通过，1=有失败（累计列出）。
 
+
+test_bug112_harness_propagates_inner_failures() {
+  local out rc=0
+  case_tmp=$(mktemp -d)
+  trap 'rm -rf "$case_tmp"' EXIT
+  mkdir -p "$case_tmp/tests" "$case_tmp/scripts"
+  cp "$SCRIPT" "$case_tmp/scripts/deploy_derper_ip_selfsigned.sh"
+  awk '
+    {print}
+    /^test_nonempty_config_uses_separate_c_argument\(\) \{/ {target=1}
+    target && /^  \($/ {print "    fail \"BUG112 forced inner failure\""; target=0}
+  ' "${ROOT_DIR}/tests/test_deploy_script.sh" >"$case_tmp/tests/test_deploy_script.sh"
+  out=$(bash "$case_tmp/tests/test_deploy_script.sh" test_nonempty_config_uses_separate_c_argument test_source_does_not_run_main 2>&1) || rc=$?
+  [[ "$rc" != 0 ]] || fail '内层失败必须让主套件非零，不能被函数末尾ok吞掉'
+  [[ "$out" == *'BUG112 forced inner failure'* ]] || fail '必须实际触发变异断言'
+  [[ "$out" == *'not ok - test_nonempty_config_uses_separate_c_argument'* ]] || fail '必须累计记录失败用例'
+  [[ "$out" == *'ok - script can be sourced'* ]] || fail '一个用例失败后仍须继续执行后续用例'
+  ok 'BUG112: inner failure is propagated and later cases still run'
+}
+
 failed=0
 run_case() {
-  if ( "$1" ); then
-    :
-  else
+  local rc
+  # 不把用例放进 if/|| 条件：否则 Bash 会抑制整个函数的 errexit，
+  # 内层子 shell 的失败会被用例末尾的 ok 吞掉。
+  set +e
+  ( set -e; "$1" )
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
     echo "not ok - $1" >&2
     failed=$((failed + 1))
   fi
+  return 0
 }
 
 # 默认按序执行全部用例；传参可单独运行指定用例（用于定位与变异验证）。
 cases=(
+  test_bug112_harness_propagates_inner_failures
   test_no_crlf_and_syntax
   test_source_does_not_run_main
   test_source_survives_unset_user

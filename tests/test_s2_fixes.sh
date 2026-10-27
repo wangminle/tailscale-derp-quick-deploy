@@ -31,6 +31,7 @@ setup_install() {
   runtime=inactive
   systemctl() {
     case "$1" in
+      is-enabled) return 1 ;;
       is-active) [[ "$runtime" == active ]] ;;
       stop) runtime=inactive ;;
       start) runtime=active ;;

@@ -142,3 +142,7 @@ tailscaled
 # 包管理（一般不会用到，但保留）
 node_modules/
 vendor/
+
+# Python可选验收工具缓存
+__pycache__/
+*.pyc

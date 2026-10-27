@@ -5,7 +5,7 @@
 > 本文是中文的详细用户指南（技术参考）。主仓库首页 `README.md` 为精简版中文快速上手；英文用户指南见同目录的 `REFERENCE_EN.md`。
 
 > **脚本文件**：`deploy_derper_ip_selfsigned.sh`  
-> **当前版本**：0.2.18（2026-10-24）\
+> **当前版本**：0.2.19（2026-10-27）\
 > **查看版本**：`bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
@@ -311,10 +311,11 @@ prepare | apply | cancel | maintain
                           不能与 --check/--dry-run/--repair/--force/--uninstall/--recover-interrupted 同用
 --metrics-textfile <P>    将健康检查导出为 Prometheus 文本指标到路径 P
                           （必须与 --health-check 或 --install-healthcheck-cron 一起使用；结合 node_exporter 使用）
---uninstall               停止并卸载 derper 的 systemd 服务（保留二进制与证书；同时删除健康检查 timer/cron 与 --tls-connlimit 规则，
-                          /usr/local/lib/derper-deploy 下的健康检查稳定副本保留，可手动删除）
+--uninstall               停止并卸载 derper 的 systemd 服务（保留二进制与证书；同时删除健康检查 timer/cron、证书维护 service/timer 与 --tls-connlimit 规则，
+                          /usr/local/lib/derper-deploy 下的健康检查稳定副本保留，可手动删除）。
+                          维护 unit 文件、启用或运行状态残留时退出非零，不报告完成
 --purge                   搭配 --uninstall：额外删除安装目录（/opt/derper）
---purge-all               搭配 --uninstall：在 --purge 基础上同时删除二进制、/etc/derper/derper.env、健康检查稳定程序/状态和脚本创建的 tailscaled socket drop-in；防火墙规则和用户/组账户需手动确认
+--purge-all               搭配 --uninstall：在 --purge 基础上同时删除二进制、/etc/derper/derper.env、健康检查稳定程序/状态、维护脚本副本及 target.conf、脚本创建的 tailscaled socket drop-in；防火墙规则和用户/组账户需手动确认
 --recover-interrupted     显式恢复未完成的升级/迁移。不会自动继续中断的步骤。
                           存在未完成标记时，普通安装/修复/轮换/卸载会被阻断；恢复集与标记位于
                           /var/lib/derper-deploy（root 管理）。不能与安装、修复、检查或卸载同时使用。
@@ -604,9 +605,9 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 退出码语义（可用于 shell/监控判定）：
 
 ```text
-0  关键健康项全部正常（服务、端口、目标配置和证书均正常，在线证书与磁盘证书一致；启用 -verify-clients 时 tailscaled 运行且 LocalAPI 可用）
+0  关键健康项全部正常（服务、端口、目标配置和证书均正常，在线证书与磁盘证书一致；启用 -verify-clients 时 tailscaled 运行，且 derper 服务用户可以访问 LocalAPI）
 1  至少一项关键健康检查已确认失败，或 --metrics-textfile 写入失败
-2  结果未知：当前身份无权限读取证书目录，或无法确认 tailscaled LocalAPI 状态；未知不会被当成健康
+2  结果未知：当前身份无权限读取证书目录，或无法确认 derper 服务用户能否访问 tailscaled LocalAPI；未知不会被当成健康
 ```
 
 任意非 0 都表示未通过，旧的 `if ! --health-check` 写法无需修改。
@@ -641,7 +642,7 @@ fi
 ℹ️  资源：derper 内存 RSS 约 3 MiB
 ```
 
-未知结果会以 ⚠️ 行提示（例如"证书：无权限确认"或"客户端校验：已启用，但当前身份无法确认 tailscaled LocalAPI"），并返回退出码 2。
+未知结果会以 ⚠️ 行提示（例如"证书：无权限确认"或"客户端校验：已启用，但无法确认 derper 服务用户能否访问 tailscaled LocalAPI"），并返回退出码 2。调用者（常为 root）能访问 LocalAPI，不代表 unit 中的 `User=` 也能访问。
 
 Prometheus 指标样例（文本文件内容）：
 
@@ -704,7 +705,7 @@ sudo tailscale up
 ## 卸载
 
 ```bash
-# 停止并卸载 systemd 服务（保留二进制与证书；同时删除健康检查 timer/cron 与 --tls-connlimit 规则）
+# 停止并卸载 systemd 服务（保留二进制与证书；同时删除健康检查 timer/cron、证书维护 service/timer 与 --tls-connlimit 规则）
 sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall
 
 # 卸载并清理安装目录（证书等）
@@ -714,7 +715,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall --purge
 sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall --purge-all
 ```
 
-注意：卸载不影响 Tailscale 本体（tailscaled、客户端等）。若需一起移除，请按发行版常规方式操作。普通卸载和 `--purge` 保留健康检查稳定副本；`--purge-all` 删除稳定程序和 status（默认目录 `/usr/local/lib/derper-deploy/`，并兼顾 cron 回退目录），空目录一并移除。目录内其他用户文件保留；副本目录为符号链接或删除失败时返回非零。
+注意：卸载不影响 Tailscale 本体（tailscaled、客户端等）。若需一起移除，请按发行版常规方式操作。普通卸载和 `--purge` 保留健康检查稳定副本及维护脚本副本；`--purge-all` 删除稳定程序和 status（默认目录 `/usr/local/lib/derper-deploy/`，并兼顾 cron 回退目录），以及维护脚本副本和 `target.conf`，空目录一并移除。目录内其他用户文件保留；副本目录为符号链接或删除失败时返回非零。维护 service/timer 的文件、启用或运行状态残留时，其余清理仍会继续，但最终退出非零且不报告“完成”。
 
 ---
 

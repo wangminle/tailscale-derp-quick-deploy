@@ -1673,6 +1673,118 @@ test_b3_layout_blocks_cert_rename_and_keeps_identity() {
 # 退出码 0=全部通过，1=有失败（累计列出）。
 
 # 默认按序执行全部用例；传参可单独运行指定用例（用于定位与变异验证）。
+# BUG-117：默认幂等部署在 LocalAPI 已确认故障时不得绕过发布门禁并成功收尾。
+setup_bug117_main() {
+  DEPLOY_STATE_DIR="$case_tmp/deploy-state"
+  mkdir -p "$DEPLOY_STATE_DIR"
+  flock() { return 0; }
+  check_os_environment() { :; }
+  require_root() { :; }
+  recover_cert_update() { return 0; }
+  ordinary_change_allowed() { return 0; }
+  recover_interrupted_change() { return 0; }
+  acquire_deploy_lock() { return 0; }
+  detect_public_ip() { IP_ADDR=8.8.8.8; return 0; }
+  check_tailscale_status() { TS_INSTALLED=1 TS_RUNNING=1 TS_VERSION="1.80.0" TS_VER_OK=1; }
+  check_derper_status() {
+    DERPER_BIN=1 DERPER_SERVICE_PRESENT=1 DERPER_RUNNING=1 PURE_IP_OK=1
+    DESIRED_CONFIG_OK=1 DERPER_VERIFY_CLIENTS_EFFECTIVE=1
+    PORT_TLS_OK=1 PORT_STUN_OK=1 CURRENT_DERPER_OWNS_PORTS=1
+    TS_LOCALAPI_OK="$BUG117_LOCALAPI_OK" TS_AUTH_UNKNOWN="${BUG117_AUTH_UNKNOWN:-0}"
+  }
+  check_cert_status() { CERT_PRESENT=1 CERT_NAMING_OK=1 CERT_SAN_MATCH=1 CERT_EXPIRY_OK=1; }
+  check_live_cert_status() { LIVE_CERT_CHECKED=1 CERT_LIVE_MATCH=1; }
+  cert_layout_is_ok() { return 0; }
+  check_extra_attack_surface() { EXTRA_LISTENERS=""; }
+  check_automatic_updates() { AUTO_UPDATES_OK=1; }
+  precheck_verify_clients() { return 0; }
+  align_derper_version_with_tailscale() { :; }
+  derper_binary_needs_install() { return 1; }
+  ensure_compatible_certs() { CERTS_CHANGED=0; return 0; }
+  commit_cert_update() { return 0; }
+  run_post_deploy_extras() { return 0; }
+  print_firewall_tips() { :; }
+  runtime_checks() { :; }
+  write_systemd_service() { fail '幂等部署不应重写 derper unit'; }
+  # 真实门禁只被替身包装：记录调用，并在 LocalAPI 故障时按真实判断失败。
+  publish_verification_gate() {
+    printf 'called\n' >"$case_tmp/gate-called"
+    [[ "${TS_LOCALAPI_OK:-0}" -eq 1 ]]
+  }
+  finalize_deployment_report() { printf 'called\n' >"$case_tmp/report-called"; return 0; }
+  finish_deploy_auto_maintain() { return 0; }
+}
+
+test_bug117_default_deploy_gates_confirmed_localapi_failure() {
+  BUG117_LOCALAPI_OK=0 BUG117_AUTH_UNKNOWN=0
+  setup_bug117_main
+  local out rc=0
+  out=$(main --ip 8.8.8.8 2>&1) || rc=$?
+  [[ "$rc" -ne 0 ]] || fail "LocalAPI 已确认故障时默认部署必须非零：${out}"
+  [[ -f "$case_tmp/gate-called" ]] || fail '健康检查失败时仍必须调用发布门禁'
+  [[ ! -f "$case_tmp/report-called" ]] || fail '门禁失败后不得执行成功收尾'
+  [[ "$out" != *'已就绪'* ]] || fail '门禁失败不得输出已就绪'
+}
+
+test_bug117_default_deploy_still_succeeds_when_healthy() {
+  BUG117_LOCALAPI_OK=1 BUG117_AUTH_UNKNOWN=0
+  setup_bug117_main
+  local out rc=0
+  out=$(main --ip 8.8.8.8 2>&1) || rc=$?
+  [[ "$rc" -eq 0 ]] || fail "健康的幂等部署应成功：${rc} ${out}"
+  [[ -f "$case_tmp/gate-called" ]] || fail '健康路径仍应经过发布门禁'
+  [[ "$out" == *'已就绪'* ]] || fail '健康路径应输出已就绪'
+}
+
+# BUG-122：LocalAPI 必须按 derper unit 的 User= 判断，而不是调用者（常为 root）。
+test_bug122_localapi_checks_derper_service_user() {
+  command -v python3 >/dev/null 2>&1 || { skip "无 python3，Unix socket 未测"; return 0; }
+  local ts_sock="$case_tmp/ts.sock" caller
+  python3 -c 'import socket, sys; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.bind(sys.argv[1])' "$ts_sock" 2>/dev/null || {
+    skip "Unix socket 不可用"
+    return 0
+  }
+  chmod 666 "$ts_sock"
+  caller=$(id -un)
+  DERPER_VERIFY_CLIENTS_EFFECTIVE=1 TS_RUNNING=1
+  expected_tailscaled_socket() { printf '%s\n' "$ts_sock"; }
+  probe_tailscaled_localapi() { printf '200\n'; }
+  printf '[Service]\nUser=nobody\n' >"$SERVICE_PATH"
+
+  # 调用者能访问、derper 用户确认不可访问：必须是明确故障（非未知、非健康）。
+  running_as_root() { return 0; }
+  user_can_access_socket() { return 1; }
+  note_tailscaled_auth_visibility 2>/dev/null
+  [[ "$TS_LOCALAPI_OK" -eq 0 && "$TS_AUTH_UNKNOWN" -eq 0 ]] ||
+    fail "derper 用户被拒绝时必须是确认故障：OK=${TS_LOCALAPI_OK} UNKNOWN=${TS_AUTH_UNKNOWN}"
+
+  # derper 用户可访问：健康。
+  user_can_access_socket() { [[ "$1" == nobody ]]; }
+  note_tailscaled_auth_visibility 2>/dev/null
+  [[ "$TS_LOCALAPI_OK" -eq 1 && "$TS_AUTH_UNKNOWN" -eq 0 ]] ||
+    fail "derper 用户可访问时应健康：OK=${TS_LOCALAPI_OK} UNKNOWN=${TS_AUTH_UNKNOWN}"
+
+  # 非 root 调用者无法证明他人权限：未知，不能报假健康也不能报确认故障。
+  running_as_root() { return 1; }
+  user_can_access_socket() { return 1; }
+  note_tailscaled_auth_visibility 2>/dev/null
+  [[ "$TS_LOCALAPI_OK" -eq 0 && "$TS_AUTH_UNKNOWN" -eq 1 ]] ||
+    fail "无法确认 derper 用户权限时应为未知：OK=${TS_LOCALAPI_OK} UNKNOWN=${TS_AUTH_UNKNOWN}"
+
+  # unit 的 User= 就是调用者时，调用者自身判断已足够。
+  printf '[Service]\nUser=%s\n' "$caller" >"$SERVICE_PATH"
+  user_can_access_socket() { fail '服务用户与调用者相同时无需额外探测'; }
+  note_tailscaled_auth_visibility 2>/dev/null
+  [[ "$TS_LOCALAPI_OK" -eq 1 && "$TS_AUTH_UNKNOWN" -eq 0 ]] || fail '同一用户应健康'
+
+  # 服务用户不存在：服务本就无法以该身份启动，确认故障。
+  printf '[Service]\nUser=derper-no-such-user-xyz\n' >"$SERVICE_PATH"
+  running_as_root() { return 0; }
+  note_tailscaled_auth_visibility 2>/dev/null
+  [[ "$TS_LOCALAPI_OK" -eq 0 && "$TS_AUTH_UNKNOWN" -eq 0 ]] || fail '服务用户不存在应为确认故障'
+}
+
+
 tests=(
   test_b1_incomplete_marker_blocks_and_is_not_executed
   test_b1_lock_failure_blocks_second_change
@@ -1742,6 +1854,9 @@ tests=(
   test_bug045_timer_execstart_uses_proper_systemd_quoting
   test_bug046_all_firewall_deletions_fail_propagates_error
   test_bug046_mixed_backend_remove_failure_propagates_error
+  test_bug117_default_deploy_gates_confirmed_localapi_failure
+  test_bug117_default_deploy_still_succeeds_when_healthy
+  test_bug122_localapi_checks_derper_service_user
 )
 if [[ "$#" -gt 0 ]]; then
   tests=("$@")

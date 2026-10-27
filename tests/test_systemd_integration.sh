@@ -9,7 +9,8 @@ if [[ "${DERPER_INTEGRATION_VM:-}" != 1 || "$(id -u)" != 0 || "$(cat /proc/1/com
   exit 2
 fi
 if systemctl is-active --quiet derper || systemctl cat derper.service >/dev/null 2>&1 || [[ -e /opt/derper || -e /var/lib/derper || -e /var/lib/derper-deploy || -e /usr/local/bin/derper ]] \
-   || systemctl cat derper-healthcheck.timer >/dev/null 2>&1 || getent passwd derper-gb >/dev/null; then
+   || systemctl cat derper-healthcheck.timer >/dev/null 2>&1 || systemctl cat derper-cert-maintain.timer >/dev/null 2>&1 \
+   || [[ -e /etc/derper || -e /usr/local/lib/derper-deploy || -e /etc/systemd/system/derper.service.d || -e /etc/systemd/system/derper.service.certs-archive ]] || getent passwd derper-gb >/dev/null; then
   echo 'not verified - 已有 DERP 部署，拒绝覆盖' >&2
   exit 2
 fi
@@ -20,29 +21,40 @@ for tool in systemctl openssl ss curl runuser timeout sha256sum; do command -v "
 [[ -x "$fixture" ]] || { echo 'not verified - fixture 不可执行'; exit 2; }
 artifacts="${DERPER_TEST_ARTIFACTS:-/root/gb-artifacts}"
 mkdir -p "$artifacts"
+{
+  cat /etc/os-release
+  uname -a
+  systemd --version | head -1
+  printf 'pid1=%s\nvirt=%s\n' "$(cat /proc/1/comm)" "$(systemd-detect-virt)"
+  sha256sum "$SCRIPT" "$fixture"
+} >"$artifacts/environment.txt"
 tmp=$(mktemp -d /root/derper-gb.XXXXXXXX)
 cleanup() {
   local rc=$?
   trap - EXIT
-  rm -f /etc/systemd/system/derper.service.d/refuse-stop.conf
+  [[ -z "${policy_fixture_pid:-}" ]] || { kill "$policy_fixture_pid" 2>/dev/null || true; wait "$policy_fixture_pid" 2>/dev/null || true; }
+  rm -f /etc/systemd/system/derper.service.d/refuse-stop.conf /etc/systemd/system/derper.service.d/restart-once.conf /etc/systemd/system/derper.service.d/block-start.conf
   systemctl daemon-reload
   systemctl show derper -p MainPID -p ActiveState -p Result >"$artifacts/final-service.txt" 2>&1 || true
-  journalctl -u derper -u derper-healthcheck --no-pager >"$artifacts/journal.txt" 2>&1 || true
+  journalctl -u derper -u derper-healthcheck -u derper-cert-maintain --no-pager >"$artifacts/journal.txt" 2>&1 || true
+  systemctl disable --now derper-cert-maintain.timer derper-cert-maintain.service >/dev/null 2>&1 || true
   systemctl disable --now derper-healthcheck.timer >/dev/null 2>&1 || true
   systemctl disable --now derper.service >/dev/null 2>&1 || true
   systemctl stop derper.service >/dev/null 2>&1 || true
   systemctl stop derper-healthcheck.service >/dev/null 2>&1 || true
   rm -f /etc/systemd/system/derper.service /etc/systemd/system/derper.service.bak.*
-  rm -f /etc/systemd/system/derper-healthcheck.{service,timer}
+  rm -f /etc/systemd/system/derper-healthcheck.{service,timer} /etc/systemd/system/derper-cert-maintain.{service,timer}
+  rm -rf /etc/systemd/system/derper.service.certs-archive
   rm -rf /etc/systemd/system/derper.service.d /etc/systemd/system/derper.service.certs-rollback
   rm -f /usr/local/bin/derper /etc/cron.d/derper-healthcheck
   rm -rf /opt/derper /var/lib/derper /var/lib/derper-deploy /usr/local/lib/derper-deploy "$tmp"
-  rm -f /etc/derper/derper.env
+  rm -f /etc/derper/derper.env /etc/derper/policy-api.env
   rmdir /etc/derper 2>/dev/null || true
   systemctl daemon-reload
-  systemctl reset-failed derper derper-healthcheck >/dev/null 2>&1 || true
+  systemctl reset-failed derper derper-healthcheck derper-cert-maintain >/dev/null 2>&1 || true
   userdel derper-gb >/dev/null 2>&1 || true
   if [[ ! -e /usr/local/bin/derper && ! -e /opt/derper && ! -e /etc/systemd/system/derper-healthcheck.timer ]] \
+     && [[ ! -e /etc/systemd/system/derper.service.certs-archive && ! -e /etc/systemd/system/derper-cert-maintain.timer && ! -e /var/lib/derper-deploy && ! -e /etc/derper/policy-api.env ]] \
      && ! systemctl is-active --quiet derper && ! ss -lntup | grep -Eq ':(30443|33478)\b'; then
     echo 'ok - 测试服务、调度、端口与安装文件已清理' >"$artifacts/cleanup.txt"
   else
@@ -249,12 +261,139 @@ s=json.load(open(sys.argv[1])); assert s['result']=='unknown' and s['metrics']['
 PY
   ok 'C3过期指标在真实CLI中标记stale/unknown'
 fi
+# D集成：systemd/服务/磁盘/HTTP均真实；云端只用显式loopback fixture，不是GD。
+if [[ "${DERPER_INTEGRATION_D:-0}" == 1 ]]; then
+  mkdir -p "$artifacts/d" "$tmp/policy"
+  d_old_fp=$(live_cert_sha256_raw)
+  python3 - "$tmp/policy/policy.json" "$d_old_fp" <<'DPY'
+import json,pathlib,sys
+node={'Name':'900a','RegionID':900,'HostName':'127.0.0.1','IPv4':'127.0.0.1','DERPPort':30443,'STUNPort':33478,'CertName':'sha256-raw:'+sys.argv[2]}
+pathlib.Path(sys.argv[1]).write_text(json.dumps({'derpMap':{'Regions':{'900':{'RegionID':900,'RegionCode':'my-derp','RegionName':'VM-Test','Nodes':[node]}}}}))
+DPY
+  python3 "$ROOT_DIR/tests/fixtures/policy_api.py" --state-dir "$tmp/policy" --port-file "$tmp/policy/port" >"$artifacts/d/fixture.log" 2>&1 &
+  policy_fixture_pid=$!
+  for ((i=0; i<50; i++)); do [[ ! -f "$tmp/policy/port" ]] || break; sleep 0.1; done
+  [[ -s "$tmp/policy/port" ]] || fail '本地策略fixture未启动'
+  mkdir -p /etc/derper
+  POLICY_CREDENTIAL_FILE=/etc/derper/policy-api.env
+  printf 'TS_TAILNET=fixture.test\nTS_API_BASE=http://127.0.0.1:%s\nTS_API_CLIENT_ID=fixture\nTS_API_CLIENT_SECRET=fixture-only\n' "$(cat "$tmp/policy/port")" >"$POLICY_CREDENTIAL_FILE"
+  chmod 600 "$POLICY_CREDENTIAL_FILE"
+  TS_TAILNET=fixture.test
+  CERT_DAYS=365
+  CERT_LEAD_DAYS=30
+  ENABLE_AUTO_MAINTAIN=1
+  cp "$SCRIPT" "$tmp/maintenance-source.sh"
+  chmod 644 "$tmp/maintenance-source.sh"
+  SCRIPT_SELF="$tmp/maintenance-source.sh"
+  apply_auto_maintain_policy >"$artifacts/d/install.log" 2>&1
+  systemctl is-enabled --quiet derper-cert-maintain.timer || fail '维护timer未enable'
+  systemctl is-active --quiet derper-cert-maintain.timer || fail '维护timer未激活'
+  # 防止daily调度与下面的手动故障注入并发；实际oneshot仍通过systemd执行。
+  systemctl stop derper-cert-maintain.timer
+  systemctl stop derper-cert-maintain.service
+  mv "$tmp/maintenance-source.sh" "$tmp/source-moved.sh"
+  stable="$(deploy_state_root)/maintenance/deploy_derper_ip_selfsigned.sh"
+  target_conf="$(deploy_state_root)/maintenance/target.conf"
+  [[ -f "$stable" && "$(stat -c %a "$target_conf")" == 600 ]] || fail '维护副本/配置权限错误'
+  grep -qx 'ALLOW_NON_GLOBAL_IP=1' "$target_conf" || fail '维护任务丢失内网显式放行'
+  if runuser -u "$RUN_USER" -- test -r "$POLICY_CREDENTIAL_FILE"; then fail 'derper用户可读维护凭据'; fi
+  systemctl start derper-cert-maintain.service >"$artifacts/d/idle.log" 2>&1
+  [[ "$(read_maintenance_kv result)" == idle && "$(live_cert_sha256_raw)" == "$d_old_fp" ]] || fail '未到期任务意外换证'
+  systemctl cat derper-cert-maintain.service derper-cert-maintain.timer >"$artifacts/d/generated-units.txt"
+  cp "$target_conf" "$artifacts/d/target.conf"
+  ok 'D真实timer启用、root凭据隔离、源脚本移走后稳定副本执行且未到期不换证'
+
+  sed -i 's/^CERT_LEAD_DAYS=.*/CERT_LEAD_DAYS=365/' "$target_conf"
+  systemctl start derper-cert-maintain.service >"$artifacts/d/due.log" 2>&1
+  d_current_fp=$(live_cert_sha256_raw)
+  cp "$(maintenance_status_path)" "$artifacts/d/due-status.txt"
+  printf 'before=%s\nafter=%s\n' "$d_old_fp" "$d_current_fp" >"$artifacts/d/due-fingerprints.txt"
+  [[ "$d_current_fp" != "$d_old_fp" && "$(read_maintenance_kv result)" == success_replaced ]] || fail '到期维护未更换实际服务身份'
+  grep -q "sha256-raw:$d_current_fp" "$tmp/policy/policy.json" || fail '本地fixture与运行身份不一致'
+  ok 'D到期oneshot通过真实HTTP fixture更新字段并加载新证书（非真实云端）'
+
+  touch "$tmp/policy/deny"
+  if systemctl start derper-cert-maintain.service >"$artifacts/d/revoked.log" 2>&1; then fail '撤权仍报维护成功'; fi
+  [[ "$(live_cert_sha256_raw)" == "$d_current_fp" ]] || fail '撤权后更换了证书'
+  [[ "$(read_maintenance_kv mode)" == manual && "$(read_maintenance_kv needs_manual)" == 1 ]] || fail '撤权未转人工'
+  rm "$tmp/policy/deny"
+  systemctl reset-failed derper-cert-maintain derper
+  ok 'D真实oneshot撤权失败非零、旧服务保留并记录人工处理'
+
+  # 仅首次ExecStartPre失败；恢复旧证书后的第二次真实restart成功。
+  cat >"$INSTALL_DIR/reject-once.sh" <<'DSH'
+#!/bin/sh
+if [ ! -e /var/lib/derper/d-restart-attempted ]; then
+  touch /var/lib/derper/d-restart-attempted
+  exit 42
+fi
+DSH
+  chmod 755 "$INSTALL_DIR/reject-once.sh"
+  mkdir -p /etc/systemd/system/derper.service.d
+  printf '[Service]\nExecStartPre=/bin/sh /opt/derper/reject-once.sh\n' >/etc/systemd/system/derper.service.d/restart-once.conf
+  systemctl daemon-reload
+  if systemctl start derper-cert-maintain.service >"$artifacts/d/restart-failed.log" 2>&1; then fail '故障注入仍报成功'; fi
+  [[ -f /var/lib/derper/d-restart-attempted ]] || fail '未命中真实启动失败注入点'
+  service_verified_running || fail '换证失败后旧服务未恢复'
+  [[ "$(live_cert_sha256_raw)" == "$d_current_fp" ]] || fail '旧服务身份未确认恢复'
+  grep -q "sha256-raw:$d_current_fp" "$tmp/policy/policy.json" || fail '反向补偿未恢复本地fixture字段'
+  [[ "$(read_maintenance_kv result)" == failed ]] || fail '失败被误记成功'
+  rm /etc/systemd/system/derper.service.d/restart-once.conf "$INSTALL_DIR/reject-once.sh" /var/lib/derper/d-restart-attempted
+  systemctl daemon-reload
+  systemctl reset-failed derper derper-cert-maintain
+  ok 'D真实换证restart失败，旧磁盘/实际进程恢复后才反向补偿fixture指纹'
+
+  # 新/旧两次启动均被真实Unit条件阻断：不得撤回仍在云端的新指纹。
+  writes_before=$(cat "$tmp/policy/writes")
+  printf '[Unit]\nConditionPathExists=/root/DERPER_D_ALLOW_START\n' >/etc/systemd/system/derper.service.d/block-start.conf
+  systemctl daemon-reload
+  if systemctl start derper-cert-maintain.service >"$artifacts/d/restore-failed.log" 2>&1; then fail '原服务恢复失败仍报成功'; fi
+  d_pending_fp=$(read_rotation_kv new_sha256)
+  [[ "$d_pending_fp" != "$d_current_fp" ]] || fail '失败用例未生成新候选身份'
+  [[ "$(cat "$tmp/policy/writes")" == "$((writes_before + 1))" ]] || fail '旧服务未恢复时发生了反向云写'
+  [[ "$(read_maintenance_kv result)" == needs_coordination && "$(read_maintenance_kv needs_manual)" == 1 ]] || fail '原服务恢复失败没有保留待协调'
+  grep -q "sha256-raw:$d_pending_fp" "$tmp/policy/policy.json" || fail '未保留fixture新指纹'
+  cp "$(maintenance_status_path)" "$artifacts/d/needs-coordination.txt"
+  rm /etc/systemd/system/derper.service.d/block-start.conf
+  systemctl daemon-reload
+  systemctl reset-failed derper derper-cert-maintain
+  systemctl start derper
+  service_verified_running || fail '解除故障后旧服务仍不可用'
+  [[ "$(live_cert_sha256_raw)" == "$d_current_fp" ]] || fail '解除故障后身份错误'
+  # 测试执行人显式协调：恢复已确认后才调用字段级补偿；不是无人值守自动重试。
+  load_policy_credentials
+  obtain_policy_token
+  local_old_cert_identity_restored || fail '人工协调前旧身份未通过确认'
+  reverse_compensate_certname >"$artifacts/d/manual-coordination.log" 2>&1
+  grep -q "sha256-raw:$d_current_fp" "$tmp/policy/policy.json" || fail '人工协调fixture字段失败'
+  ok 'D旧服务无法恢复时保留新云端字段并转待协调，解除故障后显式核验再恢复'
+
+  ENABLE_AUTO_MAINTAIN=0
+  DISABLE_AUTO_MAINTAIN=1
+  apply_auto_maintain_policy >"$artifacts/d/disable.log" 2>&1
+  systemctl daemon-reload
+  [[ "$(read_maintenance_kv intent)" == disabled && ! -e /etc/systemd/system/derper-cert-maintain.timer ]] || fail '显式停用未撤销登记/调度'
+  ! systemctl is-active --quiet derper-cert-maintain.timer || fail '维护timer仍激活'
+  DISABLE_AUTO_MAINTAIN=0
+  SCRIPT_SELF="$SCRIPT"
+  cert_hash=$(file_sha256 "$(derper_manual_cert_file)")
+  key_hash=$(file_sha256 "$(derper_manual_key_file)")
+  printf 'before=%s\nafter=%s\n' "$d_old_fp" "$d_current_fp" >"$artifacts/d/fingerprints.txt"
+  kill "$policy_fixture_pid"
+  wait "$policy_fixture_pid" 2>/dev/null || true
+  policy_fixture_pid=''
+  ok 'D停用登记与真实timer删除，最终卸载清理由EXIT断言检查'
+fi
+
 # BUG-081：真实 systemd 下，原absent意图也要移除新unit并刷新缓存。
 systemctl stop derper
 cp -p "$SERVICE_PATH" "$tmp/saved-unit"
 rm "$SERVICE_PATH"
 systemctl daemon-reload
 cp -p "$(derper_config_path)" "$INSTALL_DIR/derper.json"
+# BUG-110 会跳过已经就绪的状态目录；这里需真实构造待修复权限，
+# 才能让迁移创建本用例专属的 absent-unit 恢复集，而非读取上一场景的记录。
+chmod 755 "$NODE_STATE_DIR"
 migrate_node_state >"$artifacts/absent-migrate.log" 2>&1
 state_before=$(read_kv_value "$(deploy_state_root)/recovery/manifest" state_sha256)
 [[ "$(read_kv_value "$(deploy_state_root)/recovery/manifest" unit_sha256)" == absent ]] || fail '应记录unit原先不存在'
@@ -287,4 +426,15 @@ if systemctl is-active --quiet derper; then fail '首装回退未停止实际进
 [[ ! -e "$BIN_PATH" && ! -e "$(deploy_state_root)/incomplete" ]] || fail '确认停止后没有清理首装候选/标记'
 ok 'BUG-067真实RefuseManualStop拒停保留候选/标记，解除后独立CLI重试先停服再清理'
 printf 'old_binary=%s\ncandidate_binary=%s\nunit=%s\nnode_identity=%s\ncert=%s\n' "$old_hash" "$new_hash" "$unit_hash" "$config_hash" "$cert_hash" >"$artifacts/hashes.txt"
+if [[ "${DERPER_INTEGRATION_D:-0}" == 1 ]]; then
+  # 完整GB结束后再卸载，避免改变前面用例的基线。只写入/enable调度，不启动维护。
+  install_cert_maintain_units >"$artifacts/d/reinstall-before-uninstall.log" 2>&1
+  systemctl daemon-reload
+  systemctl enable derper-cert-maintain.timer >>"$artifacts/d/reinstall-before-uninstall.log" 2>&1
+  bash "$SCRIPT" uninstall --purge-all --yes >"$artifacts/d/uninstall.log" 2>&1
+  [[ ! -e /etc/systemd/system/derper-cert-maintain.service && ! -e /etc/systemd/system/derper-cert-maintain.timer ]] || fail '完整卸载残留维护unit'
+  [[ ! -e "$(deploy_state_root)/maintenance/deploy_derper_ip_selfsigned.sh" ]] || fail '完整卸载残留维护副本'
+  ! systemctl is-enabled --quiet derper-cert-maintain.timer || fail '完整卸载仍有启用登记'
+  ok 'D实际CLI完整卸载删除维护service/timer/副本及启用登记'
+fi
 ok 'GB 真实 systemd 集成完成（不含跨版本/客户端鉴权/公网中继验证）'

@@ -9,8 +9,8 @@
 set -euo pipefail
 
 # 脚本自身版本（与 docs/CHANGELOG_*.md、仓库根目录 VERSION 保持同步）
-SCRIPT_VERSION="0.2.18"
-SCRIPT_VERSION_DATE="2026-10-24"
+SCRIPT_VERSION="0.2.19"
+SCRIPT_VERSION_DATE="2026-10-27"
 
 # 默认端口
 DERP_PORT="30399"        # DERP TLS 端口
@@ -303,12 +303,15 @@ C/D阶段入口（旧参数继续支持）：
                           必须与 --health-check 或 --install-healthcheck-cron 一起使用；
                           建议结合 node_exporter 的 textfile collector 使用。
   --uninstall             停止并卸载 derper systemd 服务（保留二进制与证书）。
+                          同时删除健康检查 timer/cron、证书维护 service/timer 与 --tls-connlimit 规则。
+                          维护 unit 文件、启用或运行状态残留时退出非零，不报告完成。
                           不能与 --health-check/--check/--dry-run/--repair/--force 同时使用。
   --recover-interrupted   显式恢复未完成的升级/迁移。不会自动继续中断的步骤。
                           不能与安装、修复、检查或卸载同时使用。
   --purge                 必须与 --uninstall 一起使用：额外删除 ${INSTALL_DIR}（证书等）。
   --purge-all             必须与 --uninstall 一起使用：在 --purge 基础上，同时删除 ${BIN_PATH}、
-                          /etc/derper/derper.env、健康检查稳定副本/状态和脚本创建的 tailscaled socket drop-in。
+                          /etc/derper/derper.env、健康检查稳定副本/状态、维护脚本副本及 target.conf、
+                          以及脚本创建的 tailscaled socket drop-in。
                           防火墙规则和用户/组账户需手动确认，不会自动删除。
 
 示例：
@@ -1690,6 +1693,28 @@ except Exception:
   printf '%s\n' "$http_code"
 }
 
+# 已部署 unit 中的 User=（无 unit 或未声明时输出空）。
+derper_unit_run_user() {
+  read_derper_unit_content 2>/dev/null \
+    | awk -F= '/^[[:space:]]*User=/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}' || true
+}
+
+# 判断 derper 服务用户能否读写 LocalAPI socket：0 可以，1 确认不可，2 无法确认。
+# 服务用户为空或与当前调用者相同时，调用者自身的读写判断已足够。
+derper_user_socket_access() {
+  local user="$1" sock="$2"
+  [[ -n "$user" ]] || return 0
+  if [[ "$user" == "$(id -un 2>/dev/null || true)" ]]; then return 0; fi
+  # 用户不存在时 systemd 也无法启动服务，视为确认不可访问
+  id "$user" >/dev/null 2>&1 || return 1
+  if user_can_access_socket "$user" "$sock"; then return 0; fi
+  # 仅 root 的 runuser，或可免密 sudo 的实际探测才能证明“不可访问”；否则只能算未知
+  if running_as_root && { command -v runuser >/dev/null 2>&1 || command -v sudo >/dev/null 2>&1; }; then
+    return 1
+  fi
+  return 2
+}
+
 # verify-clients 开启时，区分 tailscaled 已停止、LocalAPI 明确拒绝和当前身份无法确认。
 note_tailscaled_auth_visibility() {
   TS_AUTH_UNKNOWN=0
@@ -1707,8 +1732,19 @@ note_tailscaled_auth_visibility() {
   local http_code
   http_code=$(probe_tailscaled_localapi "$sock")
   if [[ "$http_code" =~ ^2[0-9]{2}$ ]]; then
-    TS_LOCALAPI_OK=1
-    TS_AUTH_UNKNOWN=0
+    # 调用者（常为 root）能访问不代表 derper 服务用户也能访问：核对 unit 中的 User=。
+    local svc_user access_rc=0
+    svc_user=$(derper_unit_run_user)
+    derper_user_socket_access "$svc_user" "$sock" || access_rc=$?
+    case "$access_rc" in
+      0) TS_LOCALAPI_OK=1; TS_AUTH_UNKNOWN=0 ;;
+      1)
+        TS_LOCALAPI_OK=0
+        TS_AUTH_UNKNOWN=0
+        echo "[警告] derper 服务用户 ${svc_user} 无法访问 tailscaled LocalAPI socket：${sock}（调用者可访问不代表服务可用）。" >&2
+        ;;
+      *) TS_LOCALAPI_OK=0; TS_AUTH_UNKNOWN=1 ;;
+    esac
   elif [[ "$http_code" == "403" || "$http_code" == "401" ]]; then
     TS_LOCALAPI_OK=0
     TS_AUTH_UNKNOWN=0
@@ -1780,11 +1816,11 @@ cert_days_remaining() {
   [[ -n "$raw" ]] || { echo ""; return 0; }
   ts_now=$(date +%s)
   # GNU date
-  if ts_end=$(date -d "$raw" +%s 2>/dev/null); then
+  if ts_end=$(LC_ALL=C date -d "$raw" +%s 2>/dev/null); then
     :
   else
     # BSD date 兼容（较少见于本脚本目标环境）
-    ts_end=$(date -j -f "%b %d %T %Y %Z" "$raw" +%s 2>/dev/null || echo "")
+    ts_end=$(LC_ALL=C date -j -f "%b %d %T %Y %Z" "$raw" +%s 2>/dev/null || echo "")
   fi
   [[ -n "$ts_end" ]] || { echo ""; return 0; }
   echo $(( (ts_end - ts_now) / 86400 ))
@@ -3559,6 +3595,11 @@ cert_public_matches_key() {
   [[ -n "$cert_pub" && "$cert_pub" == "$key_pub" ]]
 }
 
+# 候选证书至少还要有效 1 小时，避免 apply 时切换到已过期或即将过期的证书。
+candidate_validity_ok() {
+  openssl x509 -in "$1" -noout -checkend 3600 >/dev/null 2>&1
+}
+
 rotation_candidate_reusable() {
   local phase cand key fp rec
   cand=$(cert_rotation_candidate_cert)
@@ -3571,6 +3612,9 @@ rotation_candidate_reusable() {
   [[ "$(read_rotation_kv region_id 2>/dev/null || true)" == "$REGION_ID" ]] || return 1
   [[ "$(read_rotation_kv derp_port 2>/dev/null || true)" == "$DERP_PORT" ]] || return 1
   [[ "$(read_rotation_kv stun_port 2>/dev/null || true)" == "$STUN_PORT" ]] || return 1
+  # 用户改了 --cert-days 就不能继续复用旧有效期的候选；候选已过期或即将过期同样不可复用。
+  [[ "$(read_rotation_kv cert_days 2>/dev/null || true)" == "$CERT_DAYS" ]] || return 1
+  candidate_validity_ok "$cand" || return 1
   cert_contains_ip_san "$cand" "$IP_ADDR" || return 1
   fp=$(openssl x509 -in "$cand" -outform DER | sha256_hex) || return 1
   rec=$(read_rotation_kv new_sha256 2>/dev/null || true)
@@ -3698,7 +3742,12 @@ _switch_live_certificate_from_candidate() {
       return 1
     fi
   fi
-  archive_completed_cert_transaction || return 1
+  if ! archive_completed_cert_transaction; then
+    # 归档失败也要先恢复本地，再让调用者按实际旧身份决定云端补偿；
+    # 不能等 EXIT 才回退，否则云端协调会早于本地身份恢复。
+    restore_service_after_cert_rollback || return 1
+    return 1
+  fi
 }
 
 hujson_patch_certname() {
@@ -3884,7 +3933,7 @@ def find_root(t):
     i = skip(t, 0)
     if i < len(t) and t[i] == "{":
         e = match(t, i, "{", "}")
-        if e >= 0:
+        if e >= 0 and skip(t, e + 1) == len(t):
             return i, e
     return None
 
@@ -3903,6 +3952,13 @@ for a, b in iter_objects(s):
 
 host_hits = [m for m in matches if m[2]["HostName"][1] == host]
 tool_mode = os.environ.get("POLICY_HUJSON_MODE") or "patch"
+if tool_mode == "absent":
+    # 只有策略根可解析且完全没有同 HostName 节点，才证明目标不存在；
+    # 重复、Region 不匹配、CertName 缺失或结构异常一律不算“不存在”。
+    if find_root(s) is None:
+        sys.stderr.write("unparsable policy\n")
+        sys.exit(2)
+    sys.exit(0 if not host_hits else 2)
 if tool_mode == "read":
     scoped = []
     for item in host_hits:
@@ -4340,6 +4396,12 @@ policy_put_acl() {
   esac
 }
 
+# 0 确认云端没有本节点；非 0 表示存在、有歧义或策略无法可靠解析。
+_cloud_target_absent_from_acl() {
+  local acl="$1" host="$2" region="${3:-${REGION_ID:-}}"
+  _hujson_invoke absent "$acl" "$host" "$region" placeholder "" >/dev/null 2>&1
+}
+
 _cloud_certname_from_acl() {
   local acl="$1" host="$2" region="${3:-${REGION_ID:-}}"
   _hujson_invoke read "$acl" "$host" "$region" placeholder "" 2>/dev/null || true
@@ -4422,15 +4484,16 @@ EOF
 }
 
 assert_prepared_identity() {
-  local rec_ip rec_region rec_derp rec_stun rec_tail rec_new rec_old cand live cur
+  local rec_ip rec_region rec_derp rec_stun rec_tail rec_days rec_new rec_old cand live cur
   rec_ip=$(read_rotation_kv ip) || return 1
   rec_region=$(read_rotation_kv region_id) || return 1
   rec_derp=$(read_rotation_kv derp_port) || return 1
   rec_stun=$(read_rotation_kv stun_port) || return 1
   rec_tail=$(read_rotation_kv tailnet) || return 1
+  rec_days=$(read_rotation_kv cert_days) || return 1
   rec_new=$(read_rotation_kv new_sha256) || return 1
   rec_old=$(read_rotation_kv old_sha256) || return 1
-  if [[ "$rec_ip" != "$IP_ADDR" || "$rec_region" != "$REGION_ID" || "$rec_derp" != "$DERP_PORT" || "$rec_stun" != "$STUN_PORT" ]]; then
+  if [[ "$rec_ip" != "$IP_ADDR" || "$rec_region" != "$REGION_ID" || "$rec_derp" != "$DERP_PORT" || "$rec_stun" != "$STUN_PORT" || "$rec_days" != "$CERT_DAYS" ]]; then
     echo "[错误] 本次参数与 prepare 记录的目标身份不一致，请重新 prepare。" >&2
     return 1
   fi
@@ -4441,6 +4504,7 @@ assert_prepared_identity() {
   cand=$(cert_rotation_candidate_cert)
   [[ -f "$cand" && ! -L "$cand" ]] || { echo "[错误] 候选证书不存在，请重新 prepare。" >&2; return 1; }
   cert_contains_ip_san "$cand" "$IP_ADDR" || { echo "[错误] 候选证书 SAN 与目标 IP 不一致，请重新 prepare。" >&2; return 1; }
+  candidate_validity_ok "$cand" || { echo "[错误] 候选证书已过期或剩余有效期不足 1 小时，请重新 prepare。" >&2; return 1; }
   cert_public_matches_key "$cand" "$(cert_rotation_candidate_key)" || { echo "[错误] 候选证书与私钥不匹配，请重新 prepare。" >&2; return 1; }
   cur=$(openssl x509 -in "$cand" -outform DER | sha256_hex) || return 1
   [[ "$cur" == "$rec_new" ]] || { echo "[错误] 候选指纹与 prepare 记录不一致，请重新 prepare。" >&2; return 1; }
@@ -4455,6 +4519,95 @@ assert_prepared_identity() {
     cur=$(openssl x509 -in "$live" -outform DER | sha256_hex) || return 1
     [[ "$cur" == "$rec_old" ]] || { echo "[错误] 正式证书指纹与 prepare 记录不一致，请重新 prepare。" >&2; return 1; }
   fi
+}
+
+# 磁盘回退成功不代表运行进程已重新加载旧证书。曾运行的服务必须恢复并匹配旧指纹；
+# 原先停止的服务保持停止时，只核对磁盘旧身份，不擅自启动服务。
+local_old_cert_identity_restored() {
+  local old_fp disk_fp live_fp backup="${SERVICE_PATH}.certs-rollback"
+  old_fp=$(read_rotation_kv old_sha256) || return 1
+  [[ "$old_fp" != none && -n "$old_fp" ]] || return 1
+  disk_fp=$(openssl x509 -in "$(derper_manual_cert_file)" -outform DER 2>/dev/null | sha256_hex) || return 1
+  [[ "$disk_fp" == "$old_fp" ]] || return 1
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet derper; then
+    verify_restored_service || return 1
+    live_fp=$(live_cert_sha256_raw) || return 1
+    [[ "$live_fp" == "$old_fp" ]] || return 1
+  else
+    [[ "${CERT_ROLLBACK_WAS_RUNNING:-0}" != 1 && ! -f "$backup/was-running" ]] || return 1
+  fi
+}
+
+# D2/D4 安全反向补偿：自动模式下云端 PUT 已成功（云端指向本次新指纹）后本地切换失败时，
+# 基于最新策略和 ETag 只撤回本工具写入的 CertName 字段，不回写整份旧策略。
+# 云端已被他人改动目标则停止自动回退并转人工；首次登记无旧指纹时无法反向补丁，转人工。
+reverse_compensate_certname() {
+  local old_fp new_fp old_name new_name acl patched rc current
+  old_fp=$(read_rotation_kv old_sha256)
+  new_fp=$(read_rotation_kv new_sha256)
+  new_name="sha256-raw:${new_fp}"
+  if [[ "$old_fp" == none || -z "$old_fp" ]]; then
+    echo "[错误] 首次登记无旧指纹，无法生成反向最小补丁；若云端已登记本节点新指纹，转人工协调，不回写整份旧策略。" >&2
+    write_maintenance_status unknown needs_coordination "首次登记无法反向补偿" 1
+    return 1
+  fi
+  old_name="sha256-raw:${old_fp}"
+  if ! policy_load_acl; then
+    echo "[错误] 反向补偿：无法读取最新云端策略，转人工协调，未回写整份旧策略。" >&2
+    write_maintenance_status unknown needs_coordination "反向补偿读策略失败" 1
+    return 1
+  fi
+  acl=$POLICY_ACL_BODY
+  current=$(_cloud_certname_from_acl "$acl" "$IP_ADDR")
+  if [[ -z "$current" ]]; then
+    if _cloud_target_absent_from_acl "$acl" "$IP_ADDR"; then
+      echo "[信息] 云端确认没有本节点条目，无需反向补偿。" >&2
+      return 0
+    fi
+    echo "[错误] 反向补偿：云端目标有歧义（重复 HostName、Region 不匹配、CertName 缺失）或策略无法可靠解析，不能当作无需补偿，转人工协调。" >&2
+    write_maintenance_status unknown needs_coordination "反向补偿目标歧义" 1
+    return 1
+  fi
+  if [[ "$current" != "$new_name" ]]; then
+    echo "[错误] 云端 CertName 已非本次新指纹（他人可能已改动），停止自动反向回退，转人工协调。" >&2
+    write_maintenance_status unknown needs_coordination "反向补偿目标已变" 1
+    return 1
+  fi
+  patched=$(hujson_patch_certname "$acl" "$IP_ADDR" "$REGION_ID" "$old_name" "$new_name") || {
+    echo "[错误] 反向补偿：无法生成最小补丁，转人工协调，未回写整份旧策略。" >&2
+    write_maintenance_status unknown needs_coordination "反向补偿补丁失败" 1
+    return 1
+  }
+  policy_validate_acl "$patched" || { echo "[错误] 反向补偿 validate 失败，未提交。" >&2; write_maintenance_status unknown needs_coordination "反向补偿validate失败" 1; return 1; }
+  rc=0
+  policy_put_acl "$patched" >/dev/null || rc=$?
+  if [[ "${POLICY_HTTP_STATUS:-}" == 412 ]]; then
+    echo "[错误] 反向补偿 ETag 冲突，他人可能已修改策略，转人工协调。" >&2
+    write_maintenance_status unknown needs_coordination "反向补偿ETag冲突" 1
+    return 1
+  fi
+  if [[ "$rc" -ne 0 && "$rc" -ne 28 ]]; then
+    echo "[错误] 反向补偿提交失败（rc=$rc），转人工协调。" >&2
+    write_maintenance_status unknown needs_coordination "反向补偿提交失败" 1
+    return 1
+  fi
+  # 超时(rc=28)或成功：读回核实，不把超时直接当作已回退。
+  if ! policy_load_acl; then
+    POLICY_ACL_BODY=""
+  fi
+  current=$(_cloud_certname_from_acl "${POLICY_ACL_BODY:-}" "$IP_ADDR")
+  if [[ "$current" == "$old_name" ]]; then
+    echo "[信息] 反向补偿成功：云端 CertName 已回退到旧指纹。" >&2
+    return 0
+  fi
+  if [[ "$current" == "$new_name" ]]; then
+    echo "[错误] 反向补偿读回仍为新指纹，未确认回退，转人工协调。" >&2
+    write_maintenance_status unknown needs_coordination "反向补偿读回未确认" 1
+    return 1
+  fi
+  echo "[错误] 反向补偿读回为未知值（他人已改），转人工协调。" >&2
+  write_maintenance_status unknown needs_coordination "反向补偿读回已变" 1
+  return 1
 }
 
 apply_cert_rotation() {
@@ -4489,8 +4642,13 @@ apply_cert_rotation() {
   fi
   _switch_live_certificate_from_candidate || {
     if [[ "$auto" -eq 1 ]]; then
-      echo "[错误] 本地切换失败。若云端仍指向新指纹，请人工协调，脚本不会回写整份旧策略。" >&2
-      write_maintenance_status ready needs_coordination "本地切换失败待协调" 1
+      if local_old_cert_identity_restored; then
+        echo "[错误] 本地切换失败，已确认旧身份恢复。尝试基于最新策略和 ETag 只反向补偿本工具写入的云端字段，不回写整份旧策略。" >&2
+        reverse_compensate_certname || true
+      else
+        echo "[错误] 本地旧身份未确认恢复，保留云端指纹，停止自动反向补偿，转人工协调。" >&2
+        write_maintenance_status unknown needs_coordination "本地旧身份未确认恢复" 1
+      fi
     fi
     return 1
   }
@@ -4517,10 +4675,11 @@ cert_rotation_is_due() {
   local days lead
   days=$(cert_days_remaining || true)
   lead="${CERT_LEAD_DAYS:-30}"
-  [[ "$days" =~ ^-?[0-9]+$ ]] || return 1
-  [[ "$lead" =~ ^[0-9]+$ ]] || return 1
-  [[ "$lead" -lt 1 ]] && return 1
-  if [[ -n "$days" && "$days" -le "$lead" ]]; then
+  # 0 已到维护日期；1 确定未到；2 到期日或提前天数无法确定（不能伪装成“未到期”）。
+  [[ "$days" =~ ^-?[0-9]+$ ]] || return 2
+  [[ "$lead" =~ ^[0-9]+$ ]] || return 2
+  [[ "$lead" -lt 1 ]] && return 2
+  if [[ "$days" -le "$lead" ]]; then
     return 0
   fi
   return 1
@@ -4534,17 +4693,28 @@ run_cert_maintain() {
     echo "[信息] 维护条件为 ${mode}，保留现有有效证书。" >&2
     return 1
   fi
-  if ! cert_rotation_is_due; then
-    write_maintenance_status ready idle "未到提前维护日期" 0
-    return 0
-  fi
+  local due_rc=0
+  cert_rotation_is_due || due_rc=$?
+  case "$due_rc" in
+    0) ;;
+    1)
+      write_maintenance_status ready idle "未到提前维护日期" 0
+      return 0
+      ;;
+    *)
+      echo "[错误] 无法计算证书到期时间（证书不可读、openssl 异常或日期无法解析），不能判断是否需要续期，请人工检查。" >&2
+      write_maintenance_status ready failed "无法计算证书到期时间" 1
+      return 1
+      ;;
+  esac
   prepare_cert_rotation || { write_maintenance_status ready failed "prepare失败" 1; return 1; }
-  ENABLE_AUTO_MAINTAIN=1
   if apply_cert_rotation; then
     write_maintenance_status ready success_replaced "已按登记策略换证" 0
     return 0
   fi
-  write_maintenance_status ready failed "换证失败已保留候选" 1
+  if [[ "$(read_maintenance_kv result 2>/dev/null || true)" != needs_coordination ]]; then
+    write_maintenance_status ready failed "换证失败已保留候选" 1
+  fi
   return 1
 }
 
@@ -4631,16 +4801,40 @@ remove_cert_maintain_units() {
     systemctl disable --now derper-cert-maintain.timer >/dev/null 2>&1 || true
     systemctl disable --now derper-cert-maintain.service >/dev/null 2>&1 || true
   fi
-  rm -f "$svc" "$timer"
-  [[ ! -e "$svc" && ! -e "$timer" ]]
+  rm -f "$svc" "$timer" 2>/dev/null || true
+  if [[ -e "$svc" || -L "$svc" || -e "$timer" || -L "$timer" ]]; then
+    echo "[错误] 维护 unit 文件未能删除：${svc} / ${timer}" >&2
+    return 1
+  fi
+  if command -v systemctl >/dev/null 2>&1; then
+    if ! systemctl daemon-reload >/dev/null 2>&1; then
+      echo "[错误] 删除维护 unit 后 systemctl daemon-reload 失败，无法确认调度状态已刷新。" >&2
+      return 1
+    fi
+    # 文件已删除并不代表调度已停止：核对启用状态与运行状态。
+    local unit
+    for unit in derper-cert-maintain.timer derper-cert-maintain.service; do
+      if systemctl is-enabled --quiet "$unit" >/dev/null 2>&1; then
+        echo "[错误] ${unit} 仍处于启用状态，自动换证调度可能继续执行。" >&2
+        return 1
+      fi
+      if systemctl is-active --quiet "$unit" >/dev/null 2>&1; then
+        echo "[错误] ${unit} 仍在运行，自动换证调度可能继续执行。" >&2
+        return 1
+      fi
+    done
+  fi
+  return 0
 }
 
 apply_auto_maintain_policy() {
   if [[ "${DISABLE_AUTO_MAINTAIN:-0}" == 1 ]]; then
     write_maintenance_status manual disabled "已关闭自动换证" 0 "" disabled disabled || return 1
-    remove_cert_maintain_units || {
-      echo "[警告] 未能完全删除维护 timer，已记录为人工维护。" >&2
-    }
+    if ! remove_cert_maintain_units; then
+      write_maintenance_status manual failed "未能完全删除维护任务" 1 "" disabled failed || true
+      echo "[错误] 未能完全删除维护 service/timer，自动换证调度可能仍会执行，请人工清理后重试。" >&2
+      return 1
+    fi
     return 0
   fi
   if [[ "${ENABLE_AUTO_MAINTAIN:-0}" == 1 ]]; then
@@ -7431,7 +7625,12 @@ uninstall_derper() {
   require_root
   echo "[步骤] 停止并卸载 derper systemd 服务…"
   remove_healthcheck_cron
-  remove_cert_maintain_units || true
+  # 维护 unit 删除失败不能被吞掉：继续清理其余部分，但最终必须非零且不报告“完成”。
+  local uninstall_rc=0
+  if ! remove_cert_maintain_units; then
+    echo "[错误] 维护 service/timer 未能完全删除，自动换证调度可能仍会执行。" >&2
+    uninstall_rc=1
+  fi
   remove_tls_connlimit
 
   # 在移除单元前尽力识别当前服务运行用户
@@ -7487,6 +7686,10 @@ uninstall_derper() {
       echo "[提示] 未能识别非 root 的服务运行用户；如需删除账户请手动确认后执行 userdel。"
     fi
     echo "[提示] 防火墙/云安全组规则可能由用户手工维护，脚本不会自动删除端口放行规则。"
+  fi
+  if [[ "$uninstall_rc" -ne 0 ]]; then
+    echo "[错误] 卸载未完整完成：维护调度残留，请检查 derper-cert-maintain.service/timer 的文件、启用与运行状态后重试。" >&2
+    return 1
   fi
   echo "完成：已卸载 derper 服务。"
 }
@@ -7817,7 +8020,7 @@ main() {
   # 环境检测（优先级最高，除了 --help 和 --uninstall）
   if [[ "${UNINSTALL}" -eq 1 ]]; then
     # 卸载优先处理：不依赖环境检测/公网 IP 探测/参数校验
-    uninstall_derper
+    uninstall_derper || exit 1
     exit 0
   fi
   
@@ -7863,7 +8066,7 @@ main() {
       exit 0
     fi
     if [[ "${ENABLE_AUTO_MAINTAIN:-0}" -eq 1 || "${DISABLE_AUTO_MAINTAIN:-0}" -eq 1 ]]; then
-      apply_auto_maintain_policy
+      apply_auto_maintain_policy || exit 1
     fi
     if [[ "$CERT_MAINTAIN" -ne 1 ]]; then
       print_auto_maintain_feedback "$(evaluate_auto_maintain_readiness)"
@@ -8023,6 +8226,10 @@ main() {
       run_post_deploy_extras || exit 1
       finish_deploy_auto_maintain || exit 1
       exit 0
+    fi
+    if [[ $changed -eq 0 ]]; then
+      # 未改动但 health_is_ok 失败（如 LocalAPI 明确故障）：不能跳过门禁后继续成功收尾。
+      publish_verification_gate || exit 1
     fi
     print_firewall_tips
     runtime_checks

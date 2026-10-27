@@ -17,6 +17,39 @@ make_cert_pair() {
     -subj "/CN=${ip}" -addext "subjectAltName = IP:${ip}" >/dev/null 2>&1
 }
 
+# 生成真正已过期的同 IP 证书（openssl ca 指定过去的有效期），不依赖系统时间伪造。
+make_expired_cert_pair() {
+  local dest="$1" ip="${2:-203.0.113.10}" work
+  work=$(mktemp -d)
+  : >"$work/index.txt"
+  printf '01\n' >"$work/serial"
+  cat >"$work/ca.cnf" <<CNF
+[ ca ]
+default_ca = CA_default
+[ CA_default ]
+database = $work/index.txt
+new_certs_dir = $work
+serial = $work/serial
+default_md = sha256
+policy = pol
+unique_subject = no
+x509_extensions = ext
+[ pol ]
+commonName = supplied
+[ ext ]
+subjectAltName = IP:${ip}
+[ req ]
+distinguished_name = dn
+prompt = no
+[ dn ]
+CN = ${ip}
+CNF
+  openssl req -new -newkey rsa:2048 -nodes -keyout "$dest.key" -out "$work/c.csr" -config "$work/ca.cnf" >/dev/null 2>&1 &&
+    openssl ca -batch -config "$work/ca.cnf" -selfsign -keyfile "$dest.key" -in "$work/c.csr" -out "$dest.crt" \
+      -startdate 20200101000000Z -enddate 20200102000000Z -notext >/dev/null 2>&1 || { rm -rf "$work"; return 1; }
+  rm -rf "$work"
+}
+
 cert_fp() {
   openssl x509 -in "$1" -outform DER 2>/dev/null | sha256_hex
 }
@@ -404,7 +437,12 @@ stub_timer_systemctl() {
   systemctl() {
     printf '%s\n' "$*" >>"$tmp/systemctl.log"
     case "$1" in
-      daemon-reload|enable|is-enabled|is-active) return 0 ;;
+      # 有状态替身：enable 后维护 unit 才处于启用/运行，disable 后恢复；卸载核验依赖该状态。
+      enable) [[ "$*" == *derper-cert-maintain* ]] && : >"$tmp/maintain-enabled"; return 0 ;;
+      disable) [[ "$*" == *derper-cert-maintain* ]] && rm -f "$tmp/maintain-enabled"; return 0 ;;
+      is-enabled|is-active)
+        if [[ "$*" == *derper-cert-maintain* ]]; then [[ -e "$tmp/maintain-enabled" ]]; return; fi
+        return 0 ;;
       *) return 0 ;;
     esac
   }
@@ -562,6 +600,119 @@ test_apply_fails_when_service_does_not_load_cert() {
   [[ "$(cert_fp "$INSTALL_DIR/certs/$IP_ADDR.crt")" == "$old" ]] || fail '健康验证失败应恢复旧证书'
 }
 
+# D2/D4 安全反向补偿：自动模式下云端 PUT 已成功（云端指向新指纹）后本地切换失败，
+# 必须基于最新策略和 ETag 只反向撤回本工具写入的 CertName，不回写整份旧策略。
+test_local_switch_failure_reverses_cloud_field() {
+  setup_rotation_env
+  ACCEPT_CERT_ROTATION=1
+  ENABLE_AUTO_MAINTAIN=1
+  POLICY_CREDENTIAL_FILE="$tmp/creds.env"
+  printf 'TS_TAILNET=example.com\nTS_API_CLIENT_ID=id\nTS_API_CLIENT_SECRET=sec\nPOLICY_SOURCE=api\n' >"$POLICY_CREDENTIAL_FILE"
+  local old new
+  old=$(cert_fp "$INSTALL_DIR/certs/$IP_ADDR.crt")
+  prepare_cert_rotation >/dev/null
+  new=$(read_rotation_kv new_sha256)
+  policy_auth_state() { printf 'write_ready\n'; }
+  printf '%s\n' "$old" >"$tmp/cloud-fp"
+  printf '0\n' >"$tmp/puts"
+  policy_http_request() {
+    case "$1 $2" in
+      "GET /api/v2/tailnet/example.com/acl")
+        local fp; fp=$(cat "$tmp/cloud-fp")
+        printf 'etag: "v-%s"\n\n{"derpMap":{"Regions":{"900":{"RegionID":900,"Nodes":[{"HostName":"203.0.113.10","CertName":"sha256-raw:%s"}]}}}}\n' "$fp" "$fp"
+        ;;
+      "POST /api/v2/tailnet/example.com/acl/validate") printf 'ok\n' ;;
+      "POST /api/v2/tailnet/example.com/acl")
+        local n; n=$(cat "$tmp/puts"); n=$((n+1)); printf '%s\n' "$n" >"$tmp/puts"
+        printf '%s\n' "${POLICY_IF_MATCH-}" >"$tmp/if-match-$n"
+        if printf '%s' "$3" | grep -q "sha256-raw:$new"; then
+          printf '%s\n' "$new" >"$tmp/cloud-fp"
+        elif printf '%s' "$3" | grep -q "sha256-raw:$old"; then
+          printf '%s\n' "$old" >"$tmp/cloud-fp"
+        fi
+        printf 'HTTP/2 200\r\nETag: "v-%s"\r\n\r\n{}\r\n' "$(cat "$tmp/cloud-fp")"
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  local restarted=0
+  systemctl() {
+    case "$1" in
+      is-active) [[ ! -e "$tmp/crashed" ]] ;;
+      restart)
+        restarted=$((restarted+1))
+        if [[ "$restarted" == 1 ]]; then touch "$tmp/crashed"; else rm -f "$tmp/crashed"; fi
+        return 0 ;;
+      *) return 0 ;;
+    esac
+  }
+  service_verified_running() { return 1; }
+  live_cert_sha256_raw() { cert_fp "$(derper_manual_cert_file)"; }
+  local rc=0
+  apply_cert_rotation >/dev/null 2>"$tmp/apply.err" || rc=$?
+  [[ "$rc" -ne 0 ]] || fail '本地切换失败时 apply 不得成功'
+  [[ "$(cat "$tmp/puts")" -ge 2 ]] || fail '本地切换失败后应尝试反向补偿 POST（第二次 PUT）'
+  [[ "$(cat "$tmp/cloud-fp")" == "$old" ]] || fail '反向补偿应把云端 CertName 回退到旧指纹，实际：'"$(cat "$tmp/cloud-fp")"
+  [[ "$(cert_fp "$INSTALL_DIR/certs/$IP_ADDR.crt")" == "$old" ]] || fail '本地证书应保持旧指纹'
+  grep -E -q '反向补偿' "$tmp/apply.err" || fail '应提示反向补偿'
+  [[ "$(read_maintenance_kv result 2>/dev/null || true)" != applied ]] || fail '反向补偿期间不得记 applied'
+}
+
+# D2/D4 反向补偿安全边界：云端已被他人改成第三方指纹时，必须停止自动回退并转人工，不得覆盖他人配置。
+test_local_switch_failure_foreign_change_blocks_reverse() {
+  setup_rotation_env
+  ACCEPT_CERT_ROTATION=1
+  ENABLE_AUTO_MAINTAIN=1
+  POLICY_CREDENTIAL_FILE="$tmp/creds.env"
+  printf 'TS_TAILNET=example.com\nTS_API_CLIENT_ID=id\nTS_API_CLIENT_SECRET=sec\nPOLICY_SOURCE=api\n' >"$POLICY_CREDENTIAL_FILE"
+  local old new third=foreignfingerprint
+  old=$(cert_fp "$INSTALL_DIR/certs/$IP_ADDR.crt")
+  prepare_cert_rotation >/dev/null
+  new=$(read_rotation_kv new_sha256)
+  policy_auth_state() { printf 'write_ready\n'; }
+  printf '0\n' >"$tmp/gets"
+  printf '0\n' >"$tmp/puts"
+  policy_http_request() {
+    case "$1 $2" in
+      "GET /api/v2/tailnet/example.com/acl")
+        local n fp; n=$(cat "$tmp/gets"); n=$((n+1)); printf '%s\n' "$n" >"$tmp/gets"
+        case "$n" in
+          1) fp="$old" ;;   # sync 加载
+          2) fp="$new" ;;   # sync 读回（正向 PUT 已成功）
+          *) fp="$third" ;; # 反向补偿加载：他人已改成第三方指纹
+        esac
+        printf 'etag: "v-%s"\n\n{"derpMap":{"Regions":{"900":{"RegionID":900,"Nodes":[{"HostName":"203.0.113.10","CertName":"sha256-raw:%s"}]}}}}\n' "$fp" "$fp"
+        ;;
+      "POST /api/v2/tailnet/example.com/acl/validate") printf 'ok\n' ;;
+      "POST /api/v2/tailnet/example.com/acl")
+        local n; n=$(cat "$tmp/puts"); n=$((n+1)); printf '%s\n' "$n" >"$tmp/puts"
+        printf 'HTTP/2 200\r\nETag: "v-new"\r\n\r\n{}\r\n'
+        ;;
+      *) return 1 ;;
+    esac
+  }
+  local restarted=0
+  systemctl() {
+    case "$1" in
+      is-active) [[ ! -e "$tmp/crashed" ]] ;;
+      restart)
+        restarted=$((restarted+1))
+        if [[ "$restarted" == 1 ]]; then touch "$tmp/crashed"; else rm -f "$tmp/crashed"; fi
+        return 0 ;;
+      *) return 0 ;;
+    esac
+  }
+  service_verified_running() { return 1; }
+  live_cert_sha256_raw() { cert_fp "$(derper_manual_cert_file)"; }
+  local rc=0
+  apply_cert_rotation >/dev/null 2>"$tmp/apply.err" || rc=$?
+  [[ "$rc" -ne 0 ]] || fail '本地切换失败时 apply 不得成功'
+  [[ "$(cat "$tmp/puts")" -eq 1 ]] || fail '云端已被他人改动时不得发起反向 PUT，实际 PUT 次数：'"$(cat "$tmp/puts")"
+  [[ "$(read_maintenance_kv result 2>/dev/null || true)" == needs_coordination ]] || fail '他人改动目标应记 needs_coordination 转人工'
+  grep -E -q '待协调|他人|转人工' "$tmp/apply.err" || fail '应提示他人已改目标、转人工协调'
+  [[ "$(cert_fp "$INSTALL_DIR/certs/$IP_ADDR.crt")" == "$old" ]] || fail '本地证书应保持旧指纹'
+}
+
 test_timer_ready_only_after_enable() {
   setup_rotation_env
   SYSTEMD_UNIT_DIR="$tmp/systemd"
@@ -632,6 +783,7 @@ test_transient_unknown_keeps_auto_intent() {
   ENABLE_AUTO_MAINTAIN=0
   [[ "$(evaluate_auto_maintain_readiness)" == ready ]] || fail '临时 unknown 不得取消已登记的自动维护'
   DISABLE_AUTO_MAINTAIN=1
+  stub_timer_systemctl
   apply_auto_maintain_policy >/dev/null || fail '显式停用应成功'
   DISABLE_AUTO_MAINTAIN=0
   policy_auth_state() { printf 'write_ready\n'; }
@@ -766,7 +918,7 @@ test_purge_all_removes_maintain_program() {
   require_root() { :; }
   remove_healthcheck_cron() { :; }
   remove_tls_connlimit() { :; }
-  systemctl() { return 0; }
+  systemctl() { case "$1" in is-enabled|is-active) return 1 ;; *) return 0 ;; esac; }
   SERVICE_PATH="$tmp/derper.service"
   INSTALL_DIR="$tmp/install-tree"
   BIN_PATH="$tmp/derper-bin"
@@ -1005,6 +1157,7 @@ test_bug104_maintain_retries_preserve_schedule_failure() {
     [[ "$(evaluate_auto_maintain_readiness)" == unknown ]] || fail '维护状态重写后仍须 unknown'
   done
   DISABLE_AUTO_MAINTAIN=1
+  stub_timer_systemctl
   finish_deploy_auto_maintain >/dev/null || fail '显式停用应能解除失败并返回人工模式'
   DISABLE_AUTO_MAINTAIN=0
   [[ "$(evaluate_auto_maintain_readiness)" == manual ]] || fail '停用后须保持人工模式'
@@ -1170,6 +1323,486 @@ test_bug106_short_cert_days_keep_default_lead_in_range() {
   fi
 }
 
+
+# BUG-111：保留真实切换/回滚/补偿函数，仅用替身模拟旧进程恢复失败。
+run_bug111_recovery_scenario() {
+  local scenario="$1" old new rc=0
+  setup_rotation_env
+  ACCEPT_CERT_ROTATION=1 ENABLE_AUTO_MAINTAIN=1
+  POLICY_CREDENTIAL_FILE="$tmp/creds.env"
+  printf 'TS_TAILNET=example.com\nTS_API_CLIENT_ID=id\nTS_API_CLIENT_SECRET=fake\nPOLICY_SOURCE=api\n' >"$POLICY_CREDENTIAL_FILE"
+  old=$(cert_fp "$INSTALL_DIR/certs/$IP_ADDR.crt")
+  prepare_cert_rotation >/dev/null || fail 'prepare 应成功'
+  new=$(read_rotation_kv new_sha256)
+  printf '%s\n' "$old" >"$tmp/cloud-fp"
+  printf '%s\n' "$old" >"$tmp/live-fp"
+  printf '0\n' >"$tmp/puts"
+  printf '0\n' >"$tmp/restarts"
+  policy_auth_state() { echo write_ready; }
+  policy_http_request() {
+    local fp n
+    case "$1 $2" in
+      'GET /api/v2/tailnet/example.com/acl')
+        fp=$(cat "$tmp/cloud-fp")
+        printf 'HTTP/2 200\r\nETag: "v-%s"\r\n\r\n{"derpMap":{"Regions":{"900":{"RegionID":900,"Nodes":[{"HostName":"203.0.113.10","CertName":"sha256-raw:%s"}]}}}}' "$fp" "$fp" ;;
+      'POST /api/v2/tailnet/example.com/acl/validate') printf 'HTTP/2 200\r\n\r\n' ;;
+      'POST /api/v2/tailnet/example.com/acl')
+        n=$(cat "$tmp/puts"); printf '%s\n' "$((n+1))" >"$tmp/puts"
+        fp=$(_cloud_certname_from_acl "$3" "$IP_ADDR")
+        printf '%s\n' "${fp#sha256-raw:}" >"$tmp/cloud-fp"
+        printf 'HTTP/2 200\r\n\r\n{}' ;;
+      *) return 1 ;;
+    esac
+  }
+  systemctl() {
+    local n
+    case "$1" in
+      is-active) [[ "$scenario" != inactive ]] ;;
+      restart)
+        n=$(cat "$tmp/restarts"); printf '%s\n' "$((n+1))" >"$tmp/restarts"
+        if [[ "$n" == 0 ]]; then
+          printf '%s\n' "$new" >"$tmp/live-fp"
+          return 0
+        fi
+        [[ "$scenario" != restart_failure ]] || return 1
+        if [[ "$scenario" == restored || "$scenario" == archive_failure ]]; then printf '%s\n' "$old" >"$tmp/live-fp"; fi
+        return 0 ;;
+      *) return 0 ;;
+    esac
+  }
+  live_cert_sha256_raw() { cat "$tmp/live-fp"; }
+  verify_switched_derper() { [[ "$scenario" == archive_failure ]]; }
+  if [[ "$scenario" == archive_failure ]]; then
+    mv() {
+      [[ "$1" != "${SERVICE_PATH}.certs-rollback" || "$2" != "$(cert_archive_path)" ]] || return 1
+      command mv "$@"
+    }
+  elif [[ "$scenario" == inactive ]]; then
+    cp() {
+      [[ "$1" != -p || "$2" != "$(cert_rotation_candidate_cert)" ]] || return 1
+      command cp "$@"
+    }
+  fi
+  verify_restored_service() { return 0; }
+  cert_days_remaining() { echo 1; }
+  if [[ "$scenario" == restored || "$scenario" == archive_failure || "$scenario" == inactive ]]; then
+    apply_cert_rotation >"$tmp/out" 2>&1 || rc=$?
+  else
+    run_cert_maintain >"$tmp/out" 2>&1 || rc=$?
+  fi
+  cleanup_deployment "$rc"
+  [[ "$rc" != 0 ]] || fail '本地换证失败必须非零'
+  [[ "$(cert_fp "$INSTALL_DIR/certs/$IP_ADDR.crt")" == "$old" ]] || fail '磁盘应恢复旧证书'
+  if [[ "$scenario" == restored || "$scenario" == archive_failure || "$scenario" == inactive ]]; then
+    if [[ "$scenario" == inactive ]]; then [[ "$(cat "$tmp/restarts")" == 0 ]] || fail '原停止服务不得被启动'; fi
+    [[ "$(cat "$tmp/cloud-fp")" == "$old" && "$(cat "$tmp/live-fp")" == "$old" && "$(cat "$tmp/puts")" == 2 ]] || fail '只有确认旧运行身份恢复后才能反向写旧指纹'
+  else
+    [[ "$(cat "$tmp/cloud-fp")" == "$new" && "$(cat "$tmp/puts")" == 1 ]] || fail '旧服务未恢复时不得反向覆盖云端新指纹'
+    [[ "$(read_maintenance_kv result)" == needs_coordination && "$(read_maintenance_kv mode)" == unknown && "$(read_maintenance_kv needs_manual)" == 1 ]] || fail '定时维护必须保留本地恢复失败的待协调状态'
+  fi
+}
+
+test_bug111_failed_restore_keeps_cloud_fingerprint() { run_bug111_recovery_scenario restart_failure; }
+test_bug111_wrong_live_cert_blocks_reverse() { run_bug111_recovery_scenario wrong_live; }
+test_bug111_confirmed_restore_allows_reverse() { run_bug111_recovery_scenario restored; }
+
+test_bug111_archive_failure_restores_both_identities() { run_bug111_recovery_scenario archive_failure; }
+test_bug111_stopped_service_stays_stopped() { run_bug111_recovery_scenario inactive; }
+
+test_bug113_bsd_cert_date_uses_C_locale() {
+  setup_rotation_env
+  # 不依赖宿主是否安装中文locale；BSD替身只接受明确指定的C locale。
+  date() {
+    case "$1" in
+      +%s) echo 100000 ;;
+      -d) return 1 ;;
+      -j) [[ "${LC_ALL:-}" == C ]] || return 1; echo 272800 ;;
+      *) return 1 ;;
+    esac
+  }
+  local days
+  days=$(LC_ALL=POSIX cert_days_remaining)
+  [[ "$days" == 2 ]] || fail "BSD证书日期必须与调用者locale无关，实际：${days:-empty}"
+}
+
+test_bug114_vm_workflow_exports_fixture() {
+  local stage fixture captured rc out
+  mkdir -p "$tmp/work/tests"
+  cat >"$tmp/work/tests/test_systemd_integration.sh" <<'SH'
+#!/usr/bin/env bash
+set -eu
+: "${DERPER_TEST_BINARY:?fixture missing}"
+printf '%s\n' "$DERPER_TEST_BINARY" >"$FIXTURE_CAPTURE"
+SH
+  # 执行仓库中的实际workflow run块，仅把root默认路径换成临时路径。
+  awk -v fallback="$tmp/default fixture" '
+    /- name: Run systemd integration suite/ {found=1; next}
+    found && /run: \|/ {body=1; next}
+    body && /^      - / {exit}
+    body {sub(/^          /, ""); gsub(/\/root\/derper/, fallback); print}
+  ' "$ROOT_DIR/.github/workflows/tests.yml" >"$tmp/vm-step.sh"
+  [[ -s "$tmp/vm-step.sh" ]] || fail '未找到VM实际执行步骤'
+  for stage in default explicit missing; do
+    fixture="$tmp/default fixture"
+    [[ "$stage" != explicit ]] || fixture="$tmp/explicit fixture"
+    printf '#!/bin/sh\nexit 0\n' >"$fixture"
+    chmod 755 "$fixture"
+    [[ "$stage" != missing ]] || rm -f "$fixture"
+    captured="$tmp/captured-$stage"
+    rc=0
+    out=$(
+      cd "$tmp/work"
+      unset DERPER_TEST_BINARY
+      export FIXTURE_CAPTURE="$captured"
+      export GITHUB_WORKSPACE="$tmp/work"
+      if [[ "$stage" == explicit ]]; then export DERPER_TEST_BINARY="$fixture"; fi
+      bash -e "$tmp/vm-step.sh"
+    ) || rc=$?
+    if [[ "$stage" == missing ]]; then
+      [[ "$rc" == 2 ]] || fail "fixture缺失必须明确未验收并返回2：$rc"
+      [[ ! -e "$captured" ]] || fail 'fixture缺失时不得执行集成脚本'
+      [[ "$out" == *'not verified'* ]] || fail '跳过必须明确标记未验收'
+    else
+      [[ "$rc" == 0 ]] || fail "VM的${stage}路径传递失败：${rc} ${out}"
+      [[ -f "$captured" && "$(cat "$captured")" == "$fixture" ]] || fail '集成脚本必须收到实际fixture路径'
+    fi
+  done
+}
+
+# BUG-118：改 --cert-days 不得复用旧有效期候选；apply 必须拒绝已过期候选。
+test_bug118_cert_days_change_regenerates_candidate() {
+  setup_rotation_env
+  CERT_DAYS=1
+  prepare_cert_rotation >/dev/null 2>&1 || fail '1 天候选 prepare 应成功'
+  local first_fp first_end second_fp second_end
+  first_fp=$(cert_fp "$(cert_rotation_candidate_cert)")
+  first_end=$(openssl x509 -in "$(cert_rotation_candidate_cert)" -noout -enddate)
+  CERT_DAYS=3650
+  prepare_cert_rotation >/dev/null 2>&1 || fail '3650 天候选 prepare 应成功'
+  second_fp=$(cert_fp "$(cert_rotation_candidate_cert)")
+  second_end=$(openssl x509 -in "$(cert_rotation_candidate_cert)" -noout -enddate)
+  [[ "$first_fp" != "$second_fp" ]] || fail '修改 --cert-days 后不得复用旧候选'
+  [[ "$first_end" != "$second_end" ]] || fail '十年候选的到期时间必须不同于一天候选'
+  [[ "$(read_rotation_kv cert_days)" == 3650 ]] || fail '记录必须保存新的有效期'
+  [[ "$(read_rotation_kv new_sha256)" == "$second_fp" ]] || fail '记录必须指向新候选'
+  # 相同参数重复 prepare 仍复用同一候选（幂等）
+  prepare_cert_rotation >/dev/null 2>&1 || fail '重复 prepare 应成功'
+  [[ "$(cert_fp "$(cert_rotation_candidate_cert)")" == "$second_fp" ]] || fail '参数不变时应复用候选'
+}
+
+test_bug118_apply_refuses_expired_candidate() {
+  setup_rotation_env
+  ACCEPT_CERT_ROTATION=1
+  CERT_LEAD_DAYS=30
+  local live_before expired_fp rc=0
+  live_before=$(cert_fp "$INSTALL_DIR/certs/$IP_ADDR.crt")
+  prepare_cert_rotation >/dev/null 2>&1 || fail 'prepare 应成功'
+  # 用真实已过期的同 IP 证书替换候选，并让记录与之保持一致。
+  make_expired_cert_pair "$tmp/expired" "$IP_ADDR" || fail '无法生成已过期证书'
+  openssl x509 -in "$tmp/expired.crt" -noout -checkend 0 >/dev/null 2>&1 && fail '测试证书必须真实过期'
+  cp "$tmp/expired.crt" "$(cert_rotation_candidate_cert)"
+  cp "$tmp/expired.key" "$(cert_rotation_candidate_key)"
+  expired_fp=$(cert_fp "$tmp/expired.crt")
+  write_rotation_record <<RECORD
+kind=cert-rotation
+phase=prepared
+old_sha256=${live_before}
+new_sha256=${expired_fp}
+region_id=${REGION_ID}
+ip=${IP_ADDR}
+derp_port=${DERP_PORT}
+stun_port=${STUN_PORT}
+cert_days=${CERT_DAYS}
+tailnet=${TS_TAILNET}
+etag=none
+policy_mode=manual
+lead_days=${CERT_LEAD_DAYS}
+RECORD
+  apply_cert_rotation >"$tmp/out" 2>&1 || rc=$?
+  [[ "$rc" -ne 0 ]] || fail 'apply 不得切换到已过期候选'
+  grep -q '已过期或剩余有效期不足' "$tmp/out" || fail "应说明候选有效期不足：$(cat "$tmp/out")"
+  [[ "$(cert_fp "$INSTALL_DIR/certs/$IP_ADDR.crt")" == "$live_before" ]] || fail '拒绝后正式证书必须保持不变'
+  # 重新 prepare 必须丢弃过期候选，而不是复用。
+  prepare_cert_rotation >/dev/null 2>&1 || fail '重新 prepare 应成功'
+  [[ "$(cert_fp "$(cert_rotation_candidate_cert)")" != "$expired_fp" ]] || fail '过期候选不得被复用'
+}
+
+# BUG-119：到期日未知必须非零并留下人工处理信号，不能写成 idle。
+test_bug119_unknown_expiry_is_not_idle() {
+  setup_rotation_env
+  write_maintenance_status ready recorded '已登记' 0
+  policy_auth_state() { printf 'write_ready\n'; }
+  CERT_LEAD_DAYS=30
+  cert_days_remaining() { printf '\n'; }
+  local rc=0
+  run_cert_maintain >"$tmp/out" 2>&1 || rc=$?
+  [[ "$rc" -ne 0 ]] || fail '到期日未知时维护必须非零'
+  [[ "$(read_maintenance_kv result)" != idle ]] || fail '到期日未知不得记为 idle'
+  [[ "$(read_maintenance_kv reason)" != '未到提前维护日期' ]] || fail '到期日未知不得写成未到日期'
+  [[ "$(read_maintenance_kv needs_manual)" == 1 ]] || fail '到期日未知必须标记需人工'
+  grep -q '无法计算证书到期时间' "$tmp/out" || fail '必须输出原因'
+  # 确定未到期仍然是 idle 且成功。
+  cert_days_remaining() { echo 200; }
+  run_cert_maintain >/dev/null 2>&1 || fail '确定未到期应成功'
+  [[ "$(read_maintenance_kv result)" == idle && "$(read_maintenance_kv needs_manual)" == 0 ]] || fail '确定未到期应为 idle 且无需人工'
+}
+
+test_bug119_cert_rotation_is_due_tristate() {
+  setup_rotation_env
+  CERT_LEAD_DAYS=30
+  local rc
+  cert_days_remaining() { echo 10; }
+  rc=0; cert_rotation_is_due || rc=$?; [[ "$rc" == 0 ]] || fail "到期应返回 0，实际 $rc"
+  cert_days_remaining() { echo 100; }
+  rc=0; cert_rotation_is_due || rc=$?; [[ "$rc" == 1 ]] || fail "未到期应返回 1，实际 $rc"
+  cert_days_remaining() { echo ''; }
+  rc=0; cert_rotation_is_due || rc=$?; [[ "$rc" == 2 ]] || fail "未知应返回 2，实际 $rc"
+  cert_days_remaining() { echo 10; }
+  CERT_LEAD_DAYS=abc
+  rc=0; cert_rotation_is_due || rc=$?; [[ "$rc" == 2 ]] || fail "提前天数非法应返回 2，实际 $rc"
+}
+
+# BUG-120：目标歧义/策略不可解析不能当作“云端没有本节点”。
+run_bug120_reverse_scenario() {
+  local scenario="$1" old new rc=0 policy_body=""
+  command -v python3 >/dev/null 2>&1 || { echo "skip - 无 python3，HuJSON 解析未测"; return 0; }
+  setup_rotation_env
+  ENABLE_AUTO_MAINTAIN=1
+  prepare_cert_rotation >/dev/null 2>&1 || fail 'prepare 应成功'
+  old=$(read_rotation_kv old_sha256)
+  new=$(read_rotation_kv new_sha256)
+  write_maintenance_status ready recorded '已登记' 0
+  case "$scenario" in
+    duplicate)
+      policy_body=$(printf '{"derpMap":{"Regions":{"900":{"RegionID":900,"Nodes":[{"HostName":"203.0.113.10","CertName":"sha256-raw:%s"},{"HostName":"203.0.113.10","CertName":"sha256-raw:%s"}]}}}}' "$new" "$new") ;;
+    region_mismatch)
+      policy_body=$(printf '{"derpMap":{"Regions":{"901":{"RegionID":901,"Nodes":[{"HostName":"203.0.113.10","RegionID":901,"CertName":"sha256-raw:%s"}]}}}}' "$new") ;;
+    missing_certname)
+      policy_body='{"derpMap":{"Regions":{"900":{"RegionID":900,"Nodes":[{"HostName":"203.0.113.10"}]}}}}' ;;
+    unparsable)
+      policy_body='<<<not a policy>>>' ;;
+    trailing_garbage)
+      policy_body='{} trailing-garbage' ;;
+    multiple_roots)
+      policy_body='{} {}' ;;
+    absent)
+      policy_body='{"derpMap":{"Regions":{"900":{"RegionID":900,"Nodes":[{"HostName":"198.51.100.7","CertName":"sha256-raw:abc"}]}}}}' ;;
+  esac
+  BUG120_POLICY_BODY="$policy_body"
+  # 注意：被测函数内部有同名局部变量 acl，替身必须读不会被遮蔽的全局变量。
+  policy_load_acl() { POLICY_ACL_BODY="$BUG120_POLICY_BODY"; POLICY_IF_MATCH='"etag"'; return 0; }
+  printf '0\n' >"$tmp/puts"
+  policy_validate_acl() { return 0; }
+  policy_put_acl() { printf '1\n' >"$tmp/puts"; return 0; }
+  reverse_compensate_certname >"$tmp/out" 2>&1 || rc=$?
+  if [[ "$scenario" == absent ]]; then
+    [[ "$rc" == 0 ]] || fail "云端确认没有本节点时无需补偿应成功：$(cat "$tmp/out")"
+    [[ "$(read_maintenance_kv result)" != needs_coordination ]] || fail '确认不存在时不应转人工'
+  else
+    [[ "$rc" != 0 ]] || fail "${scenario}：目标歧义不得当作无需补偿：$(cat "$tmp/out")"
+    [[ "$(read_maintenance_kv result)" == needs_coordination ]] || fail "${scenario}：必须记录 needs_coordination"
+    [[ "$(read_maintenance_kv needs_manual)" == 1 ]] || fail "${scenario}：必须标记需人工"
+    [[ "$(cat "$tmp/puts")" == 0 ]] || fail "${scenario}：歧义时不得写云端"
+  fi
+}
+
+test_bug120_duplicate_hostname_requires_coordination() { run_bug120_reverse_scenario duplicate; }
+test_bug120_region_mismatch_requires_coordination() { run_bug120_reverse_scenario region_mismatch; }
+test_bug120_missing_certname_requires_coordination() { run_bug120_reverse_scenario missing_certname; }
+test_bug120_unparsable_policy_requires_coordination() { run_bug120_reverse_scenario unparsable; }
+test_bug120_confirmed_absent_needs_no_compensation() { run_bug120_reverse_scenario absent; }
+
+# BUG-121：卸载吞掉维护调度删除失败。完整 CLI 入口必须非零且不报告完成。
+test_bug121_uninstall_propagates_maintain_unit_removal_failure() {
+  setup_rotation_env
+  SYSTEMD_UNIT_DIR="$tmp/systemd"
+  mkdir -p "$SYSTEMD_UNIT_DIR"
+  DEPLOY_STATE_DIR="$tmp/deploy-state"
+  install_cert_maintain_units >/dev/null || fail '应先安装维护 unit'
+  # 把 timer 替换成非空目录：rm -f 无法删除，模拟删除失败。
+  rm -f "$SYSTEMD_UNIT_DIR/derper-cert-maintain.timer"
+  mkdir -p "$SYSTEMD_UNIT_DIR/derper-cert-maintain.timer/keep"
+  check_os_environment() { :; }
+  require_root() { :; }
+  remove_healthcheck_cron() { :; }
+  remove_tls_connlimit() { :; }
+  ordinary_change_allowed() { return 0; }
+  recover_interrupted_change() { return 0; }
+  acquire_deploy_lock() { return 0; }
+  stub_timer_systemctl
+  : >"$tmp/maintain-enabled"
+  local out rc=0
+  out=$(main --uninstall 2>&1) || rc=$?
+  [[ "$rc" -ne 0 ]] || fail "维护 unit 删除失败时卸载必须非零：${out}"
+  [[ "$out" != *'完成：已卸载 derper 服务'* ]] || fail '删除失败不得报告卸载完成'
+  [[ "$out" == *'维护 unit 文件未能删除'* ]] || fail "必须说明具体失败原因：${out}"
+  [[ ! -e "$SERVICE_PATH" ]] || fail '其余卸载步骤仍应继续（derper unit 已移除）'
+}
+
+test_bug121_uninstall_checks_enabled_and_running_state() {
+  setup_rotation_env
+  SYSTEMD_UNIT_DIR="$tmp/systemd"
+  mkdir -p "$SYSTEMD_UNIT_DIR"
+  install_cert_maintain_units >/dev/null || fail '应先安装维护 unit'
+  # 文件可删除，但 timer 仍被 systemd 报告为启用：不能算删除成功。
+  systemctl() { return 0; }
+  if remove_cert_maintain_units >/dev/null 2>"$tmp/err"; then fail '仍处于启用状态时必须失败'; fi
+  grep -q '仍处于启用状态' "$tmp/err" || fail '应说明启用状态残留'
+  systemctl() {
+    case "$1" in
+      is-enabled) return 1 ;;
+      is-active) [[ "$*" == *timer* ]] ;;
+      *) return 0 ;;
+    esac
+  }
+  if remove_cert_maintain_units >/dev/null 2>"$tmp/err"; then fail '仍在运行时必须失败'; fi
+  grep -q '仍在运行' "$tmp/err" || fail '应说明运行状态残留'
+  systemctl() { case "$1" in is-enabled|is-active) return 1 ;; *) return 0 ;; esac; }
+  remove_cert_maintain_units >/dev/null 2>&1 || fail '已停用且文件已删除应成功'
+}
+
+test_bug121_disable_failure_is_not_recorded_as_clean_manual() {
+  setup_rotation_env
+  SYSTEMD_UNIT_DIR="$tmp/systemd"
+  mkdir -p "$SYSTEMD_UNIT_DIR/derper-cert-maintain.service/keep"
+  DISABLE_AUTO_MAINTAIN=1
+  systemctl() { case "$1" in is-enabled|is-active) return 1 ;; *) return 0 ;; esac; }
+  local rc=0
+  apply_auto_maintain_policy >/dev/null 2>&1 || rc=$?
+  [[ "$rc" -ne 0 ]] || fail '停用时删除 unit 失败必须向外传播'
+  [[ "$(read_maintenance_kv scheduler_state)" == failed ]] || fail '调度残留必须记录为 failed'
+  [[ "$(read_maintenance_kv needs_manual)" == 1 ]] || fail '调度残留必须标记需人工'
+}
+
+test_bug118_apply_rejects_changed_cert_days() {
+  setup_rotation_env
+  ACCEPT_CERT_ROTATION=1
+  ENABLE_AUTO_MAINTAIN=1
+  CERT_DAYS=1
+  prepare_cert_rotation >/dev/null 2>&1 || fail 'prepare 应成功'
+  local live_before
+  live_before=$(cert_fp "$INSTALL_DIR/certs/$IP_ADDR.crt")
+  CERT_DAYS=3650
+  policy_auth_state() { printf 'write_ready\n'; }
+  policy_load_acl() { touch "$tmp/cloud-called"; return 1; }
+  local rc=0
+  apply_cert_rotation >/dev/null 2>&1 || rc=$?
+  [[ "$rc" -ne 0 ]] || fail 'apply 不得接受与 prepare 不一致的 cert-days'
+  [[ ! -e "$tmp/cloud-called" ]] || fail 'cert-days 不匹配时不得读取或写入云端以尝试切换'
+  [[ "$(cert_fp "$INSTALL_DIR/certs/$IP_ADDR.crt")" == "$live_before" ]] || fail 'cert-days 不匹配时正式证书不得改变'
+}
+
+test_bug120_trailing_garbage_requires_coordination() { run_bug120_reverse_scenario trailing_garbage; }
+test_bug120_multiple_roots_require_coordination() { run_bug120_reverse_scenario multiple_roots; }
+
+test_bug121_daemon_reload_failure_propagates() {
+  setup_rotation_env
+  SYSTEMD_UNIT_DIR="$tmp/systemd"
+  mkdir -p "$SYSTEMD_UNIT_DIR"
+  systemctl() { case "$1" in daemon-reload) return 1 ;; *) return 0 ;; esac; }
+  if remove_cert_maintain_units >/dev/null 2>"$tmp/err"; then
+    fail 'daemon-reload 失败不得算维护调度删除成功'
+  fi
+  grep -q 'daemon-reload' "$tmp/err" || fail '应说明 daemon-reload 失败'
+}
+
+test_bug121_uninstall_daemon_reload_failure_is_not_success() {
+  setup_rotation_env
+  SYSTEMD_UNIT_DIR="$tmp/systemd"
+  mkdir -p "$SYSTEMD_UNIT_DIR"
+  check_os_environment() { :; }
+  require_root() { :; }
+  remove_healthcheck_cron() { :; }
+  remove_tls_connlimit() { :; }
+  ordinary_change_allowed() { return 0; }
+  recover_interrupted_change() { return 0; }
+  acquire_deploy_lock() { return 0; }
+  systemctl() { case "$1" in daemon-reload) return 1 ;; is-enabled|is-active) return 1 ;; *) return 0 ;; esac; }
+  local out rc=0
+  out=$(main --uninstall 2>&1) || rc=$?
+  [[ "$rc" -ne 0 ]] || fail '卸载时 daemon-reload 失败必须非零'
+  [[ "$out" != *'完成：已卸载 derper 服务'* ]] || fail 'daemon-reload 失败不得报告卸载完成'
+  [[ "$out" == *'daemon-reload'* ]] || fail '卸载应说明 daemon-reload 失败'
+  [[ ! -e "$SERVICE_PATH" ]] || fail '其余卸载步骤仍应继续'
+}
+
+test_bug121_disable_daemon_reload_failure_marks_failed() {
+  setup_rotation_env
+  SYSTEMD_UNIT_DIR="$tmp/systemd"
+  mkdir -p "$SYSTEMD_UNIT_DIR"
+  DISABLE_AUTO_MAINTAIN=1
+  systemctl() { case "$1" in daemon-reload) return 1 ;; is-enabled|is-active) return 1 ;; *) return 0 ;; esac; }
+  local rc=0
+  apply_auto_maintain_policy >/dev/null 2>&1 || rc=$?
+  [[ "$rc" -ne 0 ]] || fail '停用时 daemon-reload 失败必须非零'
+  [[ "$(read_maintenance_kv scheduler_state)" == failed ]] || fail 'reload 失败必须记录 scheduler_state=failed'
+  [[ "$(read_maintenance_kv needs_manual)" == 1 ]] || fail 'reload 失败必须标记需人工'
+}
+
+# BUG-116：定时任务内部执行 maintain 成功后，不得被 main 重新登记覆盖。
+test_bug116_maintain_success_state_survives_main() {
+  local old new unit_marker
+  setup_rotation_env
+  SYSTEMD_UNIT_DIR="$tmp/systemd"
+  mkdir -p "$SYSTEMD_UNIT_DIR"
+  POLICY_CREDENTIAL_FILE="$tmp/creds.env"
+  printf 'TS_TAILNET=example.com\nTS_API_CLIENT_ID=id\nTS_API_CLIENT_SECRET=fake\nPOLICY_SOURCE=api\n' >"$POLICY_CREDENTIAL_FILE"
+  old=$(cert_fp "$INSTALL_DIR/certs/$IP_ADDR.crt")
+  printf '%s\n' "$old" >"$tmp/cloud-fp"
+  printf '%s\n' "$old" >"$tmp/live-fp"
+  policy_auth_state() { echo write_ready; }
+  policy_http_request() {
+    local fp
+    case "$1 $2" in
+      'GET /api/v2/tailnet/example.com/acl')
+        fp=$(cat "$tmp/cloud-fp")
+        printf 'HTTP/2 200\r\nETag: "v-%s"\r\n\r\n{"derpMap":{"Regions":{"900":{"RegionID":900,"Nodes":[{"HostName":"203.0.113.10","CertName":"sha256-raw:%s"}]}}}}' "$fp" "$fp" ;;
+      'POST /api/v2/tailnet/example.com/acl/validate') printf 'HTTP/2 200\r\n\r\n' ;;
+      'POST /api/v2/tailnet/example.com/acl')
+        fp=$(_cloud_certname_from_acl "$3" "$IP_ADDR")
+        printf '%s\n' "${fp#sha256-raw:}" >"$tmp/cloud-fp"
+        printf 'HTTP/2 200\r\n\r\n{}' ;;
+      *) return 1 ;;
+    esac
+  }
+  stub_timer_systemctl
+  # 登记自动维护（用户显式启用）：写入 ready/recorded 并安装 unit。
+  ENABLE_AUTO_MAINTAIN=1
+  apply_auto_maintain_policy >/dev/null || fail '首次启用应成功'
+  ENABLE_AUTO_MAINTAIN=0
+  unit_marker="$SYSTEMD_UNIT_DIR/derper-cert-maintain.service"
+  [[ -f "$unit_marker" ]] || fail '启用后应存在维护 unit'
+  rm -f "$unit_marker"   # 若 main 重新登记，会重新装回 unit
+  # 之后的 maintain 与 timer 一样：不带 --enable-auto-maintain。
+  flock() { return 0; }
+  check_os_environment() { :; }
+  require_root() { :; }
+  recover_cert_update() { return 0; }
+  ordinary_change_allowed() { return 0; }
+  recover_interrupted_change() { return 0; }
+  acquire_deploy_lock() { return 0; }
+  cert_days_remaining() { echo 1; }
+  verify_switched_derper() { return 0; }
+  live_cert_sha256_raw() { cat "$tmp/live-fp"; }
+  systemctl() {
+    case "$1" in
+      is-enabled|is-active) return 0 ;;
+      restart) cert_fp "$(derper_manual_cert_file)" >"$tmp/live-fp"; return 0 ;;
+      *) return 0 ;;
+    esac
+  }
+  local out rc=0
+  out=$(main maintain --ip 203.0.113.10 --allow-non-global-ip --region-id 900 2>&1) || rc=$?
+  [[ "$rc" -eq 0 ]] || fail "maintain 成功应退出 0：${rc} ${out}"
+  new=$(cert_fp "$INSTALL_DIR/certs/$IP_ADDR.crt")
+  [[ "$new" != "$old" ]] || fail '到期维护应实际换证'
+  [[ "$(cat "$tmp/cloud-fp")" == "$new" ]] || fail '云端指纹应同步为新证书'
+  [[ "$(read_maintenance_kv result)" == success_replaced ]] || fail "最终结果必须保留 success_replaced：$(read_maintenance_kv result)"
+  [[ "$(read_maintenance_kv reason)" == '已按登记策略换证' ]] || fail '最终原因不得被覆盖为重新登记'
+  [[ ! -e "$unit_marker" ]] || fail 'maintain 不得重新安装维护 unit'
+  [[ "$(read_maintenance_kv intent)" == enabled ]] || fail '用户启用意图必须保留'
+}
+
 selected=(
   test_prepare_does_not_switch_live_cert
   test_yes_does_not_apply_or_resign
@@ -1197,6 +1830,15 @@ selected=(
   test_apply_rejects_changed_target_identity
   test_next_prepare_issues_fresh_candidate
   test_apply_fails_when_service_does_not_load_cert
+  test_bug111_failed_restore_keeps_cloud_fingerprint
+  test_bug111_wrong_live_cert_blocks_reverse
+  test_bug111_confirmed_restore_allows_reverse
+  test_bug111_archive_failure_restores_both_identities
+  test_bug111_stopped_service_stays_stopped
+  test_bug113_bsd_cert_date_uses_C_locale
+  test_bug114_vm_workflow_exports_fixture
+  test_local_switch_failure_reverses_cloud_field
+  test_local_switch_failure_foreign_change_blocks_reverse
   test_timer_ready_only_after_enable
   test_timer_keeps_node_and_schedule
   test_transient_unknown_keeps_auto_intent
@@ -1223,6 +1865,25 @@ selected=(
   test_bug106_config_lead_defaults_and_cli_precedence
   test_bug105_expired_certificate_is_due_for_maintain
   test_bug106_short_cert_days_keep_default_lead_in_range
+  test_bug118_cert_days_change_regenerates_candidate
+  test_bug118_apply_refuses_expired_candidate
+  test_bug118_apply_rejects_changed_cert_days
+  test_bug119_unknown_expiry_is_not_idle
+  test_bug119_cert_rotation_is_due_tristate
+  test_bug120_duplicate_hostname_requires_coordination
+  test_bug120_region_mismatch_requires_coordination
+  test_bug120_missing_certname_requires_coordination
+  test_bug120_unparsable_policy_requires_coordination
+  test_bug120_trailing_garbage_requires_coordination
+  test_bug120_multiple_roots_require_coordination
+  test_bug120_confirmed_absent_needs_no_compensation
+  test_bug121_uninstall_propagates_maintain_unit_removal_failure
+  test_bug121_uninstall_checks_enabled_and_running_state
+  test_bug121_disable_failure_is_not_recorded_as_clean_manual
+  test_bug121_daemon_reload_failure_propagates
+  test_bug121_uninstall_daemon_reload_failure_is_not_success
+  test_bug121_disable_daemon_reload_failure_marks_failed
+  test_bug116_maintain_success_state_survives_main
 )
 [[ $# == 0 ]] || selected=("$@")
 failed=0

@@ -1,5 +1,28 @@
 # Changelog
 
+## [Unreleased]
+
+## [0.2.19] - 2026-10-27
+
+- Add root C/S2 permission evidence and Python adapter regressions to the fixed Ubuntu 22.04/24.04 matrix. The manual disposable VM job requests C/D and preserves logs, generated artifacts and cleanup evidence; a missing real binary exits 2 (unverified).
+- Add D-stage real systemd maintenance scenarios with a loopback-only HTTP fixture for stable copies, due/revoked runs, restart failure recovery, reverse compensation and disabling. Cleanup also removes archived private keys. The dual Ubuntu 22.04/24.04 disposable VMs have been executed; the D integration did not pass because of BUG-116 (fixed in this release; a VM rerun is required for acceptance). The fixture does not establish cloud GD.
+- Provide an optional independent Linux H3 adapter and real acceptance runbook. Require a single target Region, distributed/live certificate pin agreement, an actual relay round trip and a valid STUN response. Direct/other-Region paths remain unknown; real Tailnet/H3 and lifetime compatibility are pending.
+- Fix BUG-116: a scheduled `maintain` success is no longer re-registered as `recorded` by the main entry point and the unit is not reinstalled; `success_replaced` and the user's enable intent are preserved.
+- Fix BUG-117: when nothing changed but the health check fails (for example a confirmed LocalAPI failure), the default idempotent deployment no longer skips the publish gate and reports success; a failed gate exits non-zero.
+- Fix BUG-122: the verify-clients LocalAPI check now evaluates socket access as the `User=` in the derper unit. A caller (often root) that can reach the socket while the service user is denied is a confirmed failure; when it cannot be proven the result is unknown, never falsely healthy.
+- Fix BUG-118: changing `--cert-days` no longer reuses a candidate with the old lifetime; apply also checks the prepared lifetime and rejects parameter drift, an expired candidate, or under one hour remaining, requiring a new prepare.
+- Fix BUG-119: when `maintain` cannot compute the certificate expiry it exits non-zero, records the reason and flags manual action instead of reporting an `idle` "not yet due".
+- Fix BUG-120: reverse compensation is skipped only when the complete policy parses and the node is confirmed absent; duplicate HostName, Region mismatch, missing CertName, trailing garbage, multiple roots, or other parse failures are recorded as `needs_coordination`.
+- Fix BUG-121: uninstall no longer swallows a maintenance service/timer removal or `daemon-reload` failure; it re-checks unit files, enabled state and running state, continues the remaining cleanup, but exits non-zero without reporting completion. Disabling auto-maintain fails the same way and records `scheduler_state=failed`.
+- Add and register regressions for the above (3 review, 19 D-stage); BUG-116/121 cover the full CLI end state.
+- Fix BUG-111: reverse the cloud fingerprint only after confirming the old disk certificate and, for a previously running service, its live fingerprint. An unconfirmed restoration keeps the cloud value and records coordination required; scheduled maintenance preserves that reason. An archive failure restores locally before compensation, and a stopped service stays stopped.
+- Fix BUG-112: run each main regression case with errexit outside a conditional context and accumulate its exit code in the parent. A final success message can no longer hide an inner assertion failure. A deliberate-failure copy checks nonzero exit and continuation to later cases.
+- Fix BUG-113: use C locale for GNU/BSD certificate-date parsing so a non-English locale does not turn a due certificate into an idle maintenance result.
+- Fix BUG-114: explicitly export the final DERPER_TEST_BINARY in the manual VM job, keeping preflight and integration execution on the same default or explicit fixture path. A missing fixture remains explicitly unverified.
+- Implement D2/D4 safe cloud reverse compensation (DEV-008): when an automatic rotation fails locally and the old identity is verified restored, revert only the CertName field this tool wrote using the latest policy and ETag instead of rewriting the whole old policy; foreign edits, ETag conflicts, or unconfirmed read-back stop and hand over to manual coordination. Adds two red-then-green regressions for reverse compensation and the foreign-change block.
+- Add a fixed Ubuntu 22.04/24.04 Bash regression matrix to CI plus a manual systemd PID1 disposable-VM workflow entry (workflow_dispatch, self-hosted disposable-VM runner); the fixed matrix does not yet rerun root-only cases. Verified by CHK-046 through CHK-051 acceptance and an independent rerun (main 108 ok lines, D 61, both Bash versions and ShellCheck pass).
+- Register regressions for these failures and document compensation boundaries. Isolated Tailnet writes, real H3, lifetime compatibility, and production acceptance remain separate.
+
 ## [0.2.18] - 2026-10-24
 
 - Fix redundant migration stop/start cycles caused by retained legacy node configuration (BUG-110). Reuse ready node state after checking ownership/group, 0600/0700 modes, and readability; retain the legacy copy and outer recovery material. First migration, permission repair, and run-user changes keep their protected path. Writing a unit with ready state now only performs the final release restart. Adds four S2 regressions verified to fail before the fix and pass afterward.
@@ -803,6 +826,6 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 **Contributors**: Thanks to architects for professional advice
 
-**Update Date**: 2026-10-24
+**Update Date**: 2026-10-27
 
-**Version**: 0.2.18
+**Version**: 0.2.19
