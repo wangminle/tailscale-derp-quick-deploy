@@ -7,14 +7,14 @@
 | 文件 | 职责 | 运行环境 | CI | 传参单跑 | 退出码 |
 | --- | --- | --- | --- | --- | --- |
 | test_deploy_script.sh | 主回归套件：参数解析、环境检查、证书、unit、防火墙、健康检查、向导、main 编排与底层辅助函数（105 个注册入口，含安装进度伪终端验证和失败门禁变异回归，按领域组织） | 非 root（root 专属断言自动跳过） | ✅ | ✅ | 0 通过 / 1 有失败 |
-| test_review_regressions.sh | 审查回归：历次审查反例的先红后绿用例（BUG-014～058 主要条目）、B 阶段 b1/b2/b3 行为、BUG-109 回环接口后缀及中英文加固示例与实际 unit 一致性、BUG-117/122 默认部署门禁与 LocalAPI 服务用户（71 用例） | 非 root（root/工具缺失场景输出 skip） | ✅ | ✅ | 0 通过 / 1 有失败 |
+| test_review_regressions.sh | 审查回归：历次审查反例的先红后绿用例（BUG-014～058 主要条目）、B 阶段 b1/b2/b3 行为、BUG-109 回环接口后缀及中英文加固示例与实际 unit 一致性、BUG-117/122/123 默认部署门禁与 LocalAPI 服务用户实际请求（73 用例） | 非 root（root/工具缺失场景输出 skip） | ✅ | ✅ | 0 通过 / 1 有失败 |
 | test_s2_fixes.sh | S2 批次修复行为回归（BUG-053/055/059/060/061/070/077～081/110，24 用例），替身服务管理，含已就绪跳过、首次迁移/权限修复/恢复集保护及unit仅最终重启 | 非 root，需 gcc | ✅ | ✅ | 0 通过 / 1 有失败 |
 | test_s2_evidence.sh | 真实环境证据：flock、服务用户权限、旧用户恢复、BUG-110就绪跳过/换用户/不可读拒绝，以及 root 拒绝低权限同名进程/不可信 inode | 需 root + flock + useradd + gcc | ✅（sudo） | ❌（整文件执行） | 0 通过 / 1 失败 / 2 环境不符 |
 | test_c_stage.sh | C 阶段契约与行为（DEV-011/012/013）：配置白名单、新旧 CLI、ELF 导入、JSON/derpMap、H0～H3、状态与门禁（33 用例）；需 python3，ELF 用例需 gcc | 非 root；2项 root 专属用例退出 77 跳过 | ✅（含 sudo 补跑 root 用例） | ✅ | 0 通过 / 1 有失败 |
-| test_d_stage.sh | D 阶段契约与行为（DEV-008）：prepare/apply/cancel、HuJSON 最小补丁、策略 API 替身、自动/人工/未知三态、启用/停用持久化与维护 unit，以及事务归档、身份绑定、OAuth/ETag/HTTP 状态、timer 参数、符号链接写入、内网放行继承、cancel/maintain 反馈、purge-all、换证回滚重启、停用优先、幂等启停、过期续期、短期证书提前天数、调度失败跨命令持久化和安装根目录链接拒绝、Tailnet 目标和配置提前天数显式校验回归及反向补偿、BUG-111 本地恢复/归档失败/停止意图、BUG-113 BSD locale、BUG-114 实际 VM 执行块回归、BUG-116/118～121 maintain 结束状态/候选有效期/到期未知/反向补偿歧义/卸载传播回归（80 用例）；需 openssl，HuJSON 补丁需 python3 | 非 root | ✅ | ✅ | 0 通过 / 1 有失败 |
+| test_d_stage.sh | D 阶段契约与行为（DEV-008）：prepare/apply/cancel、HuJSON 最小补丁、策略 API 替身、自动/人工/未知三态、启用/停用持久化与维护 unit，以及事务归档、身份绑定、OAuth/ETag/HTTP 状态、timer 参数、符号链接写入、内网放行继承、cancel/maintain 反馈、purge-all、换证回滚重启、停用优先、幂等启停、过期续期、短期证书提前天数、调度失败跨命令持久化和安装根目录链接拒绝、Tailnet 目标和配置提前天数显式校验回归及反向补偿、BUG-111 本地恢复/归档失败/停止意图、BUG-113 BSD locale、BUG-114 实际 VM 执行块回归、BUG-116/118～121 maintain 结束状态/候选有效期/到期未知/反向补偿歧义/卸载传播，以及云端已更新后重试、尚未生效候选和 maintain 停用入口回归（85 用例）；需 openssl，HuJSON 补丁需 python3 | 非 root | ✅ | ✅ | 0 通过 / 1 有失败 |
 | test_systemd_integration.sh | GB及可选C/D集成：真实systemd PID1一次性VM执行发布/恢复/健康与证书维护timer，D仅用本地HTTP fixture（非GD） | 仅人工标记的一次性 VM（`DERPER_INTEGRATION_VM=1` + `/root/DERPER_DISPOSABLE_GB_VM`），否则退出 2 | 手动（自托管一次性 VM） | ❌ | 0 通过 / 1 失败 / 2 环境不符 |
 
-| test_h3_probe.py / test_acceptance_assets.py | 独立客户端适配器、真实Unix socket/UDP协议、HTTP fixture及CI/清理契约（22项） | Python3，Linux/macOS本地替身 | 固定矩阵 | unittest | 0通过 / 非零失败 |
+| test_h3_probe.py / test_acceptance_assets.py | 独立客户端适配器（含 ping 归因、双栈地址、STUN 复核预算与旧版 Python socket.timeout 兼容）、真实Unix socket/UDP协议、HTTP fixture及CI/清理契约（26项） | Python3，Linux/macOS本地替身 | 固定矩阵 | unittest | 0通过 / 非零失败 |
 
 真实VM、隔离GD/H3及长效兼容的逐步操作见[真实验收操作包](REAL_ACCEPTANCE.md)。本地Python回归不能替代真实Tailnet证据。
 
@@ -50,7 +50,7 @@
 | D 阶段 prepare/apply/cancel、策略替身与维护三态（DEV-008） | test_d_stage.sh |
 | BUG-101～108（BUG-100 与105同源） | test_d_stage.sh 中 test_bug101_～test_bug108_ 入口；目标缺失/来源、配置提前天数、调度跨命令状态与换证边界 |
 | BUG-111～114、116、118～121 | test_d_stage.sh 的 test_bug111_、test_bug113_、test_bug114_、test_bug116_、test_bug118_～test_bug121_；主套件 test_bug112_harness_propagates_inner_failures 验证真实失败传播与累计 |
-| BUG-117、122 | test_review_regressions.sh 的 test_bug117_（默认部署门禁）、test_bug122_（LocalAPI 按 derper 服务用户判断；需 python3 与 Unix socket，否则 skip） |
+| BUG-117、122、123 | test_review_regressions.sh 的 test_bug117_（默认部署门禁）、test_bug122_（LocalAPI 按 derper 服务用户判断）、test_bug123_（切换为该用户实际请求 LocalAPI，属主/权限位不作为健康依据；需 python3 与 Unix socket，否则 skip） |
 | BUG-066/067、071～076 | test_c_stage.sh新增8个test_bug<ID>入口；067直接覆盖rollback_deploy_change首装分支，071含忽略TERM及父进程先退出的子进程清理，072以root补验状态/指标祖先权限，074含词法/符号/硬链接别名，075检查目标/检查范围切换。真实首装拒停及独立CLI重试另在test_systemd_integration.sh |
 | GB 真实 systemd 故障注入（TST-017） | test_systemd_integration.sh（一次性 VM） |
 | BUG-063 Bash 3.2 兼容 | 全部套件须在 macOS Bash 3.2 与 Linux Bash 5 双环境通过 |

@@ -322,7 +322,7 @@
   <path d="M2785 699 V741" class="flow"/>
 
   <rect x="2435" y="741" width="700" height="124" class="decision"/>
-  <text x="2785" y="771" class="text"><tspan x="2785">H2：verify-clients 的 LocalAPI 依赖</tspan><tspan x="2785" dy="24">调用者 HTTP 2xx 后再按 unit User= 检查 socket 访问</tspan><tspan x="2785" dy="22">服务用户被拒/不存在→确认故障；无法证明→unknown</tspan><tspan x="2785" dy="22">verify=off→not_applicable</tspan></text>
+  <text x="2785" y="771" class="text"><tspan x="2785">H2：verify-clients 的 LocalAPI 依赖</tspan><tspan x="2785" dy="24">调用者 2xx 后切换为 unit User= 实际请求 LocalAPI</tspan><tspan x="2785" dy="22">服务用户被拒/不存在→确认故障；无法探测→unknown</tspan><tspan x="2785" dy="22">verify=off→not_applicable</tspan></text>
   <path d="M2785 865 V907" class="flow"/>
 
   <rect x="2435" y="907" width="700" height="132" class="external"/>

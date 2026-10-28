@@ -2,6 +2,14 @@
 
 本文件描述可执行步骤，**不是通过报告**。本地回归/HTTP fixture不能关闭真实GD/H3。先完成一次性VM，再在同一隔离Tailnet完成GD/H3/长效兼容。生产迁移另列，不使用现网节点做失败注入。所有日志保存在本地checkpoints，策略正文/凭据/私钥不提交Git，不贴到聊天。
 
+## 当前进度（2026-10-28）
+
+当前工作区已在 Ubuntu 22.04/24.04 一次性 KVM 客体通过未放宽断言的正式 C/D 套件，两平台各 23 条成功输出、退出 0，包含 `success_replaced` 结束状态、恢复、停用和清理；root C 各 2 项、S2 真实权限/锁各 5 项通过。Debian WSL 补验 ShellCheck 和 root C；京东云普通用户回归及回环 TLS/STUN、用户级 systemd 实验通过。源码与测试产物摘要已核对，状态见根目录 task-list.md 的 TST-032。
+
+此次结果未覆盖真实云端策略写入、合法客户端指定 Region 转发或长效客户端兼容；GitHub 固定矩阵尚无实际运行记录。VM 中的停用场景直接调用 `apply_auto_maintain_policy`，不能单独作为 BUG-129 完整 `maintain --disable-auto-maintain` 命令的真实 VM 证据（该入口已有 D 阶段本地回归）。同样，BUG-127 的失败后重试和 BUG-128 的未来证书拒绝目前由本地回归证明。后续补验这些精确故障路径时应单独留证，不能由通用 C/D 成功外推。
+
+当前暂缺专用 Tailnet、Region 和独立客户端；第二步及后续步骤待资源就绪后执行。第一步保留为复现说明，无需因文档更新重复创建 VM。
+
 ## 第一步：提供一次性VM（需要用户准备资源）
 
 准备两台**可销毁、无DERP部署**的Ubuntu22.04和24.04 VM。必须systemd PID1、虚拟机（普通容器/WSL不能替代）、root权限、2GB内存和可用网络。告知SSH主机别名、架构；不要发送私钥。普通固定矩阵CI在GitHub托管runner运行，真实PID1套件使用独立一次性VM/自托管runner。
@@ -37,7 +45,7 @@ cat /root/derper-evidence/cleanup.txt
 提供以下**非敏感信息**：隔离Tailnet名称、明确允许修改的测试RegionID/节点IP/TCP/UDP端口、DERP测试机及两个客户端SSH别名/客户端Tailnet IP、版本。确认是隔离资源并允许本节点字段写入、测试换证/短暂中断和失败注入后，再执行下一步。
 
 - DERP测试机的tailscaled及两个独立客户端都加入同一隔离Tailnet；保留verify-clients开启，derper/tailscaled实际revision兼容。服务器peer map能看到两客户端。
-- Region中只放一个被验DERP节点，地址使用显式IPv4/IPv6或与目标完全相同的数字IP HostName，保留官方其他区域与既有策略。H3适配器会拒绝多节点歧义。
+- Region中只放一个被验DERP节点，地址使用显式IPv4/IPv6或与目标完全相同的数字IP HostName，保留官方其他区域与既有策略。H3适配器会拒绝多节点歧义；同一节点同时下发IPv4和IPv6时，客户端可能经另一地址中继，适配器无法证明目标地址可用，会返回unknown。需要验证某一地址时，测试节点只应下发该地址族，或接受该项记为未验证。
 - 在测试机本地按examples/policy-api.env.example创建root0600凭据文件，使用隔离Tailnet的OAuth client credentials和明确policy_file权限。凭据不粘聊天、不写命令行参数、不放deploy.conf。静态token无法确认scope时保持unknown，不绕过授权判断。
 - 用户/管理员在后台核对最小权限及必要依赖scope；GitOps策略先走仓库流程，不让脚本双写。生产Tailnet不用于本轮。
 
@@ -74,14 +82,15 @@ wrapper及全部祖先root所有、不可组/其他用户写，不能链接；�
 | 顺序 | 真实操作 | 通过条件/后续 |
 | --- | --- | --- |
 | G1 基线 | 读取策略、validate、独立客户端H3 | GET/validate仅证明可读/可验证；原指纹/服务/实际客户端吻合 |
-| G2 人工准备/取消 | prepare后记录候选与片段；cancel | 云端/正式证书/进程不变；同轮候选可校验，取消只删候选 |
+| G2 人工准备/取消 | prepare后记录候选与片段；cancel；在隔离机补验尚未生效/过期候选 | 云端/正式证书/进程不变；失效候选应用被拒且重新prepare不复用，取消只删候选 |
 | G3 首次登记 | 仅另一个隔离空目标上，先确认write_ready并显式登记自动维护授权，再prepare/apply追加本节点 | 不覆盖官方或其他节点；冲突拒绝；客户端确实收到该Region。已有登记则记录不适用，另用隔离空目标完成本例 |
 | G4 真实轮换 | 先在本次目标配置下显式deploy --enable-auto-maintain并确认ready，再prepare/apply；故障用例前停止timer避免并发 | 真POST/If-Match读回；云端/磁盘/运行证书一致，A/B重新H3确认新指纹已传播；保留旧事务 |
 | G5 并发保护 | 管理员在隔离目标制造ETag变化/目标字段被他人修改 | 不覆盖他人字段；停止自动回退并needs_coordination；保留人工修复材料 |
 | G6 写入超时 | 在隔离测试机用经review的单次故障注入，使真实POST已到达但响应丢失 | 先GET读回再决定继续；最多一次预期正向写，无盲目重签或整份回写。注入方案先审阅，不在生产网络试验 |
+| G6b 写后读回失败/中断 | 真实POST成功后仅令读回失败或在本地切换前中断；记录云端新指纹与本地旧指纹，再重试同一候选 | 指定Region/唯一目标确认后完成本地切换，不重复提交；歧义或目标变化仍拒绝。与G6同样先审阅注入方案 |
 | G7 本地切换失败 | 真实POST成功后令新服务首次restart失败、旧服务可恢复 | 旧磁盘及实际服务身份确认后才以最新ETag反向撤回本工具字段；读回旧值，H3恢复 |
 | G8 旧服务也恢复失败 | 在隔离VM限制两次启动，再解除限制 | 保留云端新指纹、标记needs_coordination/needs_manual，不误报完整恢复；管理员核对实际身份后协调字段并恢复H3 |
-| G9 撤权与timer | 显式启用；未到期运行、到期运行；撤销凭据再运行；停用并卸载 | 真timer/稳定副本/target/到期和失败语义正确；撤权不提前换证；停用撤销登记，卸载后无调度/凭据泄漏；journal与状态一致 |
+| G9 撤权与timer | 显式启用；未到期运行、到期运行；撤销凭据再运行；执行maintain --disable-auto-maintain并卸载 | 真timer/稳定副本/target/到期和失败语义正确；撤权不提前换证；停用命令退出0、intent=disabled且timer移除，后续无参数maintain不得换证；卸载后无调度/凭据泄漏；journal与状态一致 |
 
 注意：单独`apply --accept-cert-rotation`只确认人工本地切换，并不自动获得API同步授权，不能拿它记录G4真POST证据。人工路径应由管理员先按候选片段同步策略，再apply接受切换窗口并用H3复验；该路径与API写入验收分别留证。自动分支须有效write_ready且有本次明确启用/历史登记的授权；命令应始终带同一测试目标配置。G9验证实际timer前再显式启用，不能把故障注入期暂停timer误当生产维护策略。
 

@@ -19,7 +19,7 @@ make_cert_pair() {
 
 # 生成真正已过期的同 IP 证书（openssl ca 指定过去的有效期），不依赖系统时间伪造。
 make_expired_cert_pair() {
-  local dest="$1" ip="${2:-203.0.113.10}" work
+  local dest="$1" ip="${2:-203.0.113.10}" start="${3:-20200101000000Z}" end="${4:-20200102000000Z}" work
   work=$(mktemp -d)
   : >"$work/index.txt"
   printf '01\n' >"$work/serial"
@@ -46,7 +46,7 @@ CN = ${ip}
 CNF
   openssl req -new -newkey rsa:2048 -nodes -keyout "$dest.key" -out "$work/c.csr" -config "$work/ca.cnf" >/dev/null 2>&1 &&
     openssl ca -batch -config "$work/ca.cnf" -selfsign -keyfile "$dest.key" -in "$work/c.csr" -out "$dest.crt" \
-      -startdate 20200101000000Z -enddate 20200102000000Z -notext >/dev/null 2>&1 || { rm -rf "$work"; return 1; }
+      -startdate "$start" -enddate "$end" -notext >/dev/null 2>&1 || { rm -rf "$work"; return 1; }
   rm -rf "$work"
 }
 
@@ -1803,7 +1803,107 @@ test_bug116_maintain_success_state_survives_main() {
   [[ "$(read_maintenance_kv intent)" == enabled ]] || fail '用户启用意图必须保留'
 }
 
+test_retry_already_updated_cloud() {
+  setup_rotation_env
+  ENABLE_AUTO_MAINTAIN=1
+  prepare_cert_rotation >/dev/null 2>&1 || fail 'prepare 失败'
+  local new
+  new=$(read_rotation_kv new_sha256)
+  policy_auth_state() { echo write_ready; }
+  policy_load_acl() {
+    POLICY_ACL_BODY="{\"derpMap\":{\"Regions\":{\"900\":{\"RegionID\":900,\"Nodes\":[{\"HostName\":\"203.0.113.10\",\"CertName\":\"sha256-raw:${new}\"}]}}}}"
+    POLICY_IF_MATCH='"v2"'
+  }
+  policy_put_acl() { fail '云端已经采用候选时不得再次提交'; }
+  apply_cert_rotation >/dev/null 2>&1 || fail '云端已采用候选的重试应完成本地切换'
+  [[ "$(cert_fp "$INSTALL_DIR/certs/$IP_ADDR.crt")" == "$new" ]] || fail '本地应切换到候选'
+}
+
+test_retry_cloud_identity_must_be_unambiguous() {
+  setup_rotation_env
+  local pin='sha256-raw:abcd' acl
+  acl='{"derpMap":{"Regions":{"901":{"RegionID":901,"Nodes":[{"HostName":"203.0.113.10","CertName":"sha256-raw:abcd"}]}}}}'
+  if _hujson_invoke current "$acl" "$IP_ADDR" "$REGION_ID" "$pin" '' >/dev/null 2>&1; then fail '其他 Region 不得视为当前候选'; fi
+  acl='{"derpMap":{"Regions":{"900":{"RegionID":900,"Nodes":[{"HostName":"203.0.113.10","CertName":"sha256-raw:abcd"},{"HostName":"203.0.113.10","CertName":"sha256-raw:abcd"}]}}}}'
+  if _hujson_invoke current "$acl" "$IP_ADDR" "$REGION_ID" "$pin" '' >/dev/null 2>&1; then fail '重复目标不得视为当前候选'; fi
+}
+
+test_post_success_readback_failure_then_retry() {
+  setup_rotation_env
+  ENABLE_AUTO_MAINTAIN=1
+  local old new
+  old=$(cert_fp "$INSTALL_DIR/certs/$IP_ADDR.crt")
+  prepare_cert_rotation >/dev/null 2>&1 || fail 'prepare 失败'
+  new=$(read_rotation_kv new_sha256)
+  printf '%s' "$old" >"$tmp/cloud"
+  printf 0 >"$tmp/gets"
+  policy_auth_state() { echo write_ready; }
+  policy_load_acl() {
+    local n fp
+    n=$(cat "$tmp/gets"); n=$((n + 1)); printf '%s' "$n" >"$tmp/gets"
+    [[ "$n" != 2 ]] || return 1
+    fp=$(cat "$tmp/cloud")
+    POLICY_ACL_BODY="{\"derpMap\":{\"Regions\":{\"900\":{\"RegionID\":900,\"Nodes\":[{\"HostName\":\"203.0.113.10\",\"CertName\":\"sha256-raw:${fp}\"}]}}}}"
+    POLICY_IF_MATCH='"v"'
+  }
+  policy_validate_acl() { :; }
+  policy_put_acl() { printf '%s' "$new" >"$tmp/cloud"; POLICY_HTTP_STATUS=200; }
+  if apply_cert_rotation >/dev/null 2>&1; then fail '读回失败时不得切换'; fi
+  [[ "$(cat "$tmp/cloud")" == "$new" && "$(cert_fp "$INSTALL_DIR/certs/$IP_ADDR.crt")" == "$old" ]] || fail '应保留云端新指纹和本地旧证书'
+  apply_cert_rotation >/dev/null 2>&1 || fail '重试应恢复本地切换'
+  [[ "$(cert_fp "$INSTALL_DIR/certs/$IP_ADDR.crt")" == "$new" ]] || fail '重试后本地指纹错误'
+}
+
+test_future_candidate_is_rejected_and_not_reused() {
+  setup_rotation_env
+  ACCEPT_CERT_ROTATION=1
+  prepare_cert_rotation >/dev/null 2>&1 || fail 'prepare 失败'
+  make_expired_cert_pair "$tmp/future" "$IP_ADDR" 20400101000000Z 20410101000000Z || fail '无法生成未来证书'
+  cp "$tmp/future.crt" "$(cert_rotation_candidate_cert)"
+  cp "$tmp/future.key" "$(cert_rotation_candidate_key)"
+  local future live
+  future=$(cert_fp "$tmp/future.crt")
+  live=$(cert_fp "$INSTALL_DIR/certs/$IP_ADDR.crt")
+  sed "s/^new_sha256=.*/new_sha256=$future/" "$(cert_rotation_record_path)" >"$tmp/record"
+  cat "$tmp/record" >"$(cert_rotation_record_path)"
+  if apply_cert_rotation >/dev/null 2>&1; then fail '尚未生效的证书不得应用'; fi
+  [[ "$(cert_fp "$INSTALL_DIR/certs/$IP_ADDR.crt")" == "$live" ]] || fail '正式证书必须不变'
+  prepare_cert_rotation >/dev/null 2>&1 || fail '重新 prepare 失败'
+  [[ "$(cert_fp "$(cert_rotation_candidate_cert)")" != "$future" ]] || fail '尚未生效的候选不得复用'
+}
+
+test_main_maintain_disable_persists_and_removes_timer() {
+  setup_rotation_env
+  SYSTEMD_UNIT_DIR="$tmp/systemd"
+  mkdir -p "$SYSTEMD_UNIT_DIR"
+  stub_timer_systemctl
+  ENABLE_AUTO_MAINTAIN=1
+  TS_API_CLIENT_ID=id
+  TS_API_CLIENT_SECRET=secret
+  policy_auth_state() { echo write_ready; }
+  apply_auto_maintain_policy >/dev/null 2>&1 || fail '启用失败'
+  [[ -f "$SYSTEMD_UNIT_DIR/derper-cert-maintain.timer" ]] || fail '缺少 timer'
+  ENABLE_AUTO_MAINTAIN=0
+  flock() { return 0; }
+  check_os_environment() { :; }
+  require_root() { :; }
+  recover_cert_update() { :; }
+  ordinary_change_allowed() { :; }
+  recover_interrupted_change() { :; }
+  acquire_deploy_lock() { :; }
+  local rc=0
+  (main maintain --disable-auto-maintain --ip 203.0.113.10 --allow-non-global-ip --region-id 900) >"$tmp/out" 2>&1 || rc=$?
+  [[ "$rc" -eq 0 ]] || fail "停用命令应成功：$(cat "$tmp/out")"
+  [[ "$(read_maintenance_kv intent)" == disabled ]] || fail '停用意图未持久化'
+  [[ ! -e "$SYSTEMD_UNIT_DIR/derper-cert-maintain.timer" ]] || fail 'timer 未删除'
+}
+
 selected=(
+  test_retry_already_updated_cloud
+  test_retry_cloud_identity_must_be_unambiguous
+  test_post_success_readback_failure_then_retry
+  test_future_candidate_is_rejected_and_not_reused
+  test_main_maintain_disable_persists_and_removes_timer
   test_prepare_does_not_switch_live_cert
   test_yes_does_not_apply_or_resign
   test_cancel_discards_candidate_keeps_live

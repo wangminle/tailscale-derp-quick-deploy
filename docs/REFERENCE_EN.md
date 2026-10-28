@@ -5,7 +5,7 @@
 > This is the detailed English user guide (technical reference). For the simplified Chinese quickstart now used as the main README, go to `../README.md`. For the Chinese user guide, see `REFERENCE_CN.md` in this folder.
 
 > **Script File**: `deploy_derper_ip_selfsigned.sh`  
-> **Current Version**: 0.2.19 (2026-10-27)\
+> **Current Version**: 0.2.20 (2026-10-28)\
 > **Show version**: `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
@@ -573,9 +573,9 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 Exit code semantics (for shell/monitoring decision):
 
 ```text
-0  All key health items normal (service, listeners, desired configuration, and certificates are healthy, the live certificate matches the on-disk certificate; with -verify-clients on, tailscaled is running and the derper service user can reach LocalAPI)
+0  All key health items normal (service, listeners, desired configuration, and certificates are healthy, the live certificate matches the on-disk certificate; with -verify-clients on, tailscaled is running and a LocalAPI request as the derper service user succeeds)
 1  At least one critical health check is a confirmed failure, or --metrics-textfile could not be written
-2  Result unknown: the caller cannot read the certificate directory, or it cannot be confirmed that the derper service user can reach tailscaled LocalAPI; unknown is never reported as healthy
+2  Result unknown: the caller cannot read the certificate directory, or it cannot be confirmed that the derper service user can request tailscaled LocalAPI; unknown is never reported as healthy
 ```
 
 Any non-zero status means not healthy, so an existing `if ! --health-check` guard keeps working unchanged.
@@ -610,7 +610,7 @@ Example output (excerpt):
 ℹ️  Resource: derper memory RSS ~3 MiB
 ```
 
-An unknown result is shown as a ⚠️ line (for example "Certificate: no permission to confirm" or "Client verification: enabled, but it cannot be confirmed that the derper service user can reach tailscaled LocalAPI") and returns exit code 2. The caller (often root) reaching LocalAPI does not prove that the unit `User=` can.
+An unknown result is shown as a ⚠️ line (for example "Certificate: no permission to confirm" or "Client verification: enabled, but it cannot be confirmed that the derper service user can use tailscaled LocalAPI") and returns exit code 2. After the caller (often root) succeeds, the script switches to the unit `User=` and actually requests LocalAPI; socket ownership, permission bits, or the caller's own access are only hints, not substitutes. If that identity switch cannot be performed, the result is unknown.
 
 Prometheus metrics sample (text file content):
 

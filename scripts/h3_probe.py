@@ -2,7 +2,10 @@
 """Linux 独立合法客户端 H3 适配器；只观测，不改节点/网络/策略。
 
 通过 tailscaled LocalAPI 用真实节点身份发送 disco 往返，并严格核对实际
-DERPRegionID。直连、其他区域、多节点歧义均返回 unknown（2）。
+DERPRegionID。直连、其他区域、多节点歧义均返回 unknown（2）；对端离线或
+ping 错误未能归因到指定 Region、节点同时下发另一地址族时也返回 unknown，
+只有确认发生在指定 DERP 路径上的错误才记为 failed。STUN 探测为最后的
+身份复核预留预算，UDP 被静默丢弃时仍能输出 stun=failed。
 接口依据 tailscale v1.104.1 client/local/local.go；实测兼容版本另记证据。
 """
 import argparse
@@ -50,6 +53,11 @@ def match_region(mapping, target):
     if (address != target.ip or (node.get('DERPPort') or 443) != target.derp_port
             or (node.get('STUNPort') or 3478) != target.stun_port):
         raise Unverified('客户端下发的节点地址/端口与请求目标不一致')
+    # 同一节点还下发另一地址族时，客户端可能经该地址连接该 Region；往返结果
+    # 无法证明目标地址可用，不能把另一地址上的成功拼成目标地址的健康。
+    other = node.get('IPv6') if ipaddress.ip_address(target.ip).version == 4 else node.get('IPv4')
+    if other:
+        raise Unverified('节点同时下发另一地址族，无法确认中继往返使用目标地址')
     pin = node.get('CertName', '')
     if not re.fullmatch(r'sha256-raw:[0-9a-f]{64}', pin):
         raise Unverified('需要本节点下发的 sha256-raw 自签指纹')
@@ -69,7 +77,16 @@ def check_peer(status, peer):
 
 def check_ping(result, target, peer):
     if result.get('Err'):
-        raise ProbeFailed('真实节点 ping 返回确认故障')
+        # 对端离线/不可达、直连失败或本地超时等错误不能证明指定 DERP 节点故障。
+        # 只有确认本次往返经指定 Region 且没有直连/peer relay 路径时才归因于目标节点，
+        # 其余一律保持未知，不能把验收证据缺失报成节点故障。
+        attributed = (result.get('DERPRegionID') == target.region
+                      and result.get('NodeIP') == peer
+                      and not result.get('IsLocalIP') and not result.get('PeerRelay')
+                      and not result.get('Endpoint'))
+        if attributed:
+            raise ProbeFailed('经由指定 Region 的真实节点往返确认失败')
+        raise Unverified('对端 ping 错误未能归因于指定 DERP 路径')
     if (result.get('DERPRegionID') != target.region or result.get('NodeIP') != peer
             or result.get('IsLocalIP') or result.get('PeerRelay') or result.get('Endpoint')):
         raise Unverified('未观测到指定 Region 的对端往返；可能直连、其他区域或 peer relay')
@@ -153,7 +170,7 @@ def check_stun(target, timeout):
         udp.send(request)
         try:
             validate_stun(udp.recv(2048), tx)
-        except (TimeoutError, ConnectionRefusedError) as err:
+        except (socket.timeout, TimeoutError, ConnectionRefusedError) as err:
             raise ProbeFailed('目标 STUN 没有返回有效响应') from err
 
 
@@ -174,6 +191,15 @@ def run(args):
         if left <= 0:
             raise Unverified('探针总预算已耗尽')
         return left
+    # 目标 UDP 端口被静默丢弃时 STUN 会一直等到超时。必须为之后的控制面与
+    # 证书复核预留预算，否则第一次 remaining() 就抛 Unverified，永远无法
+    # 输出 stun=failed；复核本身也留出至少 0.5 秒。
+    reserve = max(0.5, min(3.0, args.timeout * 0.25))
+    def stun_budget():
+        left = deadline - time.monotonic() - reserve
+        if left <= 0:
+            raise Unverified('剩余预算不足以完成 STUN 与身份复核')
+        return left
     def api(method, endpoint):
         return local_api(args.socket, method, endpoint, remaining())
     check_peer(api('GET', 'status'), peer)
@@ -185,7 +211,7 @@ def run(args):
     except ProbeFailed:
         derp = False
     try:
-        check_stun(target, remaining())
+        check_stun(target, stun_budget())
     except ProbeFailed:
         stun = False
     # 检查期间控制面/证书若改变，不把两轮不同身份拼成一次通过。

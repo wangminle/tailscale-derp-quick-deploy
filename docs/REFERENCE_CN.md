@@ -5,7 +5,7 @@
 > 本文是中文的详细用户指南（技术参考）。主仓库首页 `README.md` 为精简版中文快速上手；英文用户指南见同目录的 `REFERENCE_EN.md`。
 
 > **脚本文件**：`deploy_derper_ip_selfsigned.sh`  
-> **当前版本**：0.2.19（2026-10-27）\
+> **当前版本**：0.2.20（2026-10-28）\
 > **查看版本**：`bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
@@ -605,9 +605,9 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 退出码语义（可用于 shell/监控判定）：
 
 ```text
-0  关键健康项全部正常（服务、端口、目标配置和证书均正常，在线证书与磁盘证书一致；启用 -verify-clients 时 tailscaled 运行，且 derper 服务用户可以访问 LocalAPI）
+0  关键健康项全部正常（服务、端口、目标配置和证书均正常，在线证书与磁盘证书一致；启用 -verify-clients 时 tailscaled 运行，且以 derper 服务用户身份实际请求 LocalAPI 成功）
 1  至少一项关键健康检查已确认失败，或 --metrics-textfile 写入失败
-2  结果未知：当前身份无权限读取证书目录，或无法确认 derper 服务用户能否访问 tailscaled LocalAPI；未知不会被当成健康
+2  结果未知：当前身份无权限读取证书目录，或无法以 derper 服务用户身份实际请求 tailscaled LocalAPI 进行确认；未知不会被当成健康
 ```
 
 任意非 0 都表示未通过，旧的 `if ! --health-check` 写法无需修改。
@@ -642,7 +642,7 @@ fi
 ℹ️  资源：derper 内存 RSS 约 3 MiB
 ```
 
-未知结果会以 ⚠️ 行提示（例如"证书：无权限确认"或"客户端校验：已启用，但无法确认 derper 服务用户能否访问 tailscaled LocalAPI"），并返回退出码 2。调用者（常为 root）能访问 LocalAPI，不代表 unit 中的 `User=` 也能访问。
+未知结果会以 ⚠️ 行提示（例如"证书：无权限确认"或"客户端校验：已启用，但无法确认 derper 服务用户能否使用 tailscaled LocalAPI"），并返回退出码 2。脚本在调用者（常为 root）请求成功后，会切换为 unit 中的 `User=` 实际请求 LocalAPI；socket 属主/权限位以及调用者自身能访问都只能作为线索，不能代替该请求。无法切换身份时结果为未知。
 
 Prometheus 指标样例（文本文件内容）：
 

@@ -2,10 +2,19 @@
 
 ## [Unreleased]
 
+## [0.2.20] - 2026-10-28
+
+- Certificate rotation retries recognize an already-published candidate after checking the target region and node. Candidates that are not yet valid are rejected, and `maintain --disable-auto-maintain` persists the disabled state and removes the schedule first.
+- Fix BUG-123: after the caller can reach LocalAPI, the verify-clients H2 and publish gate switch to the derper unit `User=` and actually request it; ownership or permission bits alone no longer count as healthy. A 401/403 rejection or an inability to connect the socket as that user is a confirmed failure, while read/write access without an identity check is unknown.
+- Fix BUG-124: the external H3 adapter no longer reports a peer-offline, unreachable, or otherwise unattributed ping error as a failure of the specified DERP node. Only an error confirmed on the requested Region path without a direct/peer-relay endpoint yields `derp=failed`; everything else stays unknown.
+- Fix BUG-125: the H3 adapter's STUN check reserves budget for the following control-plane and certificate recheck, so a silently dropped target UDP port still prints `stun=failed` and exits 1 instead of becoming unknown when the budget runs out. Explicitly handle legacy Python `socket.timeout` classes that do not inherit `TimeoutError`, preventing the timeout from escaping as an unhandled exception.
+- Fix BUG-126: the H3 adapter returns unknown when the node also advertises the other address family, so a relay success over that address cannot be assembled into `derp=ok` for the target address.
+- Add and register regressions for these fixes (2 review, 4 new Python adapter cases).
+
 ## [0.2.19] - 2026-10-27
 
 - Add root C/S2 permission evidence and Python adapter regressions to the fixed Ubuntu 22.04/24.04 matrix. The manual disposable VM job requests C/D and preserves logs, generated artifacts and cleanup evidence; a missing real binary exits 2 (unverified).
-- Add D-stage real systemd maintenance scenarios with a loopback-only HTTP fixture for stable copies, due/revoked runs, restart failure recovery, reverse compensation and disabling. Cleanup also removes archived private keys. The dual Ubuntu 22.04/24.04 disposable VMs have been executed; the D integration did not pass because of BUG-116 (fixed in this release; a VM rerun is required for acceptance). The fixture does not establish cloud GD.
+- Add D-stage real systemd maintenance scenarios with a loopback-only HTTP fixture for stable copies, due/revoked runs, restart failure recovery, reverse compensation and disabling. Cleanup also removes archived private keys. The October 26 dual Ubuntu 22.04/24.04 disposable-VM D integration failed on BUG-116. On October 28, the current working tree passed the unchanged formal C/D suite on both platforms (23 success lines each, exit 0), including the final renewal status and cleanup. The fixture does not establish cloud GD; the actual GitHub matrix run remains pending.
 - Provide an optional independent Linux H3 adapter and real acceptance runbook. Require a single target Region, distributed/live certificate pin agreement, an actual relay round trip and a valid STUN response. Direct/other-Region paths remain unknown; real Tailnet/H3 and lifetime compatibility are pending.
 - Fix BUG-116: a scheduled `maintain` success is no longer re-registered as `recorded` by the main entry point and the unit is not reinstalled; `success_replaced` and the user's enable intent are preserved.
 - Fix BUG-117: when nothing changed but the health check fails (for example a confirmed LocalAPI failure), the default idempotent deployment no longer skips the publish gate and reports success; a failed gate exits non-zero.
@@ -826,6 +835,6 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 **Contributors**: Thanks to architects for professional advice
 
-**Update Date**: 2026-10-27
+**Update Date**: 2026-10-28
 
-**Version**: 0.2.19
+**Version**: 0.2.20

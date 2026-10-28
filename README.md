@@ -1,7 +1,7 @@
 # Tailscale DERP Quick Deploy Script
 
 > **Language / 语言**: [English](#english) | [中文](#中文)  
-> **Version / 版本**: `0.2.19` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
+> **Version / 版本**: `0.2.20` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 维护入口 / Maintenance: [配置、CLI、本地导入、JSON、H0～H3 与证书轮换](docs/MAINTENANCE_CN.md) · [English guide](docs/MAINTENANCE_EN.md)。测试套件分工与命名约定见 [tests/README.md](tests/README.md)；生产迁移、隔离 Tailnet 真写和真实外部客户端验收单独记录。
 

@@ -9,8 +9,8 @@
 set -euo pipefail
 
 # 脚本自身版本（与 docs/CHANGELOG_*.md、仓库根目录 VERSION 保持同步）
-SCRIPT_VERSION="0.2.19"
-SCRIPT_VERSION_DATE="2026-10-27"
+SCRIPT_VERSION="0.2.20"
+SCRIPT_VERSION_DATE="2026-10-28"
 
 # 默认端口
 DERP_PORT="30399"        # DERP TLS 端口
@@ -1699,19 +1699,88 @@ derper_unit_run_user() {
     | awk -F= '/^[[:space:]]*User=/ {gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit}' || true
 }
 
-# 判断 derper 服务用户能否读写 LocalAPI socket：0 可以，1 确认不可，2 无法确认。
-# 服务用户为空或与当前调用者相同时，调用者自身的读写判断已足够。
+# 以指定用户身份向 LocalAPI 发起与调用者相同的状态请求。
+# 能执行探测时输出 HTTP 状态码并返回 0（000 表示以该用户无法连接 socket）；
+# 无法切换身份返回 1；没有可用的探测工具返回 2。
+probe_localapi_as_user() {
+  local user="$1" sock="$2" code=""
+  local -a runner
+  if running_as_root && command -v runuser >/dev/null 2>&1; then
+    runner=(runuser -u "$user" --)
+  elif command -v sudo >/dev/null 2>&1; then
+    runner=(sudo -n -u "$user" --)
+  else
+    return 1
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    code=$("${runner[@]}" curl -s -o /dev/null -w '%{http_code}' --max-time 3 \
+      --unix-socket "$sock" "http://local-tailscaled.sock/localapi/v0/status" 2>/dev/null || true)
+  elif command -v python3 >/dev/null 2>&1; then
+    code=$("${runner[@]}" python3 -c '
+import socket, sys
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(3)
+    s.connect(sys.argv[1])
+    s.sendall(b"GET /localapi/v0/status HTTP/1.1\r\nHost: local-tailscaled.sock\r\n\r\n")
+    parts = s.recv(1024).decode("latin1", "replace").split()
+    print(parts[1] if len(parts) > 1 else "000")
+except Exception:
+    print("000")
+' "$sock" 2>/dev/null || true)
+  else
+    return 2
+  fi
+  # 空输出说明没能真正以该用户执行请求，不能据此判断访问权限。
+  [[ -n "$code" ]] || return 2
+  printf '%s\n' "$code"
+  return 0
+}
+
+# 以指定用户实际检查 socket 能否读写：0 可读写，1 确认不可读写，2 无法确认。
+# 用 sh 包装以区分“确实不可读写”和“身份切换本身失败”。
+socket_rw_as_user() {
+  local user="$1" sock="$2" out=""
+  [[ -S "$sock" ]] || return 1
+  local -a runner
+  if running_as_root && command -v runuser >/dev/null 2>&1; then
+    runner=(runuser -u "$user" --)
+  elif command -v sudo >/dev/null 2>&1; then
+    runner=(sudo -n -u "$user" --)
+  else
+    return 2
+  fi
+  out=$("${runner[@]}" sh -c 'test -r "$1" && test -w "$1" && printf RW || printf NO' sh "$sock" 2>/dev/null || true)
+  case "$out" in
+    RW) return 0 ;;
+    NO) return 1 ;;
+    *) return 2 ;;
+  esac
+}
+
+# 判断 derper 服务用户能否使用 LocalAPI：0 可以，1 确认不可，2 无法确认。
+# 服务用户为空或与当前调用者相同时，调用者自身的判断已足够。
+# 属主/权限位只能说明 socket 能否读写，无法证明 LocalAPI 接受该身份
+# （属主正确但 mode 000，或 socket 可读写而 LocalAPI 按 peer 身份返回 401/403）。
 derper_user_socket_access() {
-  local user="$1" sock="$2"
+  local user="$1" sock="$2" code="" probe_rc=0 rw_rc=0
   [[ -n "$user" ]] || return 0
   if [[ "$user" == "$(id -un 2>/dev/null || true)" ]]; then return 0; fi
   # 用户不存在时 systemd 也无法启动服务，视为确认不可访问
   id "$user" >/dev/null 2>&1 || return 1
-  if user_can_access_socket "$user" "$sock"; then return 0; fi
-  # 仅 root 的 runuser，或可免密 sudo 的实际探测才能证明“不可访问”；否则只能算未知
-  if running_as_root && { command -v runuser >/dev/null 2>&1 || command -v sudo >/dev/null 2>&1; }; then
-    return 1
+  code=$(probe_localapi_as_user "$user" "$sock" 2>/dev/null) || probe_rc=$?
+  if [[ "$probe_rc" -eq 0 ]]; then
+    case "$code" in
+      2[0-9][0-9]) return 0 ;;
+      000|'') return 1 ;;
+      401|403) return 1 ;;
+      *) return 2 ;;
+    esac
   fi
+  # 无法以服务用户身份发起请求：只有实际确认连 socket 都不可读写时才报告
+  # 确认不可；能读写时 LocalAPI 是否接受该身份仍然未知。
+  socket_rw_as_user "$user" "$sock" || rw_rc=$?
+  if [[ "$rw_rc" -eq 1 ]]; then return 1; fi
   return 2
 }
 
@@ -1732,7 +1801,7 @@ note_tailscaled_auth_visibility() {
   local http_code
   http_code=$(probe_tailscaled_localapi "$sock")
   if [[ "$http_code" =~ ^2[0-9]{2}$ ]]; then
-    # 调用者（常为 root）能访问不代表 derper 服务用户也能访问：核对 unit 中的 User=。
+    # 调用者（常为 root）能访问不代表 derper 服务用户也能访问：按 unit 的 User= 实际请求。
     local svc_user access_rc=0
     svc_user=$(derper_unit_run_user)
     derper_user_socket_access "$svc_user" "$sock" || access_rc=$?
@@ -1741,7 +1810,7 @@ note_tailscaled_auth_visibility() {
       1)
         TS_LOCALAPI_OK=0
         TS_AUTH_UNKNOWN=0
-        echo "[警告] derper 服务用户 ${svc_user} 无法访问 tailscaled LocalAPI socket：${sock}（调用者可访问不代表服务可用）。" >&2
+        echo "[警告] derper 服务用户 ${svc_user} 无法使用 tailscaled LocalAPI：${sock}（调用者可访问不代表服务可用）。" >&2
         ;;
       *) TS_LOCALAPI_OK=0; TS_AUTH_UNKNOWN=1 ;;
     esac
@@ -3597,7 +3666,8 @@ cert_public_matches_key() {
 
 # 候选证书至少还要有效 1 小时，避免 apply 时切换到已过期或即将过期的证书。
 candidate_validity_ok() {
-  openssl x509 -in "$1" -noout -checkend 3600 >/dev/null 2>&1
+  openssl x509 -in "$1" -noout -checkend 3600 >/dev/null 2>&1 &&
+    openssl verify -CAfile "$1" "$1" >/dev/null 2>&1
 }
 
 rotation_candidate_reusable() {
@@ -3967,6 +4037,25 @@ if tool_mode == "read":
             scoped.append(item)
     if len(scoped) == 1 and "CertName" in scoped[0][2]:
         sys.stdout.write(scoped[0][2]["CertName"][1])
+    sys.exit(0)
+if tool_mode == "current":
+    root = find_root(s)
+    if root is None or len(host_hits) != 1:
+        sys.exit(2)
+    a, b, f, rid = host_hits[0]
+    if (rid and rid != str(region)) or "CertName" not in f or f["CertName"][1] != new:
+        sys.exit(2)
+    # 必须位于指定 derpMap.Regions[region].Nodes 中，不能仅匹配全局同名对象。
+    fields = object_fields(s, *root)
+    for key in ("derpMap", "Regions", str(region)):
+        entry = fields.get(key)
+        if not entry or entry[0] != "obj":
+            sys.exit(2)
+        fields = object_fields(s, entry[2], entry[3] - 1)
+    nodes = fields.get("Nodes")
+    if (not nodes or nodes[0] != "arr" or not (nodes[2] < a < b < nodes[3])
+            or ("RegionID" in fields and fields["RegionID"][1] != str(region))):
+        sys.exit(2)
     sys.exit(0)
 if len(host_hits) > 1:
     sys.stderr.write("conflict: duplicate HostName\n")
@@ -4419,6 +4508,12 @@ sync_policy_for_candidate() {
     return 1
   fi
   acl=$POLICY_ACL_BODY
+  # 上次提交成功但读回失败或进程中断：先核验唯一目标与当前候选，
+  # 确认后直接继续本地切换，避免用旧指纹再次补丁造成永久冲突。
+  if _hujson_invoke current "$acl" "$IP_ADDR" "$REGION_ID" "$new_name" "" >/dev/null 2>&1; then
+    echo "[信息] 云端已采用当前候选指纹，继续本地切换。" >&2
+    return 0
+  fi
   patched=$(hujson_patch_certname "$acl" "$IP_ADDR" "$REGION_ID" "$new_name" "$old_name") || {
     echo "[错误] 云端目标冲突或无法生成最小补丁，已转人工协调。" >&2
     write_rotation_record <<EOF
@@ -4504,7 +4599,7 @@ assert_prepared_identity() {
   cand=$(cert_rotation_candidate_cert)
   [[ -f "$cand" && ! -L "$cand" ]] || { echo "[错误] 候选证书不存在，请重新 prepare。" >&2; return 1; }
   cert_contains_ip_san "$cand" "$IP_ADDR" || { echo "[错误] 候选证书 SAN 与目标 IP 不一致，请重新 prepare。" >&2; return 1; }
-  candidate_validity_ok "$cand" || { echo "[错误] 候选证书已过期或剩余有效期不足 1 小时，请重新 prepare。" >&2; return 1; }
+  candidate_validity_ok "$cand" || { echo "[错误] 候选证书尚未生效、已过期或剩余有效期不足 1 小时，请重新 prepare。" >&2; return 1; }
   cert_public_matches_key "$cand" "$(cert_rotation_candidate_key)" || { echo "[错误] 候选证书与私钥不匹配，请重新 prepare。" >&2; return 1; }
   cur=$(openssl x509 -in "$cand" -outform DER | sha256_hex) || return 1
   [[ "$cur" == "$rec_new" ]] || { echo "[错误] 候选指纹与 prepare 记录不一致，请重新 prepare。" >&2; return 1; }
@@ -5254,10 +5349,11 @@ user_can_access_socket() {
     fi
   fi
 
-  # 属主匹配
+  # 属主匹配且属主位可读写
   local owner
   owner=$(stat -c '%U' "$sock" 2>/dev/null || true)
-  if [[ "$owner" == "$user" ]]; then
+  local owner_bits=$(( (mode_oct >> 6) & 7 ))
+  if [[ -n "$owner" && "$owner" == "$user" ]] && (( (owner_bits & 6) == 6 )); then
     return 0
   fi
 
@@ -5271,8 +5367,8 @@ user_can_access_socket() {
     fi
   fi
 
-  # 实际探测：以目标用户执行 test -r/-w（最权威）
-  if command -v runuser >/dev/null 2>&1; then
+  # 实际探测：以目标用户执行 test -r/-w（最权威，能识别 ACL）
+  if running_as_root && command -v runuser >/dev/null 2>&1; then
     runuser -u "$user" -- test -r "$sock" -a -w "$sock" 2>/dev/null && return 0
   elif command -v sudo >/dev/null 2>&1; then
     sudo -n -u "$user" test -r "$sock" -a -w "$sock" 2>/dev/null && return 0
@@ -8061,6 +8157,11 @@ main() {
   fi
 
   if [[ "$CERT_PREPARE$CERT_APPLY$CERT_CANCEL$CERT_MAINTAIN" != 0000 ]]; then
+    # 停用维护本身就是本次 maintain 的操作：先持久化并移除调度，不再运行换证。
+    if [[ "$CERT_MAINTAIN" -eq 1 && "${DISABLE_AUTO_MAINTAIN:-0}" -eq 1 ]]; then
+      apply_auto_maintain_policy || exit 1
+      exit 0
+    fi
     run_d_stage_command || exit 1
     if [[ "$CERT_CANCEL" -eq 1 ]]; then
       exit 0

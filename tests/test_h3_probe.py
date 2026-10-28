@@ -57,8 +57,33 @@ class ProbeTests(unittest.TestCase):
             with self.subTest(result=result):
                 with self.assertRaises(probe.Unverified): probe.check_ping(result, self.target, '100.64.0.2')
 
-    def test_ping_confirmed_error_failed(self):
-        with self.assertRaises(probe.ProbeFailed): probe.check_ping({'Err': 'timeout'}, self.target, '100.64.0.2')
+    def test_dual_stack_node_is_unknown(self):
+        # 同一 Region 还下发另一地址族时，客户端可能经该地址中继，无法证明目标地址可用。
+        self.node['IPv6'] = '2001:db8::10'
+        with self.assertRaises(probe.Unverified): probe.match_region(self.mapping, self.target)
+        with self.assertRaises(probe.Unverified):
+            probe.match_region(self.mapping, probe.Target(900, '2001:db8::10', 30399, 3478))
+        # 空值等同未下发，不构成另一可用地址。
+        self.node['IPv6'] = ''
+        self.assertEqual(probe.match_region(self.mapping, self.target), self.node['CertName'])
+
+    def test_ping_error_without_confirmed_route_is_unknown(self):
+        # 对端离线、不可达、直连失败或超时不能证明指定 DERP 节点故障。
+        for result in [{'Err': 'timeout'},
+                       {'Err': 'timeout', 'DERPRegionID': 1, 'NodeIP': '100.64.0.2'},
+                       {'Err': 'timeout', 'DERPRegionID': 900, 'NodeIP': '100.64.0.3'},
+                       {'Err': 'timeout', 'DERPRegionID': 900, 'NodeIP': '100.64.0.2',
+                        'Endpoint': '203.0.113.1:1'},
+                       {'Err': 'timeout', 'DERPRegionID': 900, 'NodeIP': '100.64.0.2',
+                        'PeerRelay': 'other'}]:
+            with self.subTest(result=result):
+                with self.assertRaises(probe.Unverified): probe.check_ping(result, self.target, '100.64.0.2')
+
+    def test_ping_confirmed_target_route_failure(self):
+        # 已确认经指定 Region、且没有直连/peer relay 时，错误才归因于目标节点。
+        with self.assertRaises(probe.ProbeFailed):
+            probe.check_ping({'Err': 'relay closed', 'DERPRegionID': 900, 'NodeIP': '100.64.0.2'},
+                             self.target, '100.64.0.2')
 
     def test_peer_must_be_distinct_registered_node(self):
         probe.check_peer(self.status, '100.64.0.2')
@@ -105,6 +130,21 @@ class ProbeTests(unittest.TestCase):
             self.assertIn(b'tailnode', packet)
             self.assertEqual(struct.unpack('!I', packet[-4:])[0], zlib.crc32(packet[:-8]) ^ 0x5354554e)
 
+    def test_stun_legacy_socket_timeout_is_failed(self):
+        # Python 3.9 等环境的 socket.timeout 可能不是 TimeoutError 子类。
+        class LegacySocketTimeout(OSError): pass
+        class SilentUDP:
+            def __enter__(self): return self
+            def __exit__(self, *_args): return False
+            def settimeout(self, _timeout): pass
+            def connect(self, _address): pass
+            def send(self, _request): pass
+            def recv(self, _size): raise LegacySocketTimeout('timed out')
+        with patch.object(probe.socket, 'socket', return_value=SilentUDP()), \
+             patch.object(probe.socket, 'timeout', LegacySocketTimeout):
+            with self.assertRaises(probe.ProbeFailed):
+                probe.check_stun(probe.Target(900, '127.0.0.1', 443, 3478), 1)
+
     def test_run_end_to_end_contract_and_direct_route(self):
         import contextlib, io
         from types import SimpleNamespace
@@ -127,6 +167,34 @@ class ProbeTests(unittest.TestCase):
                 else:
                     with self.assertRaises(probe.Unverified): probe.run(args)
                     self.assertEqual(output.getvalue(), '')
+
+    def test_stun_timeout_reserves_budget_for_identity_recheck(self):
+        # 目标 UDP 被静默丢弃时，STUN 不得吃掉全部预算，否则复核抛未知、无法输出 stun=failed。
+        import contextlib, io, time
+        from types import SimpleNamespace
+        args = SimpleNamespace(region_id=900, ip='203.0.113.10', derp_port=30399,
+                               stun_port=3478, peer_ip='100.64.0.2', timeout=1.5, socket='unused')
+        ping = {'DERPRegionID': 900, 'NodeIP': '100.64.0.2'}
+        calls = []
+        def api(_socket, method, endpoint, _timeout):
+            calls.append(endpoint)
+            if endpoint == 'status': return self.status
+            if endpoint == 'derpmap': return self.mapping
+            return ping
+        budgets = []
+        def silent_stun(_target, timeout):
+            budgets.append(timeout)
+            time.sleep(timeout)
+            raise probe.ProbeFailed('目标 STUN 没有返回有效响应')
+        output = io.StringIO()
+        with patch.object(probe, 'local_api', side_effect=api), patch.object(probe, 'check_pin'), \
+             patch.object(probe, 'check_stun', side_effect=silent_stun), contextlib.redirect_stdout(output):
+            rc = probe.run(args)
+        self.assertEqual(rc, 1)
+        self.assertEqual(calls.count('derpmap'), 2)  # 初始核对 + STUN 后复核
+        self.assertIn('derp=ok', output.getvalue())
+        self.assertIn('stun=failed', output.getvalue())
+        self.assertTrue(0 < budgets[0] < args.timeout)
 
     def test_localapi_real_unix_http_transport(self):
         import http.server, socketserver, tempfile, threading

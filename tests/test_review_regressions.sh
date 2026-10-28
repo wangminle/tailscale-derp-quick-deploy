@@ -1753,27 +1753,30 @@ test_bug122_localapi_checks_derper_service_user() {
 
   # 调用者能访问、derper 用户确认不可访问：必须是明确故障（非未知、非健康）。
   running_as_root() { return 0; }
-  user_can_access_socket() { return 1; }
+  probe_localapi_as_user() { return 1; }
+  socket_rw_as_user() { return 1; }
   note_tailscaled_auth_visibility 2>/dev/null
   [[ "$TS_LOCALAPI_OK" -eq 0 && "$TS_AUTH_UNKNOWN" -eq 0 ]] ||
     fail "derper 用户被拒绝时必须是确认故障：OK=${TS_LOCALAPI_OK} UNKNOWN=${TS_AUTH_UNKNOWN}"
 
   # derper 用户可访问：健康。
-  user_can_access_socket() { [[ "$1" == nobody ]]; }
+  probe_localapi_as_user() { [[ "$1" == nobody ]] && printf '200\n'; }
   note_tailscaled_auth_visibility 2>/dev/null
   [[ "$TS_LOCALAPI_OK" -eq 1 && "$TS_AUTH_UNKNOWN" -eq 0 ]] ||
     fail "derper 用户可访问时应健康：OK=${TS_LOCALAPI_OK} UNKNOWN=${TS_AUTH_UNKNOWN}"
 
   # 非 root 调用者无法证明他人权限：未知，不能报假健康也不能报确认故障。
   running_as_root() { return 1; }
-  user_can_access_socket() { return 1; }
+  probe_localapi_as_user() { return 1; }
+  socket_rw_as_user() { return 2; }
   note_tailscaled_auth_visibility 2>/dev/null
   [[ "$TS_LOCALAPI_OK" -eq 0 && "$TS_AUTH_UNKNOWN" -eq 1 ]] ||
     fail "无法确认 derper 用户权限时应为未知：OK=${TS_LOCALAPI_OK} UNKNOWN=${TS_AUTH_UNKNOWN}"
 
   # unit 的 User= 就是调用者时，调用者自身判断已足够。
   printf '[Service]\nUser=%s\n' "$caller" >"$SERVICE_PATH"
-  user_can_access_socket() { fail '服务用户与调用者相同时无需额外探测'; }
+  probe_localapi_as_user() { fail '服务用户与调用者相同时无需额外探测'; }
+  socket_rw_as_user() { fail '服务用户与调用者相同时无需额外探测'; }
   note_tailscaled_auth_visibility 2>/dev/null
   [[ "$TS_LOCALAPI_OK" -eq 1 && "$TS_AUTH_UNKNOWN" -eq 0 ]] || fail '同一用户应健康'
 
@@ -1782,6 +1785,78 @@ test_bug122_localapi_checks_derper_service_user() {
   running_as_root() { return 0; }
   note_tailscaled_auth_visibility 2>/dev/null
   [[ "$TS_LOCALAPI_OK" -eq 0 && "$TS_AUTH_UNKNOWN" -eq 0 ]] || fail '服务用户不存在应为确认故障'
+}
+
+# BUG-123：必须切换为服务用户实际请求 LocalAPI；属主/权限位不能证明健康。
+test_bug123_localapi_must_be_requested_as_service_user() {
+  command -v python3 >/dev/null 2>&1 || { skip "无 python3，Unix socket 未测"; return 0; }
+  local ts_sock="$case_tmp/ts2.sock"
+  python3 -c 'import socket, sys; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.bind(sys.argv[1])' "$ts_sock" 2>/dev/null || {
+    skip "Unix socket 不可用"
+    return 0
+  }
+  chmod 666 "$ts_sock"
+  DERPER_VERIFY_CLIENTS_EFFECTIVE=1 TS_RUNNING=1
+  expected_tailscaled_socket() { printf '%s\n' "$ts_sock"; }
+  probe_tailscaled_localapi() { printf '200\n'; }
+  printf '[Service]\nUser=nobody\n' >"$SERVICE_PATH"
+  running_as_root() { return 0; }
+
+  # 调用者（root）2xx，但服务用户实际被 LocalAPI 拒绝：确认故障。
+  # 权限位检查若仍返回“可访问”，说明未按服务用户实际请求。
+  user_can_access_socket() { return 0; }
+  probe_localapi_as_user() { [[ "$1" == nobody ]] && printf '403\n'; }
+  note_tailscaled_auth_visibility 2>/dev/null
+  [[ "$TS_LOCALAPI_OK" -eq 0 && "$TS_AUTH_UNKNOWN" -eq 0 ]] ||
+    fail "服务用户被 LocalAPI 拒绝时必须确认故障：OK=${TS_LOCALAPI_OK} UNKNOWN=${TS_AUTH_UNKNOWN}"
+
+  # 服务用户以该身份连接 socket 失败（000）：确认故障，不是健康。
+  probe_localapi_as_user() { [[ "$1" == nobody ]] && printf '000\n'; }
+  note_tailscaled_auth_visibility 2>/dev/null
+  [[ "$TS_LOCALAPI_OK" -eq 0 && "$TS_AUTH_UNKNOWN" -eq 0 ]] ||
+    fail "服务用户无法连接 socket 时必须确认故障：OK=${TS_LOCALAPI_OK} UNKNOWN=${TS_AUTH_UNKNOWN}"
+
+  # 服务用户实际 2xx：健康。
+  probe_localapi_as_user() { [[ "$1" == nobody ]] && printf '200\n'; }
+  note_tailscaled_auth_visibility 2>/dev/null
+  [[ "$TS_LOCALAPI_OK" -eq 1 && "$TS_AUTH_UNKNOWN" -eq 0 ]] ||
+    fail "服务用户实际 2xx 时应健康：OK=${TS_LOCALAPI_OK} UNKNOWN=${TS_AUTH_UNKNOWN}"
+
+  # 无法切换身份实际请求时，socket 可读写也不能证明 LocalAPI 接受该身份：未知。
+  probe_localapi_as_user() { return 1; }
+  socket_rw_as_user() { return 0; }
+  note_tailscaled_auth_visibility 2>/dev/null
+  [[ "$TS_LOCALAPI_OK" -eq 0 && "$TS_AUTH_UNKNOWN" -eq 1 ]] ||
+    fail "无法实际请求时必须未知：OK=${TS_LOCALAPI_OK} UNKNOWN=${TS_AUTH_UNKNOWN}"
+
+  # 无法请求，但已实际确认服务用户连 socket 都不可读写：确认故障。
+  socket_rw_as_user() { return 1; }
+  note_tailscaled_auth_visibility 2>/dev/null
+  [[ "$TS_LOCALAPI_OK" -eq 0 && "$TS_AUTH_UNKNOWN" -eq 0 ]] ||
+    fail "确认 socket 不可读写时应为确认故障：OK=${TS_LOCALAPI_OK} UNKNOWN=${TS_AUTH_UNKNOWN}"
+}
+
+# BUG-123：socket 属主正确但权限位为 000 时，不得仅凭属主判定可访问。
+test_bug123_socket_owner_without_mode_is_not_access() {
+  command -v python3 >/dev/null 2>&1 || { skip "无 python3，Unix socket 未测"; return 0; }
+  local ts_sock="$case_tmp/ts3.sock"
+  python3 -c 'import socket, sys; s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.bind(sys.argv[1])' "$ts_sock" 2>/dev/null || {
+    skip "Unix socket 不可用"
+    return 0
+  }
+  chmod 600 "$ts_sock"
+  stat() {
+    case "$2" in
+      %a) printf '000\n' ;;
+      %U) printf 'nobody\n' ;;
+      %G) printf 'nogroup\n' ;;
+      *) command stat "$@" ;;
+    esac
+  }
+  running_as_root() { return 0; }
+  runuser() { return 1; }          # 实际探测：该用户不可读写
+  user_can_access_socket nobody "$ts_sock" && fail '属主匹配但权限位 000 不得判为可访问'
+  return 0
 }
 
 
@@ -1857,6 +1932,8 @@ tests=(
   test_bug117_default_deploy_gates_confirmed_localapi_failure
   test_bug117_default_deploy_still_succeeds_when_healthy
   test_bug122_localapi_checks_derper_service_user
+  test_bug123_localapi_must_be_requested_as_service_user
+  test_bug123_socket_owner_without_mode_is_not_access
 )
 if [[ "$#" -gt 0 ]]; then
   tests=("$@")
