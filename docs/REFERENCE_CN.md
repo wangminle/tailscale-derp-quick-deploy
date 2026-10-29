@@ -5,7 +5,7 @@
 > 本文是中文的详细用户指南（技术参考）。主仓库首页 `README.md` 为精简版中文快速上手；英文用户指南见同目录的 `REFERENCE_EN.md`。
 
 > **脚本文件**：`deploy_derper_ip_selfsigned.sh`  
-> **当前版本**：0.2.20（2026-10-28）\
+> **当前版本**：0.3.0（2026-10-29）\
 > **查看版本**：`bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
@@ -63,9 +63,16 @@ derper -c ./derper.json -hostname 127.0.0.1 -certmode manual -certdir ./certs \
 ### 硬件与网络
 - 一台具备**公网 IPv4** 的 Linux 主机（云服务器或能被公网访问的家宽设备）
 - 端口可放行：`DERP_PORT/tcp`（默认 30399）、`STUN_PORT/udp`（默认 3478）
+- DERP TCP 端口可通过 `--derp-port` 改为其他空闲端口；云安全组、本机防火墙与 derpMap 的 `DERPPort` 须同步。443 对受限网络更友好，但可能与 HTTPS 服务冲突。
 - 出站网络可访问 Go 模块代理（国内建议配置 `GOPROXY` 与 `GOSUMDB`）
 
 ### 权限与系统
+管理使用普通OpenSSH（sshd），可经Tailnet地址连接；不依赖、不启用Tailscale SSH，脚本也不修改RunSSH或sshd配置。
+
+操作顺序和分阶段完成条件见[安装业务闭环](INSTALL_WORKFLOW_CN.md)，Agent 的工具链校验与统一目标参数见[安装准备](AGENT_INSTALL_CN.md)。
+
+诊断边界：`netcheck` 不是实际中继证据；`debug derp` 的随机临时身份可能被默认开启的 `verify-clients` 正常拒绝。按 [H3 操作包](ACCEPTANCE_CN.md)使用独立合法客户端核对指定 Region、证书指纹、真实往返及 STUN。策略片段须合并，保留原有规则和 Regions。
+
 - 需要 **root 权限**执行脚本（或使用 `sudo`）
 - 推荐使用 **systemd** 作为服务管理器（脚本会自动检测并在不兼容时提供手动运行示例）
 
@@ -268,6 +275,10 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 --region-id               ACL derpMap 的 RegionID（默认 900）
 --region-code             ACL derpMap 的 RegionCode（默认 my-derp）
 --region-name             ACL derpMap 的 RegionName（默认 "My IP DERP"）
+--allow-region-id-conflict
+                          显式允许共用/替换已占用 RegionID；默认阻断其他节点冲突
+                          部署/check 用 tailscale debug derp-map + python3 只读预检
+                          同一唯一目标允许幂等；多节点策略须人工合并并保留 Nodes
 --user <username>         指定运行 derper 的用户（默认：当前登录用户）
                           可指定现有用户（如 nobody、www-data 等）
 --use-current-user        使用当前登录用户运行 derper（sudo 下为 $SUDO_USER，否则为当前用户；默认行为）
@@ -728,10 +739,13 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall --purge-all
     ```
 - Go 版本不足：
   - 新版 Tailscale 需要 Go ≥ 1.25。脚本默认 `--gotoolchain auto`，会自动拉取更高版本工具链。
+  - 产品构建的 `GOPATH`、`GOMODCACHE`、`GOCACHE` 位于本次安全临时目录并随退出清理，不写入或删除调用者已有的 `~/go`；需要重建时会重新下载依赖。
+- `derper --version` 显示 `ERR-BuildInfo`：
+  - 这是 `go install tailscale.com/cmd/derper@版本` 未注入上游 release 版本戳的显示问题，不代表模块版本或服务异常。用 `go version -m /usr/local/bin/derper` 或脚本 `status` 核对实际模块版本；无 Go 时脚本也从二进制模块信息兜底解析。
 - derper 参数不兼容：
   - 新版移除 `-https-port`，使用 `-a :<PORT>`。脚本已自动适配，无需手工更改。
 - `-verify-clients` 失败：
-  - 确认 `tailscaled` 正常并可见 `/run/tailscale/tailscaled.sock`；或在脚本中使用 `--no-verify-clients` 临时关闭。
+  - 确认 `tailscaled` 正常，并以实际 derper 服务用户请求 LocalAPI。不要为使诊断通过而关闭客户端校验；`--no-verify-clients` 仅用于明确隔离的测试环境。
 - IPv6 健康告警（`ip6tables MARK`）：
   - 尝试：`sudo modprobe xt_mark && sudo systemctl restart tailscaled`
   - 或切换到 legacy 后端：
@@ -788,6 +802,6 @@ sudo rm -f /usr/local/bin/derper
 
 - 服务器放行 `DERP_PORT/tcp` 与 `3478/udp`（云安全组 + 本机防火墙）。
 - 运行脚本并记录输出的 `CertName` 指纹。
-- 在 Tailscale 后台 ACL 粘贴 `derpMap`（使用 `CertName`）。
+- 将本节点 `derpMap` 片段合并到最新策略，保留 grants、ssh、其他规则和 Regions，使用 `CertName` 并核对客户端实际下发。
 - 在客户端运行 `tailscale netcheck`、`tailscale ping` 验证 “via DERP(my-derp)”。
 - 备份 `/opt/derper/certs/`，以防证书变化导致指纹变更。

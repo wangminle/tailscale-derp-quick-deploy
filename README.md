@@ -1,7 +1,7 @@
 # Tailscale DERP Quick Deploy Script
 
 > **Language / 语言**: [English](#english) | [中文](#中文)  
-> **Version / 版本**: `0.2.20` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
+> **Version / 版本**: `0.3.0` · `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 维护入口 / Maintenance: [配置、CLI、本地导入、JSON、H0～H3 与证书轮换](docs/MAINTENANCE_CN.md) · [English guide](docs/MAINTENANCE_EN.md)。测试套件分工与命名约定见 [tests/README.md](tests/README.md)；生产迁移、隔离 Tailnet 真写和真实外部客户端验收单独记录。
 
@@ -53,7 +53,9 @@ This project provides a **fully automated Tailscale DERP relay service deploymen
 - 🔧 **Multi-Mode Operation**: check/repair/force modes for different scenarios
 - 🗑️ **Scoped Uninstall**: `--uninstall` supports three-level cleanup for service, install directory, binary, and script-created config
 
-> Note: Health checks cover systemd status, listeners, TLS handshake and certificate fingerprint consistency, plus the tailscaled LocalAPI dependency when `-verify-clients` is on. They are **not** a full DERP/STUN/Tailnet connectivity proof; use `tailscale debug derp` / `netcheck` / `derpprobe` for that.
+> Note: Health checks cover local service/listener/certificate state and the LocalAPI dependency. `netcheck` only probes regions; `debug derp` uses a temporary identity that `verify-clients` may correctly reject. Full H3 requires an independent authorized client, the specified Region, matching distributed certificate pin, actual relay round trip and a valid STUN response. See [the acceptance guide](docs/ACCEPTANCE_EN.md). Merge the generated node fragment into the existing policy; retain grants, SSH rules and other Regions.
+
+For the operator workflow and Agent handoff, see [installation workflow](docs/INSTALL_WORKFLOW_EN.md) and [Agent installation preparation](docs/AGENT_INSTALL_EN.md). Manual maintenance does not enable periodic checks or external notifications. To opt into automatic certificate renewal later, follow the [OAuth authorization and maintenance setup guide](docs/AUTO_MAINTENANCE_EN.md).
 
 #### 4. Cross-Environment Compatibility
 
@@ -114,7 +116,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
   --ip <your-public-ip> \
   --dedicated-user \
   --security-level paranoid \
-  --derp-port 443 \
+  --derp-port 30399 \
   --auto-ufw \
   --goproxy https://goproxy.cn,direct \
   --gosumdb sum.golang.google.cn
@@ -173,6 +175,8 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # Use current login user
 
 While resolving the same-origin module version and downloading/building derper, the terminal refreshes animated dots and elapsed seconds every second and shows the stage time limit (60 and 900 seconds respectively). The dots mean the task is still running; the first dependency or toolchain download may take a while. The result and total duration are printed when a stage ends, and a build failure prints the error details. Redirected logs, `TERM=dumb`, and JSON mode keep only the static start/end messages; progress output goes to stderr.
 
+Build caches (`GOPATH`, `GOMODCACHE`, and `GOCACHE`) stay in the run's secure temporary directory and are removed on exit. The script does not write to or clean the caller's existing `~/go`; later rebuilds download dependencies again.
+
 | Parameter | Description | Default | Recommended (China) |
 |-----------|-------------|---------|---------------------|
 | `--goproxy <URL>` | Go module proxy (no automatic third-party fallback) | Inherit env | `https://goproxy.cn,direct` |
@@ -212,6 +216,9 @@ While resolving the same-origin module version and downloading/building derper, 
 | `--region-id <int>` | ACL derpMap RegionID (must be a JS-safe integer ≤ 2^53-1; 900-999 reserved for user regions) | 900 | Unique identifier for your relay node |
 | `--region-code <string>` | RegionCode | `my-derp` | Short code (displayed in `tailscale status`) |
 | `--region-name <string>` | RegionName | `My IP DERP` | Human-readable name |
+| `--allow-region-id-conflict` | Explicitly share/replace an occupied RegionID | Off; other-node conflicts block | Multi-node or replacement after planning policy merge; existing Nodes must be retained manually |
+
+Deploy and `--check` read `tailscale debug derp-map` with Python 3 for a read-only conflict preflight. The same single target remains idempotent. If the map cannot be read or parsed, the script warns that conflict status is unknown rather than claiming it is clear.
 
 ##### Operational Modes
 
@@ -281,9 +288,11 @@ curl -fsSL https://tailscale.com/install.sh | sh
 sudo systemctl enable --now tailscaled
 sudo tailscale up  # Copy login URL to browser
 
-# 4. Download deployment script
-git clone <repository-url>
-cd tailscale-derp-quick-deploy
+# 4. Download deployment script (tarball; no git required)
+curl -fsSL https://github.com/wangminle/tailscale-derp-quick-deploy/archive/refs/heads/main.tar.gz \
+  -o tailscale-derp-quick-deploy.tar.gz
+tar -xzf tailscale-derp-quick-deploy.tar.gz
+cd tailscale-derp-quick-deploy-main
 
 # 5. Pre-check (recommended)
 sudo bash scripts/deploy_derper_ip_selfsigned.sh \
@@ -293,7 +302,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 # 6. Formal deployment (China network)
 sudo bash scripts/deploy_derper_ip_selfsigned.sh \
   --ip YOUR_PUBLIC_IP \
-  --derp-port 443 \
+  --derp-port 30399 \
   --dedicated-user \
   --security-level standard \
   --auto-ufw \
@@ -306,6 +315,8 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 #    ✅ Create and start systemd service
 #    ✅ Output derpMap configuration snippet
 ```
+
+Git users can instead run `git clone https://github.com/wangminle/tailscale-derp-quick-deploy.git` followed by `cd tailscale-derp-quick-deploy`.
 
 #### Output Example
 
@@ -326,7 +337,7 @@ After successful deployment, you'll see:
             "Name": "900a",
             "RegionID": 900,
             "HostName": "203.0.113.10",
-            "DERPPort": 443,
+            "DERPPort": 30399,
             "CertName": "sha256-raw:a1b2c3d4e5f6..."
           }
         ]
@@ -361,8 +372,8 @@ $ systemctl status derper
 #### 2. Port Listening Verification
 
 ```bash
-$ ss -tulpn | grep -E ':443|:3478'
-tcp   LISTEN  0  4096  *:443   *:*     users:(("derper",pid=1234))
+$ ss -tulpn | grep -E ':30399|:3478'
+tcp   LISTEN  0  4096  *:30399   *:*     users:(("derper",pid=1234))
 udp   LISTEN  0  4096  *:3478  *:*     users:(("derper",pid=1234))
 ```
 
@@ -370,7 +381,7 @@ udp   LISTEN  0  4096  *:3478  *:*     users:(("derper",pid=1234))
 
 **Security Model:**
 ```
-Client → Connect to 203.0.113.10:443
+Client → Connect to 203.0.113.10:30399
        ↓
        Verify certificate DER SHA256 matches CertName in ACL
        ↓
@@ -394,7 +405,7 @@ On any Tailscale client:
 ```bash
 # View DERP latency
 $ tailscale netcheck
-  * my-derp (203.0.113.10:443) = 15ms  ⭐ Fastest
+  * my-derp (203.0.113.10:30399) = 15ms  ⭐ Fastest
 
 # Auto-select fastest relay when connecting to peers
 $ tailscale ping peer-device
@@ -410,7 +421,7 @@ With Grafana dashboard:
 │  DERP Service Status                 │
 │  ✅ Running  Uptime: 15d 3h 42m     │
 ├─────────────────────────────────────┤
-│  TLS Port (443)      ✅ Listening   │
+│  TLS Port (30399)      ✅ Listening   │
 │  STUN Port (3478)    ✅ Listening   │
 │  Certificate Expiry  287 days       │
 │  Memory Usage        3.2 MiB        │
@@ -494,7 +505,7 @@ fi
 
 5. **Host & Tailnet Hardening** (the real risk of a public relay is the host itself):
    - Cloud security group inbound: only `DERP TLS` + `STUN` ports; never open `22/tcp` to `0.0.0.0/0`.
-   - SSH preferably via Tailscale only (keep the cloud VNC/console as fallback), or source-restricted with password auth disabled.
+   - Use system OpenSSH (`sshd`) over the Tailnet, or restrict source IPs and disable password authentication; keep the cloud VNC/console as fallback. This script does not enable the separate Tailscale SSH feature (`--ssh`) or invoke `tailscale ssh`.
    - Do **not** restrict egress: tailscaled needs the control plane and official DERP/STUN probes.
    - Single-purpose host: run only derper + tailscaled; enable automatic security updates (`unattended-upgrades` / `dnf-automatic`).
    - Tailscale ACLs are allow-all by default: tag this server (e.g. `tag:derper-server`) and grant it no `src` access, so "relay compromise ≠ tailnet compromise".
@@ -524,8 +535,8 @@ Whether you're an **individual user quickly setting up a testing environment** o
 ### Documentation Layout
 
 - `docs/`: all product usage documents — the detailed user guides (`REFERENCE_EN.md` / `REFERENCE_CN.md`), maintenance guides, and the bilingual changelogs (`CHANGELOG_EN.md` / `CHANGELOG_CN.md`).
-- `plans/`: formal requirements, designs, and development plans (local, not versioned).
-- `checkpoints/`: review, inspection, research, and evaluation reports; execution results, deployment records, and historical snapshots (local, not versioned).
+- `design/plans/`: formal requirements, designs, and development plans (local, not versioned).
+- `design/checkpoints/`: review, inspection, research, and evaluation reports; execution results, deployment records, and historical snapshots (local, not versioned).
 - Repository root: this quickstart `README.md`, `VERSION`, and the task ledger `task-list.md`.
 
 ---
@@ -576,7 +587,9 @@ Whether you're an **individual user quickly setting up a testing environment** o
 - 🔧 **多模式运行**：check/repair/force 三种模式满足不同场景
 - 🗑️ **分级卸载**：`--uninstall` 支持服务、安装目录、二进制和脚本生成配置的三级清理
 
-> 说明：健康检查覆盖服务状态、端口监听、TLS 握手与证书指纹一致性，以及启用 `-verify-clients` 时的 tailscaled LocalAPI 依赖，**不等于**完整 DERP/STUN/Tailnet 连通性证明；请使用 `tailscale debug derp` / `netcheck` / `derpprobe` 做协议级验证。
+> 说明：健康检查覆盖本机服务/监听/证书和 LocalAPI 依赖。`netcheck` 只探测区域；`debug derp` 使用临时身份，可能被 `verify-clients` 正常拒绝。完整 H3 必须由独立合法客户端核对指定 Region、下发指纹、真实中继往返和 STUN 响应，见[公网与中继验收指南](docs/ACCEPTANCE_CN.md)。生成的节点片段必须合并到既有策略，保留 grants、ssh 和其他 Regions。
+
+用户操作与 Agent 交接见[安装业务闭环](docs/INSTALL_WORKFLOW_CN.md)及[Agent 安装准备](docs/AGENT_INSTALL_CN.md)。人工维护不表示已启用周期检查或站外通知。后续选择自动换证时，按[OAuth 授权与维护安装指南](docs/AUTO_MAINTENANCE_CN.md)操作。
 
 #### 4. 跨环境兼容
 
@@ -637,7 +650,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
   --ip <你的公网IP> \
   --dedicated-user \
   --security-level paranoid \
-  --derp-port 443 \
+  --derp-port 30399 \
   --auto-ufw \
   --goproxy https://goproxy.cn,direct \
   --gosumdb sum.golang.google.cn
@@ -696,6 +709,8 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # 使用当前登录用户
 
 同源模块版本解析和下载/编译 derper 时，终端每秒刷新跳点与已等待秒数，并显示阶段时限（分别为 60 秒和 900 秒）。跳点表示任务仍在执行；首次下载依赖或工具链可能较慢。结束后显示结果与耗时，构建失败会输出错误详情。重定向日志、`TERM=dumb` 或 JSON 模式只保留静态起止提示，进度信息写入 stderr。
 
+构建缓存（`GOPATH`、`GOMODCACHE`、`GOCACHE`）只放在本次安全临时目录并随退出清理，不写入或删除调用者已有的 `~/go`；后续重建会重新下载依赖。
+
 | 参数 | 说明 | 默认值 | 推荐值（国内） |
 |------|------|--------|----------------|
 | `--goproxy <URL>` | Go 模块代理（不会自动切换第三方代理） | 继承环境 | `https://goproxy.cn,direct` |
@@ -735,6 +750,9 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # 使用当前登录用户
 | `--region-id <int>` | ACL derpMap 的 RegionID（须为 JS 安全整数 ≤ 2^53-1；900-999 保留给用户自建区域） | 900 | 唯一标识你的中继节点 |
 | `--region-code <string>` | RegionCode | `my-derp` | 短代码（在 `tailscale status` 中显示） |
 | `--region-name <string>` | RegionName | `My IP DERP` | 人类可读名称 |
+| `--allow-region-id-conflict` | 显式共用/替换已占用 RegionID | 关闭；其他节点冲突默认阻断 | 规划多节点或替换后使用；既有 Nodes 仍须人工保留 |
+
+部署与 `--check` 会使用 Python 3 只读解析 `tailscale debug derp-map` 做冲突预检；同一唯一目标允许幂等修复。无法读取或解析时会明确报告“无法确认”，不会冒充无冲突。
 
 ##### 运行模式
 
@@ -804,9 +822,11 @@ curl -fsSL https://tailscale.com/install.sh | sh
 sudo systemctl enable --now tailscaled
 sudo tailscale up  # 复制登录 URL 到浏览器
 
-# 4. 下载部署脚本
-git clone <repository-url>
-cd tailscale-derp-quick-deploy
+# 4. 下载部署脚本（tarball，无需 git）
+curl -fsSL https://github.com/wangminle/tailscale-derp-quick-deploy/archive/refs/heads/main.tar.gz \
+  -o tailscale-derp-quick-deploy.tar.gz
+tar -xzf tailscale-derp-quick-deploy.tar.gz
+cd tailscale-derp-quick-deploy-main
 
 # 5. 预检查（推荐）
 sudo bash scripts/deploy_derper_ip_selfsigned.sh \
@@ -816,7 +836,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 # 6. 正式部署（国内网络）
 sudo bash scripts/deploy_derper_ip_selfsigned.sh \
   --ip YOUR_PUBLIC_IP \
-  --derp-port 443 \
+  --derp-port 30399 \
   --dedicated-user \
   --security-level standard \
   --auto-ufw \
@@ -829,6 +849,8 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 #    ✅ 创建 systemd 服务并启动
 #    ✅ 输出 derpMap 配置片段
 ```
+
+使用 Git 时也可执行 `git clone https://github.com/wangminle/tailscale-derp-quick-deploy.git`，再进入 `tailscale-derp-quick-deploy` 目录。
 
 #### 输出示例
 
@@ -849,7 +871,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
             "Name": "900a",
             "RegionID": 900,
             "HostName": "203.0.113.10",
-            "DERPPort": 443,
+            "DERPPort": 30399,
             "CertName": "sha256-raw:a1b2c3d4e5f6..."
           }
         ]
@@ -884,8 +906,8 @@ $ systemctl status derper
 #### 2. 端口监听验证
 
 ```bash
-$ ss -tulpn | grep -E ':443|:3478'
-tcp   LISTEN  0  4096  *:443   *:*     users:(("derper",pid=1234))
+$ ss -tulpn | grep -E ':30399|:3478'
+tcp   LISTEN  0  4096  *:30399   *:*     users:(("derper",pid=1234))
 udp   LISTEN  0  4096  *:3478  *:*     users:(("derper",pid=1234))
 ```
 
@@ -893,7 +915,7 @@ udp   LISTEN  0  4096  *:3478  *:*     users:(("derper",pid=1234))
 
 **安全模型：**
 ```
-客户端 → 连接 203.0.113.10:443
+客户端 → 连接 203.0.113.10:30399
        ↓
        验证证书 DER 的 SHA256 是否匹配 ACL 中的 CertName
        ↓
@@ -917,7 +939,7 @@ udp   LISTEN  0  4096  *:3478  *:*     users:(("derper",pid=1234))
 ```bash
 # 查看 DERP 延迟
 $ tailscale netcheck
-  * my-derp (203.0.113.10:443) = 15ms  ⭐ 最快
+  * my-derp (203.0.113.10:30399) = 15ms  ⭐ 最快
 
 # 连接对端时自动选择最快中继
 $ tailscale ping peer-device
@@ -933,7 +955,7 @@ pong from peer-device (100.x.x.x) via DERP(my-derp) in 18ms
 │  DERP 服务状态                       │
 │  ✅ 运行中  Uptime: 15d 3h 42m      │
 ├─────────────────────────────────────┤
-│  TLS 端口（443）     ✅ 监听        │
+│  TLS 端口（30399）     ✅ 监听        │
 │  STUN 端口（3478）   ✅ 监听        │
 │  证书有效期          287 天         │
 │  内存占用            3.2 MiB        │
@@ -1017,7 +1039,7 @@ fi
 
 5. **主机与 Tailnet 加固**（公网中继的真正风险在主机本身）：
    - 云安全组入方向只放行 DERP TLS + STUN 两个端口，`22/tcp` 绝不对 `0.0.0.0/0` 开放。
-   - SSH 优先只走 Tailscale（保留云厂商 VNC/控制台兜底），或限源 IP + 禁用密码登录。
+   - 使用系统 OpenSSH（`sshd`）经 Tailnet 传输，或限源 IP + 禁用密码登录，保留云厂商 VNC/控制台兜底。本脚本不启用独立的 Tailscale SSH 功能（`--ssh`），也不调用 `tailscale ssh`。
    - 出方向不要收紧：tailscaled 需要访问控制面与官方 DERP/STUN 探测。
    - 单机单用途：只跑 derper + tailscaled；开启自动安全更新（`unattended-upgrades` / `dnf-automatic`）。
    - Tailscale 默认 ACL 全通：给本服务器打 tag（如 `tag:derper-server`）且不授予任何 `src` 放行，“中继被攻破 ≠ 内网失守”。
@@ -1048,8 +1070,8 @@ fi
 ### 文档目录约定
 
 - `docs/`：全部产品使用文档——详细用户指南（`REFERENCE_CN.md` / `REFERENCE_EN.md`）、维护指南（`MAINTENANCE_CN.md` / `MAINTENANCE_EN.md`）与中英文更新日志（`CHANGELOG_CN.md` / `CHANGELOG_EN.md`）。
-- `plans/`：正式需求、设计和开发实施计划；保留本地，不纳入版本控制。
-- `checkpoints/`：review、检查、调研和评估报告，以及执行结果、部署记录与历史快照；保留本地，不纳入版本控制。
+- `design/plans/`：正式需求、设计和开发实施计划；保留本地，不纳入版本控制。
+- `design/checkpoints/`：review、检查、调研和评估报告，以及执行结果、部署记录与历史快照；保留本地，不纳入版本控制。
 - 仓库根目录：快速上手 `README.md`、`VERSION` 与实际任务台账 `task-list.md`。
 
 ---

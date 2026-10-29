@@ -1269,6 +1269,7 @@ test_install_progress_is_live_in_terminal() {
 import errno
 import os
 import pty
+import re
 import select
 import subprocess
 import tempfile
@@ -1326,7 +1327,8 @@ def run(body, label, status, expected_rc, animate=True, term='xterm'):
                 if not chunk:
                     break
                 data += chunk
-                if '已等待 1 秒'.encode() in data and proc.poll() is None:
+                # 调度繁忙时可能跳过恰好第1秒；仍要求正数计时帧在命令结束前可见。
+                if re.search(r'已等待 [1-9][0-9]* 秒', data.decode()) and proc.poll() is None:
                     live = True
             stdout, _ = proc.communicate(timeout=3)
             text = data.decode()
@@ -2600,7 +2602,7 @@ EOF
     [[ "$fw_out" == *"firewall-cmd --permanent --add-port=30399/tcp"* ]] ||
       fail "firewall-cmd hint should be printed when firewall-cmd is present"
 
-    # 3) runtime_checks：覆盖 ss、openssl 握手、nc 探测与 tailscale debug derp
+    # 3) runtime_checks：区域探测不等于合法客户端转发，不执行随机身份debug derp。
     command() {
       if [[ "$1" == -v && ( "$2" == ss || "$2" == openssl || "$2" == nc || "$2" == tailscale ) ]]; then return 0; fi
       builtin command "$@"
@@ -2610,16 +2612,16 @@ EOF
     openssl() { return 0; }
     nc() { return 0; }
     tailscale() {
-      if [[ "$1" == "debug" && "$2" == "derp" ]]; then
-        echo "DERP debug probe ok"
+      if [[ "$1" == "netcheck" ]]; then
+        echo "region network probe ok"
         return 0
       fi
       return 1
     }
     local rt_out
     rt_out=$(runtime_checks 2>&1)
-    [[ "$rt_out" == *"TLS 握手成功"* && "$rt_out" == *"DERP debug probe ok"* ]] ||
-      fail "runtime_checks should report TLS success and tailscale debug derp output"
+    [[ "$rt_out" == *"TLS 握手成功"* && "$rt_out" == *"region network probe ok"* && "$rt_out" == *"不等于"* ]] ||
+      fail "runtime_checks must report TLS and region probes with an explicit relay verification boundary"
   )
   ok "legacy nft handle cleanup, print_firewall_tips, and runtime_checks work"
 }
@@ -2720,9 +2722,9 @@ test_deployment_wizard_full_flow_and_validation() {
       fail "wizard must reject NON_INTERACTIVE=1"
     NON_INTERACTIVE=0
 
-    # 2) 完整交互生成命令并保存 derper_deploy_cmd.sh（选 c 生产 / b 专用账户 / a 443 / b 不验证 / a 大陆代理 / n 不立即执行）
+    # 2) 完整交互生成命令并保存 derper_deploy_cmd.sh（生产/专用用户/443/不验证/大陆代理/安装健康检查/不立即执行）
     id() { echo 0; }
-    out=$(printf 'c\nb\na\nb\na\nn\n' | deployment_wizard 2>&1) || fail "wizard command generation should succeed"
+    out=$(printf 'c\nb\na\nb\na\na\nn\n' | deployment_wizard 2>&1) || fail "wizard command generation should succeed"
     [[ -x "${local_tmp}/derper_deploy_cmd.sh" ]] || fail "wizard must create executable derper_deploy_cmd.sh"
     local cmd_file
     cmd_file=$(cat "${local_tmp}/derper_deploy_cmd.sh")
@@ -2732,15 +2734,17 @@ test_deployment_wizard_full_flow_and_validation() {
       fail "wizard command missing verify/security flags: $cmd_file"
     [[ "$cmd_file" == *"--goproxy"* && "$cmd_file" == *"goproxy.cn"* ]] ||
       fail "wizard command missing goproxy flag: $cmd_file"
+    [[ "$cmd_file" == *"--install-healthcheck-cron"* && "$out" == *"没有站外通知"* ]] ||
+      fail "wizard must offer health checks without promising external alerts: $cmd_file"
 
     # 3) 选择立即执行（y）但输入非法 IP（如 999.1.1.1）时报错退出 1
     rc=0
-    out=$(printf 'a\na\nb\na\nb\ny\n999.1.1.1\n' | deployment_wizard 2>&1) || rc=$?
+    out=$(printf 'a\na\nb\na\nb\nb\ny\n999.1.1.1\n' | deployment_wizard 2>&1) || rc=$?
     [[ "$rc" -ne 0 && "$out" == *"超出范围"* ]] ||
       fail "wizard must reject out-of-range IP octets, rc=$rc"
 
     # 4) 选择立即执行（y）、输入合法 IP、但在最终确认输入 no 时安全取消
-    out=$(printf 'a\na\nb\na\nb\ny\n8.8.8.8\nno\n' | deployment_wizard 2>&1) ||
+    out=$(printf 'a\na\nb\na\nb\nb\ny\n8.8.8.8\nno\n' | deployment_wizard 2>&1) ||
       fail "wizard final confirmation 'no' should cancel cleanly"
     [[ "$out" == *"已取消执行"* ]] || fail "wizard should report cancellation when final confirm is no"
   )
@@ -2771,17 +2775,27 @@ test_main_modes_end_to_end_orchestration() {
     cert_layout_is_ok() { return 0; }
     check_extra_attack_surface() { EXTRA_LISTENERS=""; }
     check_automatic_updates() { AUTO_UPDATES_OK=1; }
+    local derp_map_fixture='{"Regions":{}}'
+    tailscale() { printf '%s\n' "$derp_map_fixture"; }
+    _timeout_run() { shift; "$@"; }
 
     # 1) main --check：合法参数返回 0；非法参数仍输出总结但返回 1
     local out rc=0
     out=$(main --check --ip 8.8.8.8 2>&1) || rc=$?
     [[ "$rc" -eq 0 && "$out" == *"[检查] 参数与环境状态总结："* && "$out" == *"<已就绪：可直接跳过>"* ]] ||
-      fail "main --check with healthy state should return 0 and suggest skip"
+      fail "main --check with healthy state should return 0 and suggest skip, rc=$rc out=$out"
 
     rc=0
     out=$(main --check --ip 8.8.8.8 --derp-port 70000 2>&1) || rc=$?
     [[ "$rc" -ne 0 && "$out" == *"[检查结束]"* ]] ||
       fail "main --check with invalid port must print summary and return non-zero"
+
+    derp_map_fixture='{"Regions":{"900":{"RegionID":900,"Nodes":[{"HostName":"203.0.113.9","DERPPort":30399,"STUNPort":3478}]}}}'
+    rc=0
+    out=$(main --check --ip 8.8.8.8 2>&1) || rc=$?
+    [[ "$rc" -eq 1 && "$out" == *"RegionID 冲突"* && "$out" == *"[检查] 参数与环境状态总结："* && "$out" == *"Region 900 预检：确认冲突"* && "$out" == *"[检查结束]"* ]] ||
+      fail "main --check must print the full summary before returning a Region conflict, rc=$rc out=$out"
+    derp_map_fixture='{"Regions":{}}'
 
     # 2) main --health-check：健康退出 0，不健康退出 1
     # H0 要求 systemctl/openssl/ss 存在；桩化以便在 macOS 等缺这些工具的开发机上结果一致。

@@ -5,7 +5,7 @@
 > This is the detailed English user guide (technical reference). For the simplified Chinese quickstart now used as the main README, go to `../README.md`. For the Chinese user guide, see `REFERENCE_CN.md` in this folder.
 
 > **Script File**: `deploy_derper_ip_selfsigned.sh`  
-> **Current Version**: 0.2.20 (2026-10-28)\
+> **Current Version**: 0.3.0 (2026-10-29)\
 > **Show version**: `bash scripts/deploy_derper_ip_selfsigned.sh --version`
 
 ![Linux](https://img.shields.io/badge/OS-Linux-blue?logo=linux&logoColor=white)
@@ -55,9 +55,16 @@ Note: This mode is only for local functional verification and cannot serve as a 
 ### Hardware & Network
 - A Linux host with **public IPv4** (cloud server or home broadband device accessible from the internet)
 - Ports must be accessible: `DERP_PORT/tcp` (default 30399), `STUN_PORT/udp` (default 3478)
+- Use `--derp-port` to choose another unused TCP port. Keep the cloud security group, host firewall, and derpMap `DERPPort` in sync. Port 443 can work better on restricted networks, but may conflict with an HTTPS service.
 - Outbound network access to Go module proxy (for China mainland, configure `GOPROXY` and `GOSUMDB`)
 
 ### Permissions & System
+Management uses ordinary OpenSSH (`sshd`), optionally over Tailnet addresses. It does not require or enable Tailscale SSH; the script does not change RunSSH or sshd configuration.
+
+See [operator workflow](INSTALL_WORKFLOW_EN.md) and [Agent preparation](AGENT_INSTALL_EN.md) for staged checks and a shared target configuration. Merge node fragments into the existing policy, preserving rules and other Regions.
+
+`netcheck` is region discovery, not relay proof. `debug derp` uses a temporary identity that default `verify-clients` may reject. Follow the [H3 procedure](ACCEPTANCE_EN.md) with an independent authorized client, the specified Region, certificate pin, actual relay round trip and STUN response.
+
 - Requires **root privileges** to run the script (or use `sudo`)
 - Recommended to use **systemd** as service manager (script will auto-detect and provide manual run examples if incompatible)
 
@@ -233,6 +240,10 @@ Common paths:
 --region-id               ACL derpMap RegionID (default 900)
 --region-code             ACL derpMap RegionCode (default my-derp)
 --region-name             ACL derpMap RegionName (default "My IP DERP")
+--allow-region-id-conflict
+                          Explicitly allow sharing/replacing an occupied RegionID; other-node conflicts block by default
+                          deploy/check read tailscale debug derp-map with python3; the same single target remains idempotent
+                          Multi-node policy must still be merged manually without dropping existing Nodes
 --user <username>         Specify which user runs derper (default: current login user)
                           Can specify existing users (e.g., nobody, www-data)
 --use-current-user        Use the current login user to run derper (under sudo this is $SUDO_USER; default)
@@ -696,10 +707,13 @@ Note: Uninstall doesn't affect Tailscale itself (tailscaled, clients etc.). To r
     ```
 - Go version insufficient:
   - New Tailscale requires Go ≥ 1.25. Script defaults to `--gotoolchain auto`, will auto-fetch higher version toolchain.
+  - Product builds place `GOPATH`, `GOMODCACHE`, and `GOCACHE` in the run's secure temporary directory and remove them on exit. They neither write to nor delete the caller's existing `~/go`; a later rebuild downloads dependencies again.
+- `derper --version` shows `ERR-BuildInfo`:
+  - This is only a missing upstream release stamp when building with `go install tailscale.com/cmd/derper@version`, not a module-version or service failure. Check the actual module with `go version -m /usr/local/bin/derper` or the script's `status`; without Go, the script also falls back to embedded module metadata.
 - derper parameter incompatibility:
   - New version removes `-https-port`, uses `-a :<PORT>`. Script auto-adapts, no manual changes needed.
 - `-verify-clients` failure:
-  - Confirm `tailscaled` normal and `/run/tailscale/tailscaled.sock` visible; or use `--no-verify-clients` in script temporarily.
+  - Check tailscaled and request LocalAPI as the actual derper service user. Do not disable verification merely to pass diagnostics; `--no-verify-clients` is for explicitly isolated tests only.
 - IPv6 health warning (`ip6tables MARK`):
   - Try: `sudo modprobe xt_mark && sudo systemctl restart tailscaled`
   - Or switch to legacy backend:
@@ -756,6 +770,6 @@ sudo rm -f /usr/local/bin/derper
 
 - [ ] Server opens `DERP_PORT/tcp` and `3478/udp` (cloud security groups + local firewall).
 - [ ] Run script and record output `CertName` fingerprint.
-- [ ] In Tailscale admin console ACL, paste `derpMap` (using `CertName`).
+- [ ] Merge this node fragment into the latest policy, preserving grants, SSH rules and other Regions; verify the distributed map and CertName.
 - [ ] On clients, run `tailscale netcheck`, `tailscale ping` to verify "via DERP(my-derp)".
 - [ ] Backup `/opt/derper/certs/` to prevent fingerprint change from certificate changes.

@@ -2,7 +2,26 @@
 
 本指南描述已实现的配置、检查和维护入口。证书轮换提供 prepare/apply/cancel 与同机维护任务；云端策略写入只用合成替身验收，隔离 Tailnet 真写仍待办。脚本继续以单文件运行，旧参数保留。
 
+## 服务器节点最小授权
+
+公网 DERP 服务器的 Tailnet 身份应按最小授权管理，避免主机被攻破后同时获得访问整个 Tailnet 的权限：
+
+1. 在管理后台 Machines 页为节点添加 `tag:derper-server`，或首次登录时使用 `sudo tailscale up --advertise-tags=tag:derper-server`。已登录的 Linux CLI 没有 `tailscale set --tags`。
+2. 在 Access Controls 中声明标签所有者：
+
+   ```json
+   "tagOwners": {
+     "tag:derper-server": ["autogroup:admin"]
+   }
+   ```
+
+3. 不要在放行规则中把 `tag:derper-server` 写成 `src`。只有确需从服务器访问内网资源时，才添加限定目标设备和端口的最小规则。
+
+`verify-clients` 要求服务器能够看到合法客户端。仅添加标签却删除所有可见性会导致中继拒绝连接；修改策略后必须使用合法客户端重新验证。完整操作与验收入口见[公网与中继验收](ACCEPTANCE_CN.md)。
+
 ## 命令与兼容
+用户业务闭环见[安装流程](INSTALL_WORKFLOW_CN.md)，统一目标参数与工具链校验见[Agent 准备](AGENT_INSTALL_CN.md)。手动维护仅在执行检查时提示到期；健康检查 timer/cron、自动换证和站外通知是独立能力，不能从“安装完成”推断已启用。当前没有站外通知。
+
 
 | 子命令 | 旧入口/行为 |
 | --- | --- |
@@ -68,6 +87,12 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh deploy \
 
 自行计算的 SHA256 只能描述所取文件，不能认证来源。预期摘要应通过可信独立渠道获取；操作者仍需信任本地产物。无法识别版本的自编译产物拒绝。正常 deploy 更新不重签有效证书。
 
+## Go 构建缓存与磁盘空间
+
+root 构建使用 `/var/cache/derper-deploy/go-build` 保存 GOPATH、模块和编译缓存，目录必须为 root 所有、权限0700、绝对路径且不能是符号链接；缓存跨部署复用，不会随事务临时目录删除。自动下载的工具链、日志和事务文件使用 `/var/tmp` 下的安全临时目录，避免小内存 tmpfs 上的 `/tmp` 耗尽内存。非 root 独立测试继续使用隔离临时缓存。查询和构建的 `GOTMPDIR`、`TMPDIR` 同时固定到本次经过空间预检的目录，避免 Go 工作文件继续落回默认 `/tmp`。
+
+每次下载工具链或构建前，脚本分别检查临时目录与缓存所在文件系统，默认各需至少1GiB可用空间，空间不足会在下载前失败。 独立执行 `go list -m` 版本解析也复用该空间和缓存安全预检，因为查询可能自动下载工具链；没有部署临时目录时，会在 `/var/tmp` 创建仅供本次查询使用的目录，成功或预检失败后均清理该目录，root 持久缓存保留。空间预检不保证编译内存足够，小内存主机仍需另验实际构建资源。可通过 `DERPER_GO_BUILD_CACHE_DIR` 调整缓存位置，或用 `DERPER_GO_MIN_FREE_KB` 调整最低空间；root 使用自定义缓存时同样必须满足属主和路径安全要求。
+
 ## 状态、指标与结果
 
 同一次核心采集供文本、JSON、指标和 derpmap 使用。JSON schema_version=1，包含 sampled_at、last_success_at、result/reason、needs_manual_attention、layers、目标参数、证书摘要、新鲜度及写入结果。缺失摘要/时间等为 null；last_success_at 为当前请求检查范围最近通过的时间，H3 未配置时不代表外部中继最近成功。
@@ -86,7 +111,7 @@ bash scripts/deploy_derper_ip_selfsigned.sh status --format json \
 
 保留原指标；新增 `derper_h0_status`～`derper_h3_status`（1健康、0故障、-1未知、-2未检查、2不适用）、采样时间、旧指标年龄和最近成功时间。旧指标没有后台进程自行改写 stale 状态，监控端应比较当前时间与 derper_metrics_unixtime，或显式使用 --metrics-source。
 
-原 `--install-healthcheck-cron` 继续作为安装入口，systemd 环境实际生成 timer/oneshot，显式 Bash 调用稳定副本，带默认状态文件 `/var/lib/derper-deploy/health/status.json`；已配置探针/Region/超时/内网许可也会随调度保存。不会在定时任务中自动重启或修复。
+原 `--install-healthcheck-cron` 继续作为安装入口，systemd 环境实际生成 timer/oneshot，显式 Bash 调用稳定副本，带默认状态文件 `/var/lib/derper-deploy/health/status.json`。使用配置文件时，安装器把配置原子复制到健康程序目录的 `target.conf`，调度只读取这个 root 管理的稳定副本，不再用重复的 IP、端口、Region 或探针 CLI 参数覆盖它；编辑稳定副本会影响后续执行，移动原文件不会删除副本。无配置时仍显式保存目标与探针参数。不会在定时任务中自动重启或修复。
 
 ```bash
 systemctl status derper-healthcheck.timer
@@ -132,9 +157,11 @@ DERP/STUN 值为 ok/failed；全通过退出0，确认失败且报告对应faile
 
 当前隔离 VM 测试验证了协议解析、失败/未知门禁和回退；真实独立 Tailnet 客户端的 H3 验收、生产升级和控制面协调分别待实测，不从本地通过推断它们已完成。
 
-可选的独立 Linux 客户端适配器为 `scripts/h3_probe.py`（Python3 标准库）。它使用现有 tailscaled LocalAPI 的合法节点身份，核对单节点 Region/地址/端口、下发指纹与服务证书、真实指定 Region 往返及 STUN 响应；无需读取私钥。直连、其他 Region、多节点歧义或传播未确认返回未知，适配器不会自动强制改路由。对端离线、不可达或 ping 错误未能确认发生在指定 DERP 路径时返回未知，不会把证据缺失报成节点故障；同一节点同时下发 IPv4/IPv6 时因客户端可能经另一地址中继而返回未知。STUN 探测为随后的控制面与证书复核预留预算，UDP 被静默丢弃时仍输出 `stun=failed`。具体部署、可信 SSH wrapper 和真实 VM/GD/长效兼容步骤见[真实验收操作包](../tests/REAL_ACCEPTANCE.md)。本地适配器回归不代表真实 H3 已通过。
+可选的独立 Linux 客户端适配器为 `scripts/h3_probe.py`（Python3 标准库）。它使用现有 tailscaled LocalAPI 的合法节点身份，核对单节点 Region/地址/端口、下发指纹与服务证书、真实指定 Region 往返及 STUN 响应；无需读取私钥。直连、其他 Region、多节点歧义或传播未确认返回未知，适配器不会自动强制改路由。对端离线、不可达或 ping 错误未能确认发生在指定 DERP 路径时返回未知，不会把证据缺失报成节点故障；同一节点同时下发 IPv4/IPv6 时因客户端可能经另一地址中继而返回未知。STUN 探测为随后的控制面与证书复核预留预算，UDP 被静默丢弃时仍输出 `stun=failed`。具体部署、可信 SSH wrapper 和真实 VM/GD/长效兼容步骤见[真实验收操作包](ACCEPTANCE_CN.md)。本地适配器回归不代表真实 H3 已通过。
 
 ## 证书轮换与条件式自动维护
+
+首次启用请按[自动维护授权与安装指南](AUTO_MAINTENANCE_CN.md)操作，包含管理员 OAuth 授权流程图、凭据准备、统一目标配置、timer 启用验收及停用步骤。启用不会弹出浏览器登录，本机 tailscaled 登录不能代替策略写授权。
 
 自动维护必须配置非空、非全空白的 `TS_TAILNET`，可由部署配置或独立凭据文件提供；未配置时不请求 OAuth 或策略 API，显式 `--enable-auto-maintain` 会报错且不安装 timer。有效目标会保存到定时配置。
 

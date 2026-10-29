@@ -7,7 +7,7 @@
 | 文件 | 职责 | 运行环境 | CI | 传参单跑 | 退出码 |
 | --- | --- | --- | --- | --- | --- |
 | test_deploy_script.sh | 主回归套件：参数解析、环境检查、证书、unit、防火墙、健康检查、向导、main 编排与底层辅助函数（105 个注册入口，含安装进度伪终端验证和失败门禁变异回归，按领域组织） | 非 root（root 专属断言自动跳过） | ✅ | ✅ | 0 通过 / 1 有失败 |
-| test_review_regressions.sh | 审查回归：历次审查反例的先红后绿用例（BUG-014～058 主要条目）、B 阶段 b1/b2/b3 行为、BUG-109 回环接口后缀及中英文加固示例与实际 unit 一致性、BUG-117/122/123 默认部署门禁与 LocalAPI 服务用户实际请求（73 用例） | 非 root（root/工具缺失场景输出 skip） | ✅ | ✅ | 0 通过 / 1 有失败 |
+| test_review_regressions.sh | 审查回归：历次审查反例的先红后绿用例、B 阶段行为、回环接口与加固一致性、默认发布门禁/LocalAPI服务用户请求，以及 BUG-130～143 诊断边界/维护提示/RegionID预检/健康调度/最小授权/Go构建缓存与空间门禁（93 用例） | 非 root（root/工具缺失场景输出 skip） | ✅ | ✅ | 0 通过 / 1 有失败 |
 | test_s2_fixes.sh | S2 批次修复行为回归（BUG-053/055/059/060/061/070/077～081/110，24 用例），替身服务管理，含已就绪跳过、首次迁移/权限修复/恢复集保护及unit仅最终重启 | 非 root，需 gcc | ✅ | ✅ | 0 通过 / 1 有失败 |
 | test_s2_evidence.sh | 真实环境证据：flock、服务用户权限、旧用户恢复、BUG-110就绪跳过/换用户/不可读拒绝，以及 root 拒绝低权限同名进程/不可信 inode | 需 root + flock + useradd + gcc | ✅（sudo） | ❌（整文件执行） | 0 通过 / 1 失败 / 2 环境不符 |
 | test_c_stage.sh | C 阶段契约与行为（DEV-011/012/013）：配置白名单、新旧 CLI、ELF 导入、JSON/derpMap、H0～H3、状态与门禁（33 用例）；需 python3，ELF 用例需 gcc | 非 root；2项 root 专属用例退出 77 跳过 | ✅（含 sudo 补跑 root 用例） | ✅ | 0 通过 / 1 有失败 |
@@ -51,6 +51,12 @@
 | BUG-101～108（BUG-100 与105同源） | test_d_stage.sh 中 test_bug101_～test_bug108_ 入口；目标缺失/来源、配置提前天数、调度跨命令状态与换证边界 |
 | BUG-111～114、116、118～121 | test_d_stage.sh 的 test_bug111_、test_bug113_、test_bug114_、test_bug116_、test_bug118_～test_bug121_；主套件 test_bug112_harness_propagates_inner_failures 验证真实失败传播与累计 |
 | BUG-117、122、123 | test_review_regressions.sh 的 test_bug117_（默认部署门禁）、test_bug122_（LocalAPI 按 derper 服务用户判断）、test_bug123_（切换为该用户实际请求 LocalAPI，属主/权限位不作为健康依据；需 python3 与 Unix socket，否则 skip） |
+| BUG-130～136 | test_review_regressions.sh 的 test_bug130_～test_bug136_；RegionID占用/同目标/多节点/显式放行/结构异常/显式IPv4/解析未知与临时Go缓存均有行为断言 |
+| BUG-137 | test_deploy_script.sh 的 test_main_modes_end_to_end_orchestration 使用固定derpMap并覆盖完整入口冲突阻断；test_review_regressions.sh 的 BUG-117 main 夹具同步隔离真实Tailnet |
+| BUG-138、ADJ-037 | test_review_regressions.sh 的 test_bug138_scheduled_healthcheck_preserves_config_and_region 与 test_adj037_healthcheck_uses_stable_config_only；覆盖相对/绝对配置路径、单来源稳定配置、无配置时Region继承及H3去重；test_adj037_report_health_summary_order_and_not_installed 覆盖摘要顺序和未安装状态，主套件覆盖check冲突完整总结 |
+| BUG-139 | test_review_regressions.sh 的 test_bug139_readonly_go_cache_is_cleaned_and_empty_tmpdir_refused；覆盖只读Go模块缓存随退出清理，以及安全临时目录未初始化时拒绝构建 |
+| BUG-140 | test_d_stage.sh 的 test_bug103_idempotent_deploy_honors_maintain_switch 固定 RegionID 预检，幂等部署用例不再读取本机真实 derpMap |
+| BUG-141～143 | test_review_regressions.sh 的 test_bug141_（同地址改端口/空Nodes/未知IP）、test_bug142_（最小授权建议与双语文档）、test_bug143_（持久缓存、独立查询两文件系统空间门禁、root属主/链接拒绝及独立临时目录清理） |
 | BUG-066/067、071～076 | test_c_stage.sh新增8个test_bug<ID>入口；067直接覆盖rollback_deploy_change首装分支，071含忽略TERM及父进程先退出的子进程清理，072以root补验状态/指标祖先权限，074含词法/符号/硬链接别名，075检查目标/检查范围切换。真实首装拒停及独立CLI重试另在test_systemd_integration.sh |
 | GB 真实 systemd 故障注入（TST-017） | test_systemd_integration.sh（一次性 VM） |
 | BUG-063 Bash 3.2 兼容 | 全部套件须在 macOS Bash 3.2 与 Linux Bash 5 双环境通过 |

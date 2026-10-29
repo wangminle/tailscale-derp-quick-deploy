@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="3200" height="3700" viewBox="0 0 3200 3700" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="3200" height="4300" viewBox="0 0 3200 4300" role="img" aria-labelledby="title desc">
   <title id="title">Tailscale DERP 部署脚本业务执行全流程与判断分支</title>
   <desc id="desc">deploy_derper_ip_selfsigned.sh 的主入口、部署发布、证书轮换、自动维护、健康检查、恢复和卸载全流程图。</desc>
   <defs>
@@ -25,6 +25,7 @@
       .external { fill:#e9f5f6; stroke:#55a0a6; }
       .note { fill:#f1f4f8; stroke:#9aaabc; }
       .text { font-size:18px; fill:#172b42; text-anchor:middle; }
+      .operator-text { font-size:18px; fill:#172b42; text-anchor:start; }
       .small { font-size:16px; fill:#42556c; text-anchor:middle; }
       .branch { font-size:16px; font-weight:700; fill:#885f0c; }
       .flow { fill:none; stroke:#43536a; stroke-width:2.4; marker-end:url(#arrow); }
@@ -392,4 +393,30 @@
   <text x="90" y="3530" class="legend">持久状态：/var/lib/derper-deploy（锁、恢复集、候选、健康状态、维护状态）　/var/lib/derper（节点身份）　/opt/derper/certs（正式证书）</text>
   <text x="90" y="3564" class="legend">稳定副本：/var/lib/derper-deploy/maintenance（证书维护）　/usr/local/lib/derper-deploy（健康检查）　凭据独立保存于 /etc/derper/policy-api.env</text>
   <text x="90" y="3598" class="legend">输出：derpMap + CertName、文本/JSON 健康状态、Prometheus 指标、maintenance/status、journal；失败不会用 InsecureForTests 伪造可用配置。</text>
+  <!-- 用户视角的完成条件；不把本机部署等同完整中继验收。 -->
+  <text x="90" y="3740" class="lane-title">用户操作闭环与 Agent 交接（详见 INSTALL_WORKFLOW_CN.md）</text>
+  <rect x="90" y="3780" width="680" height="150" class="process"/>
+  <text x="115" y="3815" class="section">1. 目标与只读预检</text>
+  <text x="115" y="3850" class="operator-text"><tspan x="115">明确公网IP / TCP、UDP / Region / 版本 / sudo</tspan><tspan x="115" dy="28">默认TCP30399可自选；密码仅由用户在终端输入</tspan></text>
+  <path d="M770 3855 H850" class="flow"/>
+  <rect x="870" y="3780" width="680" height="150" class="process"/>
+  <text x="895" y="3815" class="section">2. 本机部署与本地门禁</text>
+  <text x="895" y="3850" class="operator-text"><tspan x="895">可信产物 / 专用用户 / 证书 / LocalAPI</tspan><tspan x="895" dy="28">verify-clients保留；H0-H2通过不等于H3通过</tspan></text>
+  <path d="M1550 3855 H1630" class="flow"/>
+  <rect x="1650" y="3780" width="680" height="150" class="external"/>
+  <text x="1675" y="3815" class="section">3. 合并策略并核对下发</text>
+  <text x="1675" y="3850" class="operator-text"><tspan x="1675">保留grants、ssh与原Regions；核对Region冲突</tspan><tspan x="1675" dy="28">客户端实际map的IP / 端口 / 指纹须一致</tspan></text>
+  <path d="M2330 3855 H2410" class="flow"/>
+  <rect x="2430" y="3780" width="680" height="150" class="process"/>
+  <text x="2455" y="3815" class="section">4. 公网探测</text>
+  <text x="2455" y="3850" class="operator-text"><tspan x="2455">外部TLS指纹 + 有效STUN Binding响应</tspan><tspan x="2455" dy="28">netcheck仅探测区域；nc成功不作为STUN验收</tspan></text>
+  <path d="M2770 3930 V3970 H1210 V4010" class="flow"/>
+  <rect x="870" y="4010" width="680" height="150" class="decision"/>
+  <text x="895" y="4045" class="section">5. 独立合法客户端H3</text>
+  <text x="895" y="4080" class="operator-text"><tspan x="895">指定Region真实往返 + STUN；直连则记录未验</tspan><tspan x="895" dy="28">不自动封UDP / 强制路由 / 关闭客户端校验</tspan></text>
+  <path d="M1550 4085 H1630" class="flow"/>
+  <rect x="1650" y="4010" width="1460" height="150" class="state"/>
+  <text x="1675" y="4045" class="section">6. 维护交接</text>
+  <text x="1675" y="4080" class="operator-text"><tspan x="1675">明确证书期限、人工责任、健康timer/cron、自动换证授权与调度状态；当前没有站外通知</tspan><tspan x="1675" dy="28">安装成功不隐含后台提醒；临期提示仅在执行检查时出现；未验项单列，不批量关闭</tspan></text>
+  <text x="90" y="4230" class="legend">最终摘要：实际目标、指纹来源、verify-clients、H0-H3、调度/维护状态、下一步；上游日志示例Region不作为本次配置依据。</text>
 </svg>

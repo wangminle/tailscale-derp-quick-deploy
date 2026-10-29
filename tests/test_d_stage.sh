@@ -1053,6 +1053,8 @@ test_bug103_idempotent_deploy_honors_maintain_switch() {
   check_extra_attack_surface() { EXTRA_LISTENERS=""; }
   check_automatic_updates() { AUTO_UPDATES_OK=1; }
   precheck_verify_clients() { return 0; }
+  # 幂等用例不依赖真实 Tailnet；固定 Region 预检，避免本机 derpMap 占用导致误失败。
+  precheck_region_id_conflict() { return 0; }
   align_derper_version_with_tailscale() { :; }
   derper_binary_needs_install() { return 1; }
   ensure_compatible_certs() { CERTS_CHANGED=0; return 0; }

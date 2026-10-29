@@ -1697,6 +1697,8 @@ setup_bug117_main() {
   cert_layout_is_ok() { return 0; }
   check_extra_attack_surface() { EXTRA_LISTENERS=""; }
   check_automatic_updates() { AUTO_UPDATES_OK=1; }
+  tailscale() { printf '{"Regions":{}}\n'; }
+  _timeout_run() { shift; "$@"; }
   precheck_verify_clients() { return 0; }
   align_derper_version_with_tailscale() { :; }
   derper_binary_needs_install() { return 1; }
@@ -1860,7 +1862,490 @@ test_bug123_socket_owner_without_mode_is_not_access() {
 }
 
 
+test_bug130_runtime_does_not_accept_other_region_netcheck() {
+  IP_ADDR=114.67.236.43 DERP_PORT=30399 STUN_PORT=3478 REGION_ID=901
+  ss() { :; }
+  nc() { :; }
+  tls_probe_endpoints() { echo 127.0.0.1; }
+  _timeout_run() { return 0; }
+  tailscale() {
+    [[ $1 != debug ]] || { echo unexpected-debug-call; return 1; }
+    echo 'Nearest DERP: Aliyun DERP (region 900)'
+  }
+  local out
+  out=$(runtime_checks 2>&1)
+  [[ "$out" == *'Region 901'* && "$out" == *'不等于'* ]] || fail '其他区域netcheck成功也必须明确901中继未验'
+  [[ "$out" != *unexpected-debug-call* ]] || fail '默认客户端校验下不得自动运行随机身份debug derp'
+}
+
+test_bug131_manual_feedback_does_not_promise_background_warning() {
+  cert_days_remaining() { echo 364; }
+  local out
+  out=$(print_auto_maintain_feedback manual)
+  [[ "$out" != *'临期仍会提示'* ]] || fail 'manual不得无条件承诺后台提醒'
+  [[ "$out" == *'执行检查时'* && "$out" == *'没有站外通知'* ]] || fail '必须明确检查触发与通知边界'
+}
+
+test_bug132_first_issue_and_existing_rotation_are_distinct() {
+  CERT_PRESENT=0 CERT_CHECK_UNKNOWN=0 CERT_KEY_MATCH=1 CERT_NAMING_OK=0
+  generate_selfsigned_cert() { :; }
+  local out
+  out=$(ensure_compatible_certs 2>&1)
+  [[ "$out" == *'首次'* && "$out" != *'即将重签'* ]] || fail '首次签发不能提示旧指纹变化'
+  CERT_PRESENT=1 CERT_SAN_MATCH=0
+  out=$(ensure_compatible_certs 2>&1)
+  [[ "$out" == *'即将重签'* ]] || fail '已有证书替换仍需提醒指纹变化'
+}
+
+test_deploy_report_has_one_guide_and_actual_target() {
+  IP_ADDR=114.67.236.43 DERP_PORT=30399 STUN_PORT=3478 REGION_ID=901 REGION_CODE=jdcloud-derp REGION_NAME='JD Cloud DERP'
+  live_cert_sha256_raw() { echo abc123; }
+  print_server_node_acl_advice() { :; }
+  warn_world_writable_socket() { :; }
+  apply_auto_maintain_policy() { :; }
+  evaluate_auto_maintain_readiness() { echo manual; }
+  maintenance_scheduler_state() { echo absent; }
+  cert_days_remaining() { echo 364; }
+  cert_not_after() { echo 'Oct 28 00:00:00 2027 GMT'; }
+  local out count
+  out=$(finalize_deployment_report)
+  count=$(printf '%s\n' "$out" | grep -c '客户端验证步骤')
+  [[ $count == 1 ]] || fail "客户端说明必须仅一次，实际$count"
+  [[ "$out" == *'jdcloud-derp'* && "$out" == *'verify-clients=on'* && "$out" == *'H3='* ]] || fail '摘要须包含实际目标、鉴权与验收层'
+  [[ "$out" == *'保留'* && "$out" == *'grants'* && "$out" == *'Regions'* ]] || fail '必须说明策略合并边界'
+  [[ "$out" == *'Oct 28 00:00:00 2027 GMT'* && "$out" == *'364'* && "$out" == *'回落'* ]] || fail '摘要须交代到期日期、剩余天数和过期现象'
+  [[ "$out" == *'prepare/apply'* && "$out" == *'没有站外通知'* ]] || fail '摘要须给出续期入口和通知边界'
+}
+
+test_bug133_region_id_conflict_preflight() {
+  command -v python3 >/dev/null 2>&1 || { skip '缺少python3，跳过RegionID解析回归'; return 0; }
+  IP_ADDR=114.67.236.43 DERP_PORT=30399 STUN_PORT=3478 REGION_ID=901 ALLOW_REGION_ID_CONFLICT=0
+  _timeout_run() { shift; "$@"; }
+  local derp_map_fixture rc out
+  derp_map_fixture='{"Regions":{"900":{"RegionID":900,"Nodes":[{"HostName":"47.120.74.191","DERPPort":30399,"STUNPort":3478}]}}}'
+  tailscale() { printf '%s\n' "$derp_map_fixture"; }
+  precheck_region_id_conflict >/dev/null || fail '未占用Region必须允许部署'
+
+  derp_map_fixture='{"Regions":{"901":{"RegionID":901,"RegionCode":"other","Nodes":[{"HostName":"203.0.113.9","DERPPort":443,"STUNPort":3478}]}}}'
+  rc=0; out=$(precheck_region_id_conflict 2>&1) || rc=$?
+  [[ $rc == 1 && "$out" == *'901'* && "$out" == *'冲突'* ]] || fail "其他节点占用Region必须阻断，rc=$rc out=$out"
+
+  derp_map_fixture='{"Regions":{"901":{"RegionID":901,"Nodes":[{"HostName":"114.67.236.43","DERPPort":30399,"STUNPort":3478}]}}}'
+  precheck_region_id_conflict >/dev/null || fail '同一唯一目标必须允许幂等修复'
+
+  derp_map_fixture='{"Regions":{"901":{"RegionID":901,"Nodes":[{"HostName":"114.67.236.43","DERPPort":30399,"STUNPort":3478},{"HostName":"203.0.113.9","DERPPort":443,"STUNPort":3478}]}}}'
+  rc=0; precheck_region_id_conflict >/dev/null 2>&1 || rc=$?
+  [[ $rc == 1 ]] || fail '多节点Region不能被当成同一单节点目标'
+  ALLOW_REGION_ID_CONFLICT=1
+  out=$(precheck_region_id_conflict 2>&1) || fail '显式放行后应保留人工合并路径'
+  [[ "$out" == *'显式放行'* ]] || fail '显式冲突放行必须留下警告'
+
+  ALLOW_REGION_ID_CONFLICT=0; derp_map_fixture='not-json'; rc=0
+  out=$(precheck_region_id_conflict 2>&1) || rc=$?
+  [[ $rc == 2 && "$out" == *'无法确认'* ]] || fail '解析失败必须报告未知，不能冒充无冲突'
+}
+
+test_bug133_region_conflict_opt_in_is_explicit() {
+  ALLOW_REGION_ID_CONFLICT=0
+  parse_args --allow-region-id-conflict
+  [[ "$ALLOW_REGION_ID_CONFLICT" == 1 ]] || fail '冲突放行只能由显式CLI选项开启'
+}
+
+test_bug134_region_structure_anomalies_are_unknown() {
+  command -v python3 >/dev/null 2>&1 || { skip '缺少python3，跳过Region结构回归'; return 0; }
+  IP_ADDR=114.67.236.43 DERP_PORT=30399 STUN_PORT=3478 REGION_ID=901 ALLOW_REGION_ID_CONFLICT=0
+  _timeout_run() { shift; "$@"; }
+  local derp_map_fixture rc out
+  tailscale() { printf '%s\n' "$derp_map_fixture"; }
+  for derp_map_fixture in \
+    '[]' \
+    '{"Regions":{"901":null}}' \
+    '{"Regions":{"901":{"Nodes":[null]}}}'; do
+    rc=0
+    out=$(precheck_region_id_conflict 2>&1) || rc=$?
+    [[ $rc == 2 && "$out" == *'无法确认'* ]] ||
+      fail "异常Region结构必须统一报告未知，fixture=$derp_map_fixture rc=$rc out=$out"
+  done
+
+  derp_map_fixture='{"Regions":{}}'
+  precheck_region_id_conflict >/dev/null || fail 'Region字段不存在才表示未占用'
+}
+
+test_bug135_same_target_checks_explicit_ipv4() {
+  command -v python3 >/dev/null 2>&1 || { skip '缺少python3，跳过显式IPv4回归'; return 0; }
+  IP_ADDR=114.67.236.43 DERP_PORT=30399 STUN_PORT=3478 REGION_ID=901 ALLOW_REGION_ID_CONFLICT=0
+  _timeout_run() { shift; "$@"; }
+  local derp_map_fixture rc out
+  tailscale() { printf '%s\n' "$derp_map_fixture"; }
+
+  derp_map_fixture='{"Regions":{"901":{"Nodes":[{"HostName":"114.67.236.43","IPv4":"203.0.113.9","DERPPort":30399,"STUNPort":3478}]}}}'
+  rc=0
+  out=$(precheck_region_id_conflict 2>&1) || rc=$?
+  [[ $rc == 1 && "$out" == *'冲突'* ]] ||
+    fail "HostName相同但显式IPv4不同必须阻断，rc=$rc out=$out"
+
+  derp_map_fixture='{"Regions":{"901":{"Nodes":[{"HostName":"114.67.236.43","IPv4":"114.67.236.43","DERPPort":30399,"STUNPort":3478}]}}}'
+  precheck_region_id_conflict >/dev/null || fail '显式IPv4也相同的唯一目标必须允许幂等'
+}
+
+test_bug136_independent_module_query_removes_readonly_cache() {
+  mkdir -p "$case_tmp/independent-go-bin"
+  GO_ROOT_CAPTURE="$case_tmp/independent-go-root"
+  export GO_ROOT_CAPTURE
+  cat >"$case_tmp/independent-go-bin/go" <<'SH'
+#!/bin/sh
+module_dir="${GOMODCACHE}/tailscale.com@v1.104.4"
+mkdir -p "$module_dir"
+printf 'module cache\n' >"$module_dir/cache.txt"
+chmod 444 "$module_dir/cache.txt"
+chmod 555 "$module_dir"
+printf '%s\n' "${GOMODCACHE%/gopath/pkg/mod}" >"$GO_ROOT_CAPTURE"
+printf 'v1.104.4\n'
+SH
+  chmod +x "$case_tmp/independent-go-bin/go"
+  PATH="$case_tmp/independent-go-bin:$PATH"
+  _tmpdir=''
+  _run_with_progress() { shift 3; "$@"; }
+  local out rc=0 build_root
+  out=$(resolve_derper_module_version abcdef1234567890 2>&1) || rc=$?
+  build_root=$(cat "$GO_ROOT_CAPTURE")
+  [[ $rc == 0 && "$out" == *'v1.104.4'* ]] ||
+    fail "独立版本查询本身必须成功，rc=$rc out=$out"
+  if [[ -d "$build_root" ]]; then
+    chmod -R u+w "$build_root" 2>/dev/null || true
+    rm -rf "$build_root"
+    fail '独立版本查询必须清理Go默认创建的只读模块目录'
+  fi
+}
+
+test_go_build_cache_stays_out_of_caller_home() {
+  local build_root="$case_tmp/go-build-test"
+  mkdir -p "$build_root/tmp" "$build_root/caller-home" "$build_root/bin"
+  _tmpdir="$build_root/tmp"
+  DEPLOY_STATE_DIR="$build_root/state"
+  DERPER_VERSION=v1.104.4 LOCAL_BINARY='' GOPROXY_ARG='' GOSUMDB_ARG='' GOTOOLCHAIN_ARG=auto
+  HOME="$build_root/caller-home"
+  GO_ENV_CAPTURE="$build_root/env"
+  export GO_ENV_CAPTURE
+  cat >"$build_root/bin/go" <<'SH'
+#!/bin/sh
+{
+  printf 'GOPATH=%s\n' "${GOPATH:-}"
+  printf 'GOMODCACHE=%s\n' "${GOMODCACHE:-}"
+  printf 'GOCACHE=%s\n' "${GOCACHE:-}"
+  printf 'GOTMPDIR=%s\n' "${GOTMPDIR:-}"
+  printf 'TMPDIR=%s\n' "${TMPDIR:-}"
+} >"$GO_ENV_CAPTURE"
+if [ -n "${GOBIN:-}" ]; then
+  : >"$GOBIN/derper"
+  chmod +x "$GOBIN/derper"
+else
+  printf 'v1.104.4\n'
+fi
+SH
+  chmod +x "$build_root/bin/go"
+  PATH="$build_root/bin:$PATH"
+  precheck_go_network() { :; }
+  ensure_go() { :; }
+  publish_derper_candidate() { :; }
+  _run_with_progress() { shift 3; "$@"; }
+  install_derper >/dev/null
+  local env_text
+  env_text=$(cat "$GO_ENV_CAPTURE")
+  [[ "$env_text" == *"GOPATH=${_tmpdir}/go-build/gopath"* ]] || fail "GOPATH必须位于本次临时目录：$env_text"
+  [[ "$env_text" == *"GOMODCACHE=${_tmpdir}/go-build/gopath/pkg/mod"* ]] || fail "模块缓存不得写入调用者home：$env_text"
+  [[ "$env_text" == *"GOCACHE=${_tmpdir}/go-build/cache"* ]] || fail "编译缓存不得写入调用者home：$env_text"
+  [[ "$env_text" == *"GOTMPDIR=${_tmpdir}/go-work"* && "$env_text" == *"TMPDIR=${_tmpdir}"* ]] ||
+    fail 'Go构建工作文件也必须使用经过空间预检的临时目录'
+  resolve_derper_module_version abcdef1234567890 >/dev/null
+  env_text=$(cat "$GO_ENV_CAPTURE")
+  [[ "$env_text" == *"GOPATH=${_tmpdir}/go-build/gopath"* && "$env_text" == *"GOMODCACHE=${_tmpdir}/go-build/gopath/pkg/mod"* && "$env_text" == *"GOCACHE=${_tmpdir}/go-build/cache"* ]] ||
+    fail "同源版本查询也必须使用临时Go缓存：$env_text"
+  [[ "$env_text" == *"GOTMPDIR=${_tmpdir}/go-work"* && "$env_text" == *"TMPDIR=${_tmpdir}"* ]] ||
+    fail 'Go版本查询工作文件也必须使用经过空间预检的临时目录'
+}
+
+test_bug138_scheduled_healthcheck_preserves_config_and_region() {
+  mkdir -p "$case_tmp/relative config"
+  cd "$case_tmp"
+  CONFIG_FILE='relative config/target.conf'
+  IP_ADDR=114.67.236.43 DERP_PORT=30399 STUN_PORT=3478
+  REGION_ID=901 REGION_CODE=jdcloud-derp REGION_NAME='JD Cloud DERP'
+  SECURITY_LEVEL=standard VERIFY_CLIENTS_MODE=on ALLOW_NON_GLOBAL_IP=0
+  EXTERNAL_PROBE='' REQUIRE_H3=0 HEALTH_STATE_FILE="$case_tmp/status.json"
+  render_healthcheck_commands /usr/local/lib/derper-deploy/deploy_derper_ip_selfsigned.sh "$IP_ADDR" "$case_tmp/metrics.prom"
+
+  # macOS 的 /var 是符号链接，实现按物理路径解析；两种绝对写法都指向同一文件。
+  local absolute_config="$case_tmp/relative config/target.conf"
+  local physical_config
+  physical_config="$(cd "$case_tmp/relative config" && pwd -P)/target.conf"
+  local arg previous='' config_seen=0 region_id_seen=0 region_code_seen=0 region_name_seen=0
+  eval "set -- $BASH_HEALTHCHECK_CMD"
+  for arg in "$@"; do
+    [[ "$previous" != --config || ( "$arg" != "$absolute_config" && "$arg" != "$physical_config" ) ]] || config_seen=1
+    [[ "$previous" != --region-id || "$arg" != 901 ]] || region_id_seen=1
+    [[ "$previous" != --region-code || "$arg" != jdcloud-derp ]] || region_code_seen=1
+    [[ "$previous" != --region-name || "$arg" != 'JD Cloud DERP' ]] || region_name_seen=1
+    previous=$arg
+  done
+  [[ "$config_seen$region_id_seen$region_code_seen$region_name_seen" == 1000 ]] ||
+    fail "cron只能继承绝对配置路径，不能用重复Region参数覆盖配置：$BASH_HEALTHCHECK_CMD"
+
+  local escaped_config escaped_physical
+  escaped_config=$(systemd_escape_arg "$absolute_config")
+  escaped_physical=$(systemd_escape_arg "$physical_config")
+  [[ ( "$SYSTEMD_HEALTHCHECK_EXEC" == *" --config $escaped_config"* ||
+       "$SYSTEMD_HEALTHCHECK_EXEC" == *" --config $escaped_physical"* ) &&
+     "$SYSTEMD_HEALTHCHECK_EXEC" != *' --region-id '* ]] ||
+    fail "systemd只能继承绝对配置路径，不能用重复Region参数覆盖配置：$SYSTEMD_HEALTHCHECK_EXEC"
+
+  CONFIG_FILE='' REGION_ID=902 REGION_CODE=other-derp REGION_NAME='Other DERP'
+  EXTERNAL_PROBE="$case_tmp/probe" REQUIRE_H3=0
+  render_healthcheck_commands /usr/local/lib/derper-deploy/deploy_derper_ip_selfsigned.sh "$IP_ADDR" "$case_tmp/metrics.prom"
+  [[ "$BASH_HEALTHCHECK_CMD" != *' --config '* && "$SYSTEMD_HEALTHCHECK_EXEC" != *' --config '* ]] ||
+    fail '未使用配置文件时不得生成空--config'
+  [[ "$BASH_HEALTHCHECK_CMD" == *' --region-id 902 --region-code other-derp --region-name Other\ DERP'* &&
+     "$SYSTEMD_HEALTHCHECK_EXEC" == *' --region-id 902 --region-code other-derp --region-name "Other DERP"'* ]] ||
+    fail '无配置文件且启用H3时也必须只继承同一套Region参数'
+  [[ "$(printf '%s\n' "$BASH_HEALTHCHECK_CMD" | grep -o -- '--region-id' | wc -l)" -eq 1 &&
+     "$(printf '%s\n' "$SYSTEMD_HEALTHCHECK_EXEC" | grep -o -- '--region-id' | wc -l)" -eq 1 ]] ||
+    fail 'H3分支不得重复附加RegionID'
+}
+
+test_bug139_readonly_go_cache_is_cleaned_and_empty_tmpdir_refused() {
+  _tmpdir="$case_tmp/deploy-tmp"
+  mkdir -p "$_tmpdir/go-build/gopath/pkg/mod/example.com/mod@v1.0.0" "$_tmpdir/go-build/cache"
+  printf 'x\n' >"$_tmpdir/go-build/gopath/pkg/mod/example.com/mod@v1.0.0/file"
+  chmod 444 "$_tmpdir/go-build/gopath/pkg/mod/example.com/mod@v1.0.0/file"
+  chmod 555 "$_tmpdir/go-build/gopath/pkg/mod/example.com/mod@v1.0.0"
+  cleanup_deployment 0
+  if [[ -e "$_tmpdir" ]]; then
+    chmod -R u+w "$_tmpdir" 2>/dev/null || true
+    rm -rf "$_tmpdir"
+    fail "退出清理必须删除只读Go模块缓存目录，实际残留 ${_tmpdir}"
+  fi
+
+  local rc=0 out=''
+  out=$( ( _tmpdir='' ; install_derper ) 2>&1 ) || rc=$?
+  [[ "$rc" -ne 0 && "$out" == *"安全临时目录未初始化"* ]] ||
+    fail "临时目录未初始化时必须拒绝构建而不是写入根目录，rc=$rc out=$out"
+}
+
+test_bug141_region_preflight_allows_port_change_and_unknown_for_empty_input() {
+  command -v python3 >/dev/null 2>&1 || { skip '缺少python3，跳过Region改端口回归'; return 0; }
+  IP_ADDR=114.67.236.43 DERP_PORT=443 STUN_PORT=3478 REGION_ID=901 ALLOW_REGION_ID_CONFLICT=0
+  _timeout_run() { shift; "$@"; }
+  local derp_map_fixture rc out
+  tailscale() { printf '%s\n' "$derp_map_fixture"; }
+
+  derp_map_fixture='{"Regions":{"901":{"Nodes":[{"HostName":"114.67.236.43","IPv4":"114.67.236.43","DERPPort":30399,"STUNPort":3478}]}}}'
+  out=$(precheck_region_id_conflict 2>&1) || fail '同一机器仅改端口不能被当成其他节点占用'
+  [[ "$out" == *'端口'* && "$out" == *'同步'* ]] || fail '改端口放行时应提示同步控制面端口'
+
+  derp_map_fixture='{"Regions":{"901":{"Nodes":[]}}}'
+  rc=0; out=$(precheck_region_id_conflict 2>&1) || rc=$?
+  [[ $rc == 2 && "$out" == *'无法确认'* ]] || fail "空Nodes必须返回未知而不是确认冲突，rc=$rc out=$out"
+
+  IP_ADDR=''
+  derp_map_fixture='{"Regions":{"901":{"Nodes":[{"HostName":"203.0.113.9","DERPPort":30399,"STUNPort":3478}]}}}'
+  rc=0; out=$(precheck_region_id_conflict 2>&1) || rc=$?
+  [[ $rc == 2 && "$out" == *'无法确认'* ]] || fail "IP未探测到时必须返回未知，rc=$rc out=$out"
+}
+
+test_bug142_deployment_report_restores_minimum_acl_advice() {
+  IP_ADDR=114.67.236.43 DERP_PORT=30399 STUN_PORT=3478 REGION_ID=901 REGION_CODE=jdcloud-derp REGION_NAME='JD Cloud DERP'
+  live_cert_sha256_raw() { echo abc123; }
+  warn_world_writable_socket() { :; }
+  apply_auto_maintain_policy() { :; }
+  evaluate_auto_maintain_readiness() { echo manual; }
+  maintenance_scheduler_state() { echo absent; }
+  cert_days_remaining() { echo 364; }
+  cert_not_after() { echo 'Oct 28 00:00:00 2027 GMT'; }
+  systemctl() { return 1; }
+  local out
+  out=$(finalize_deployment_report)
+  [[ "$out" == *'服务器节点在 Tailnet 内的身份'* && "$out" == *'tag:derper-server'* && "$out" == *'tagOwners'* ]] ||
+    fail '部署收尾必须实际打印服务器节点最小授权建议'
+  grep -q 'tag:derper-server' "$ROOT_DIR/docs/MAINTENANCE_CN.md" || fail '中文维护文档必须包含最小授权建议'
+  grep -q 'tag:derper-server' "$ROOT_DIR/docs/MAINTENANCE_EN.md" || fail '英文维护文档必须包含最小授权建议'
+}
+
+test_bug143_go_cache_is_persistent_and_space_checked() {
+  _tmpdir="$case_tmp/var-tmp"
+  DERPER_GO_BUILD_CACHE_DIR="$case_tmp/root-cache/go-build"
+  DERPER_GO_MIN_FREE_KB=1
+  mkdir -p "$_tmpdir"
+  id() { echo 0; }
+  stat() {
+    if [[ "$2" == %u ]]; then echo 0; else command stat "$@"; fi
+  }
+  [[ "$(go_build_cache_root)" == "$DERPER_GO_BUILD_CACHE_DIR" ]] || fail 'root构建必须使用磁盘持久缓存目录'
+  prepare_go_build_root || fail '空间充足时Go构建目录预检必须成功'
+  [[ -d "$DERPER_GO_BUILD_CACHE_DIR/gopath/pkg/mod" && -d "$DERPER_GO_BUILD_CACHE_DIR/cache" ]] ||
+    fail 'Go模块与编译缓存目录必须预先创建'
+  df() {
+    printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+    printf '/dev/fake 1024 1024 0 100%% /var/tmp\n'
+  }
+  if prepare_go_build_root >/dev/null 2>&1; then fail '空间不足必须在下载工具链和构建前阻断'; fi
+}
+
+test_adj037_healthcheck_uses_stable_config_only() {
+  HEALTHCHECK_CRON_PATH="$case_tmp/derper-healthcheck"
+  HEALTHCHECK_UNIT_DIR="$case_tmp/units"
+  HEALTHCHECK_PROGRAM_DIR="$case_tmp/stable"
+  IP_ADDR=114.67.236.43 DERP_PORT=30399 STUN_PORT=3478
+  REGION_ID=901 REGION_CODE=jdcloud-derp REGION_NAME='JD Cloud DERP'
+  SECURITY_LEVEL=standard VERIFY_CLIENTS_MODE=on ALLOW_NON_GLOBAL_IP=0
+  EXTERNAL_PROBE='' REQUIRE_H3=0 METRICS_TEXTFILE="$case_tmp/metrics.prom"
+  CONFIG_FILE="$case_tmp/source.conf"
+  printf 'CONFIG_VERSION=1\nIP_ADDR=114.67.236.43\nREGION_ID=901\n' >"$CONFIG_FILE"
+  SCRIPT_SELF="$case_tmp/deploy.sh"
+  printf '#!/bin/bash\n' >"$SCRIPT_SELF"
+  command() {
+    if [[ "$1" == -v && "$2" == systemctl ]]; then return 1; fi
+    builtin command "$@"
+  }
+  install_healthcheck_cron || fail '带配置的cron安装必须成功'
+  local stable_config="$HEALTHCHECK_PROGRAM_DIR/target.conf" cron
+  cron=$(cat "$HEALTHCHECK_CRON_PATH")
+  [[ -f "$stable_config" && "$cron" == *" --config $stable_config"* ]] || fail '调度必须使用root管理的稳定配置副本'
+  [[ "$cron" != *' --ip '* && "$cron" != *' --derp-port '* && "$cron" != *' --region-id '* ]] ||
+    fail '使用配置时不得再用重复CLI参数覆盖配置'
+
+  unset -f command
+  systemctl() { return 0; }
+  install_healthcheck_cron || fail '带配置的timer安装必须成功'
+  local svc
+  svc=$(cat "$HEALTHCHECK_UNIT_DIR/derper-healthcheck.service")
+  [[ "$svc" == *" --config $stable_config"* && "$svc" != *' --ip '* && "$svc" != *' --region-id '* ]] ||
+    fail 'systemd也只能使用稳定配置作为目标来源'
+  rm -f "$CONFIG_FILE"
+  [[ -f "$stable_config" ]] || fail '原配置移走后稳定配置必须仍然存在'
+}
+
+test_adj037_report_health_summary_order_and_not_installed() {
+  IP_ADDR=114.67.236.43 DERP_PORT=30399 STUN_PORT=3478 REGION_ID=901 REGION_CODE=jdcloud-derp REGION_NAME='JD Cloud DERP'
+  live_cert_sha256_raw() { echo abc123; }
+  print_server_node_acl_advice() { :; }
+  warn_world_writable_socket() { :; }
+  apply_auto_maintain_policy() { :; }
+  evaluate_auto_maintain_readiness() { echo manual; }
+  maintenance_scheduler_state() { echo absent; }
+  cert_days_remaining() { echo 364; }
+  cert_not_after() { echo 'Oct 28 00:00:00 2027 GMT'; }
+  systemctl() { return 1; }
+  local out health_pos next_pos
+  out=$(finalize_deployment_report)
+  [[ "$out" == *'健康检查调度：timer=未安装'* ]] || fail '未安装timer不得显示成inactive'
+  health_pos=$(printf '%s\n' "$out" | grep -n '健康检查调度' | cut -d: -f1)
+  next_pos=$(printf '%s\n' "$out" | grep -n '^下一步：' | cut -d: -f1)
+  [[ -n "$health_pos" && -n "$next_pos" && "$health_pos" -lt "$next_pos" ]] ||
+    fail '健康检查调度必须位于下一步之前'
+}
+
+test_bug143_module_query_checks_both_filesystems_before_go() {
+  local mode failed_path rc
+  go() { :; }
+  stat() { if [[ "$2" == %u ]]; then echo 0; else command stat "$@"; fi; }
+  _run_with_progress() { touch "$case_tmp/query-ran"; echo v1.104.4; }
+  DERPER_GO_BUILD_CACHE_DIR="$case_tmp/persistent-cache"
+  DERPER_GO_MIN_FREE_KB=1024
+  for mode in root user; do
+    for failed_path in temp cache; do
+      (
+        id() { if [[ "$mode" == root ]]; then echo 0; else echo 1000; fi; }
+        _tmpdir="$case_tmp/$mode-$failed_path"
+        mkdir -p "$_tmpdir"
+        df() {
+          local available=4096
+          if [[ ( "$failed_path" == temp && "$2" == "$_tmpdir" ) ||
+                ( "$failed_path" == cache && "$2" != "$_tmpdir" ) ]]; then available=0; fi
+          printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+          printf '/dev/test 4096 0 %s 0%% /var/tmp\n' "$available"
+        }
+        rc=0
+        resolve_derper_module_version abcdef >"$case_tmp/query-out" 2>"$case_tmp/query-err" || rc=$?
+        [[ "$rc" -ne 0 ]] || fail "${mode}查询在${failed_path}空间不足时必须失败"
+        [[ ! -e "$case_tmp/query-ran" ]] || fail '空间检查失败前不得运行Go查询'
+        grep -q '空间不足' "$case_tmp/query-err" || fail '应保留空间不足诊断'
+        [[ ! -s "$case_tmp/query-out" ]] || fail '失败不得输出伪版本号'
+      ) || return 1
+    done
+  done
+}
+
+test_bug143_module_query_rejects_untrusted_root_cache() {
+  go() { :; }
+  id() { echo 0; }
+  _tmpdir="$case_tmp/query-tmp"
+  mkdir -p "$_tmpdir" "$case_tmp/foreign-cache"
+  DERPER_GO_BUILD_CACHE_DIR="$case_tmp/foreign-cache"
+  stat() { if [[ "$2" == %u ]]; then echo 1000; else command stat "$@"; fi; }
+  _run_with_progress() { touch "$case_tmp/query-ran"; }
+  if resolve_derper_module_version abcdef >/dev/null 2>&1; then fail 'root版本查询必须拒绝他人所有的缓存'; fi
+  [[ ! -e "$case_tmp/query-ran" ]] || fail '属主不可信时不得运行Go查询'
+  ln -s "$case_tmp/foreign-cache" "$case_tmp/cache-link"
+  DERPER_GO_BUILD_CACHE_DIR="$case_tmp/cache-link"
+  if resolve_derper_module_version abcdef >/dev/null 2>&1; then fail 'root版本查询必须拒绝链接缓存'; fi
+}
+
+test_bug143_standalone_root_query_preflights_and_preserves_cache() {
+  go() { :; }
+  id() { echo 0; }
+  stat() { if [[ "$2" == %u ]]; then echo 0; else command stat "$@"; fi; }
+  _tmpdir=''
+  DERPER_GO_BUILD_CACHE_DIR="$case_tmp/persistent-cache"
+  mkdir -p "$DERPER_GO_BUILD_CACHE_DIR"
+  printf retained >"$DERPER_GO_BUILD_CACHE_DIR/existing"
+  df() {
+    printf '%s\n' "$2" >>"$case_tmp/checked-paths"
+    printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+    printf '/dev/test 4194304 0 4194304 0%% /var/tmp\n'
+  }
+  _run_with_progress() { printf 'v1.104.4\n'; }
+  local result query_tmp
+  result=$(resolve_derper_module_version abcdef) || fail '独立root查询应创建临时目录并成功'
+  [[ "$result" == v1.104.4 ]] || fail '版本查询stdout须只含版本'
+  [[ -s "$case_tmp/checked-paths" ]] || fail '独立查询也必须运行空间预检'
+  query_tmp=$(head -n1 "$case_tmp/checked-paths")
+  [[ "$query_tmp" == /var/tmp/derper-go-query.* && ! -e "$query_tmp" ]] || fail '查询私有临时目录应在退出后清理'
+  [[ -f "$DERPER_GO_BUILD_CACHE_DIR/existing" ]] || fail '不得删除持久缓存'
+  [[ -z "$_tmpdir" ]] || fail '独立查询不得改变调用者临时目录变量'
+
+  : >"$case_tmp/checked-paths"
+  df() {
+    printf '%s\n' "$2" >>"$case_tmp/checked-paths"
+    printf 'Filesystem 1024-blocks Used Available Capacity Mounted on\n'
+    printf '/dev/test 4194304 4194304 0 100%% /var/tmp\n'
+  }
+  if resolve_derper_module_version abcdef >/dev/null 2>&1; then fail '独立查询空间不足必须失败'; fi
+  query_tmp=$(head -n1 "$case_tmp/checked-paths")
+  [[ "$query_tmp" == /var/tmp/derper-go-query.* && ! -e "$query_tmp" ]] || fail '预检失败也必须清理查询临时目录'
+  [[ -f "$DERPER_GO_BUILD_CACHE_DIR/existing" ]] || fail '预检失败不得清理持久缓存'
+}
+
 tests=(
+  test_bug143_module_query_checks_both_filesystems_before_go
+  test_bug143_module_query_rejects_untrusted_root_cache
+  test_bug143_standalone_root_query_preflights_and_preserves_cache
+  test_adj037_report_health_summary_order_and_not_installed
+  test_adj037_healthcheck_uses_stable_config_only
+  test_bug143_go_cache_is_persistent_and_space_checked
+  test_bug142_deployment_report_restores_minimum_acl_advice
+  test_bug141_region_preflight_allows_port_change_and_unknown_for_empty_input
+  test_bug139_readonly_go_cache_is_cleaned_and_empty_tmpdir_refused
+  test_bug138_scheduled_healthcheck_preserves_config_and_region
+  test_go_build_cache_stays_out_of_caller_home
+  test_bug136_independent_module_query_removes_readonly_cache
+  test_bug135_same_target_checks_explicit_ipv4
+  test_bug134_region_structure_anomalies_are_unknown
+  test_bug133_region_id_conflict_preflight
+  test_bug133_region_conflict_opt_in_is_explicit
+  test_bug130_runtime_does_not_accept_other_region_netcheck
+  test_bug131_manual_feedback_does_not_promise_background_warning
+  test_bug132_first_issue_and_existing_rotation_are_distinct
+  test_deploy_report_has_one_guide_and_actual_target
   test_b1_incomplete_marker_blocks_and_is_not_executed
   test_b1_lock_failure_blocks_second_change
   test_b1_second_process_cannot_take_lock

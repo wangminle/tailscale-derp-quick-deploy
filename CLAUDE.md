@@ -1,12 +1,12 @@
 ## 文档目录约定
 
 - `docs/` 只放产品使用文档：安装、配置、参数、日常运维和排障指南，仅描述已交付能力。
-- `plans/` 放正式需求、设计和开发实施计划；现行入口为分阶段设计 V2、WBS V2 和证书自动维护需求。调研、评估报告及原始讨论稿归入 `checkpoints/`。已完成开发并随版本交付的需求/WBS/实施计划移入 `plans/achievements/` 归档。
-- `checkpoints/` 放代码 review、检查/调研/评估报告、执行结果、部署记录、验证材料和历史快照。新的执行记录统一写入此目录，不再新建 `records/`。
+- `design/plans/` 放正式需求、设计和开发实施计划；现行入口为分阶段设计 V2、WBS V2 和证书自动维护需求。调研、评估报告及原始讨论稿归入 `design/checkpoints/`。已完成开发并随版本交付的需求/WBS/实施计划移入 `design/plans/achievements/` 归档。
+- `design/checkpoints/` 放代码 review、检查/调研/评估报告、执行结果、部署记录、验证材料和历史快照。新的执行记录统一写入此目录，不再在根目录新建 `checkpoints/` 或 `records/`。
 - 中英文版本更新日志放 `docs/CHANGELOG_CN.md`、`docs/CHANGELOG_EN.md`；实际任务状态统一记录在根目录 `task-list.md`。
 - 测试套件的分工、命名体系与运行约定见 `tests/README.md`；新增用例必须登记进所属套件的用例列表，修复缺陷按先红后绿补回归。
 - 移动现行文档时同步修正 README、计划、台账和测试中的路径；历史快照与原始记录保留原文，其中的旧路径只作为当时证据。
-- `plans/`、`checkpoints/` 沿用现有 Git 忽略规则，公开文档不要依赖其中的本地文件作为必读链接。
+- `design/plans/`、`design/checkpoints/` 沿用现有 Git 忽略规则，公开文档不要依赖其中的本地文件作为必读链接。`design/` 本身不整体忽略。
 - 任务清单、用户交互和代码 review 结论均使用中文。
 
 ## 会话结束任务同步（必须）

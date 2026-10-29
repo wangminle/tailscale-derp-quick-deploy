@@ -6,7 +6,7 @@
 
 当前工作区已在 Ubuntu 22.04/24.04 一次性 KVM 客体通过未放宽断言的正式 C/D 套件，两平台各 23 条成功输出、退出 0，包含 `success_replaced` 结束状态、恢复、停用和清理；root C 各 2 项、S2 真实权限/锁各 5 项通过。Debian WSL 补验 ShellCheck 和 root C；京东云普通用户回归及回环 TLS/STUN、用户级 systemd 实验通过。源码与测试产物摘要已核对，状态见根目录 task-list.md 的 TST-032。
 
-此次结果未覆盖真实云端策略写入、合法客户端指定 Region 转发或长效客户端兼容；GitHub 固定矩阵尚无实际运行记录。VM 中的停用场景直接调用 `apply_auto_maintain_policy`，不能单独作为 BUG-129 完整 `maintain --disable-auto-maintain` 命令的真实 VM 证据（该入口已有 D 阶段本地回归）。同样，BUG-127 的失败后重试和 BUG-128 的未来证书拒绝目前由本地回归证明。后续补验这些精确故障路径时应单独留证，不能由通用 C/D 成功外推。
+此次结果未覆盖真实云端策略写入、合法客户端指定 Region 转发或长效客户端兼容；0.2.20 提交已有[成功的 GitHub 固定矩阵记录](https://github.com/wangminle/tailscale-derp-quick-deploy/actions/runs/40688160233)，当前 0.3.0 工作区尚未由该运行覆盖。VM 中的停用场景直接调用 `apply_auto_maintain_policy`，不能单独作为 BUG-129 完整 `maintain --disable-auto-maintain` 命令的真实 VM 证据（该入口已有 D 阶段本地回归）。同样，BUG-127 的失败后重试和 BUG-128 的未来证书拒绝目前由本地回归证明。后续补验这些精确故障路径时应单独留证，不能由通用 C/D 成功外推。
 
 当前暂缺专用 Tailnet、Region 和独立客户端；第二步及后续步骤待资源就绪后执行。第一步保留为复现说明，无需因文档更新重复创建 VM。
 
@@ -38,7 +38,7 @@ cat /root/derper-evidence/cleanup.txt
 
 0才表示所选场景和清理通过；1为失败；2为环境不符/未验。失败时也取回整个evidence目录及顶层日志，不立即删除VM。应有environment.txt（系统/脚本/产物摘要）、journal.txt、generated-units、C/D产物、fingerprints与cleanup.txt。确认无残留后销毁VM并记录资源清理。D使用127.0.0.1 HTTP fixture，只证明真实systemd编排，不能作为云端GD。脚本会改默认安装路径，仅限此一次性VM。
 
-固定Ubuntu22.04/24.04的shell/root矩阵还需在实际GitHub workflow执行，保存job链接、commit/工作树摘要和日志；只改workflow不算已跑。
+固定Ubuntu22.04/24.04的shell/root矩阵须在实际GitHub workflow执行并保存job链接、commit/工作树摘要和日志。0.2.20已取得成功运行；当前0.3.0含后续修复，需提交后单独运行，不能直接沿用旧提交的结果。
 
 ## 第二步：准备隔离Tailnet和合法客户端（需要用户准备/授权）
 
@@ -70,6 +70,8 @@ sudo python3 /opt/derper-probe/h3_probe.py \
 exec /usr/bin/ssh -o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=3 \
   h3-client-a /usr/bin/python3 /opt/derper-probe/h3_probe.py --peer-ip 100.64.0.2 "$@"
 ```
+
+上述wrapper调用普通OpenSSH，不是`tailscale ssh`，不要求开启Tailscale SSH。
 
 wrapper及全部祖先root所有、不可组/其他用户写，不能链接；不要把远端凭据放在参数。探针10秒预算加SSH连接应小于产品--probe-timeout（可显式设20），两机时钟同步。使用status --external-probe /root可信wrapper --require-h3 --format json复核H3=healthy并留证；调用参数还应显式给定本次目标配置。
 

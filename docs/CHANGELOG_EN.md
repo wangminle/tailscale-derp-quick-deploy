@@ -2,6 +2,25 @@
 
 ## [Unreleased]
 
+- Complete BUG-143 preflight coverage for standalone Go module queries: enforce cache ownership/path and both filesystem space checks before starting Go; clean private query directories while retaining persistent root caches, and direct query/build work files to the preflighted temporary location.
+
+- Fix BUG-141–143: allow same-address port changes without false Region conflicts, report empty Nodes/unknown IP as unknown, restore least-privilege server guidance in output and bilingual docs, persist root Go caches on disk, move toolchain temporary files to `/var/tmp`, and check space before download.
+- Complete ADJ-037: include Region conflicts in the full check summary before a nonzero exit, use a root-managed stable config for health scheduling without duplicate CLI overrides, clarify absent schedulers and summary order, add bilingual operator acceptance guides, and stop tracking the task-list lock file.
+
+## [0.3.0] - 2026-10-29
+
+- Move local plans and execution records into `design/plans/` and `design/checkpoints/`, update current conventions/references, and keep checkpoints ignored by Git. Historical snapshots retain their original content.
+- Fix BUG-130–132: distinguish network-region discovery from target relay proof, avoid automatic temporary-identity debug probes, clarify on-demand expiry warnings, and distinguish first issuance from rotation.
+- Consolidate deployment target, verify-clients, H0–H3, fingerprint source and health scheduling in the summary. Print client guidance once and preserve existing policy rules/Regions when merging fragments.
+- Fix BUG-133–135: deploy/check read the current derpMap and block RegionIDs owned by other nodes, while allowing the same single target (including its explicit IPv4) to remain idempotent. Sharing or replacement requires explicit `--allow-region-id-conflict`. Malformed top level, Regions, Region, Nodes, or node objects are reported as unknown instead of idle or conflict.
+- Fix BUG-138: the health-check schedule inherits the absolute `--config` path and the full Region parameters used for this deployment, so a non-default Region no longer writes Region 900/my-derp to `status.json` and `config_file` is no longer null. Re-run `--install-healthcheck-cron` to update an already installed ExecStart.
+- Fix BUG-139: exit cleanup restores write permission before removing the secure temporary directory, so the read-only Go module cache is no longer left behind; installing with an uninitialized temporary directory now fails instead of writing to `/go-build`.
+- Fix BUG-137: main and review regressions pin a derpMap fixture, so main orchestration cases no longer depend on Region occupancy in the real local Tailnet.
+- Fix BUG-140: the D-stage idempotent main case pins the RegionID preflight, so Region occupancy in the real local derpMap no longer causes a false failure.
+- Show certificate expiry, remaining days, fallback symptoms, renewal entry points and notification responsibility in the deployment summary. The wizard offers explicit health-check scheduling without implying external alerts.
+- Fix BUG-136: keep Go module/build caches in the run's secure temporary directory and remove them on exit instead of touching the caller's cache. Quickstarts use the default 30399, provide real Git/tarball downloads, and explain the cosmetic `ERR-BuildInfo` display.
+- Add operator and Agent handoff guides, correct TLS terminology, obtain toolchain checksums from official Go JSON metadata, and share complete target arguments across auxiliary install/query calls. Existing nodes were not reinstalled or rotated.
+
 ## [0.2.20] - 2026-10-28
 
 - Certificate rotation retries recognize an already-published candidate after checking the target region and node. Candidates that are not yet valid are rejected, and `maintain --disable-auto-maintain` persists the disabled state and removes the schedule first.
@@ -14,7 +33,7 @@
 ## [0.2.19] - 2026-10-27
 
 - Add root C/S2 permission evidence and Python adapter regressions to the fixed Ubuntu 22.04/24.04 matrix. The manual disposable VM job requests C/D and preserves logs, generated artifacts and cleanup evidence; a missing real binary exits 2 (unverified).
-- Add D-stage real systemd maintenance scenarios with a loopback-only HTTP fixture for stable copies, due/revoked runs, restart failure recovery, reverse compensation and disabling. Cleanup also removes archived private keys. The October 26 dual Ubuntu 22.04/24.04 disposable-VM D integration failed on BUG-116. On October 28, the current working tree passed the unchanged formal C/D suite on both platforms (23 success lines each, exit 0), including the final renewal status and cleanup. The fixture does not establish cloud GD; the actual GitHub matrix run remains pending.
+- Add D-stage real systemd maintenance scenarios with a loopback-only HTTP fixture for stable copies, due/revoked runs, restart failure recovery, reverse compensation and disabling. Cleanup also removes archived private keys. The October 26 dual Ubuntu 22.04/24.04 disposable-VM D integration failed on BUG-116. On October 28, the current working tree passed the unchanged formal C/D suite on both platforms (23 success lines each, exit 0), including the final renewal status and cleanup. The fixture does not establish cloud GD. The subsequent 0.2.20 commit passed the [GitHub matrix](https://github.com/wangminle/tailscale-derp-quick-deploy/actions/runs/40688160233); the current 0.3.0 working tree still needs its own run.
 - Provide an optional independent Linux H3 adapter and real acceptance runbook. Require a single target Region, distributed/live certificate pin agreement, an actual relay round trip and a valid STUN response. Direct/other-Region paths remain unknown; real Tailnet/H3 and lifetime compatibility are pending.
 - Fix BUG-116: a scheduled `maintain` success is no longer re-registered as `recorded` by the main entry point and the unit is not reinstalled; `success_replaced` and the user's enable intent are preserved.
 - Fix BUG-117: when nothing changed but the health check fails (for example a confirmed LocalAPI failure), the default idempotent deployment no longer skips the publish gate and reports success; a failed gate exits non-zero.
@@ -835,6 +854,6 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 
 **Contributors**: Thanks to architects for professional advice
 
-**Update Date**: 2026-10-28
+**Update Date**: 2026-10-29
 
-**Version**: 0.2.20
+**Version**: 0.3.0

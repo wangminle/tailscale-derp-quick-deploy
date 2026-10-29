@@ -9,8 +9,8 @@
 set -euo pipefail
 
 # 脚本自身版本（与 docs/CHANGELOG_*.md、仓库根目录 VERSION 保持同步）
-SCRIPT_VERSION="0.2.20"
-SCRIPT_VERSION_DATE="2026-10-28"
+SCRIPT_VERSION="0.3.0"
+SCRIPT_VERSION_DATE="2026-10-29"
 
 # 默认端口
 DERP_PORT="30399"        # DERP TLS 端口
@@ -94,6 +94,7 @@ FORCE=0                  # 强制全量重装
 REPAIR=0                 # 仅修复配置（不重装 derper）
 CHECK_ONLY=0             # --check 别名（等价于 --dry-run）
 ALLOW_NON_GLOBAL_IP=0    # 是否放行私有/保留/文档等非全局可路由 IP（仅内网测试）
+ALLOW_REGION_ID_CONFLICT=0 # 是否显式允许共用/替换已占用 RegionID
 DESIRED_CONFIG_OK=0      # 当前 systemd unit 是否与本次目标参数一致
 DERPER_VERIFY_CLIENTS_EFFECTIVE=0 # 当前已部署 unit 是否启用了 -verify-clients
 CURRENT_DERPER_OWNS_PORTS=0       # 当前监听端口是否来自已运行的 derper 服务
@@ -243,7 +244,7 @@ C/D阶段入口（旧参数继续支持）：
                [--no-verify-clients | --force-verify-clients]
                [--region-id 900] [--region-code my-derp] [--region-name "My IP DERP"]
                [--user <username> | --use-current-user | --dedicated-user]
-               [--allow-non-global-ip] [--accept-cert-rotation]
+               [--allow-non-global-ip] [--allow-region-id-conflict] [--accept-cert-rotation]
                [--tls-connlimit N] [--install-healthcheck-cron]
                [--check | --dry-run] [--repair] [--force]
                [--health-check [--metrics-textfile 路径]]
@@ -257,7 +258,9 @@ C/D阶段入口（旧参数继续支持）：
   --ip                    服务器公网 IPv4（推荐显式指定），缺省自动探测。
                           正式部署必须为全局可路由的公网地址；
                           内网/保留/文档地址默认拒绝，测试需加 --allow-non-global-ip。
-  --derp-port             DERP TLS 端口，默认 30399/TCP。
+  --derp-port             DERP TLS 端口，默认 30399/TCP；可改为其他空闲 TCP 端口。
+                         云安全组/主机防火墙须放行同一端口，derpMap 的 DERPPort 须一致。
+                         443 对受限网络更友好，但可能与现有 HTTPS 服务冲突。
   --stun-port             STUN 端口，默认 3478/UDP（同时写入 derpMap 的 STUNPort）。
   --cert-days             自签临时证书有效期（天），默认 365，范围 1–365000。
   --auto-ufw              若检测到 UFW，自动放行端口规则。
@@ -269,6 +272,8 @@ C/D阶段入口（旧参数继续支持）：
   --region-id             ACL derpMap 的 RegionID（默认 900）。
   --region-code           ACL derpMap 的 RegionCode（默认 my-derp）。
   --region-name           ACL derpMap 的 RegionName（默认 "My IP DERP"）。
+  --allow-region-id-conflict  显式允许共用/替换已占用 RegionID；默认阻断其他节点冲突。
+                          多节点策略仍须人工合并并保留既有 Nodes，不能整份替换。
   --user <username>       指定运行 derper 的用户（默认：当前登录用户）。
                           可指定现有用户（如 nobody、www-data 等）。
   --use-current-user      使用当前登录用户运行 derper（sudo 下为 \$SUDO_USER，否则为当前用户；默认行为）。
@@ -569,6 +574,9 @@ parse_args() {
         require_arg_value "$1" "${2-}"
         REGION_NAME="$2"
         shift 2;;
+      --allow-region-id-conflict)
+        ALLOW_REGION_ID_CONFLICT=1
+        shift 1;;
       --accept-cert-rotation)
         ACCEPT_CERT_ROTATION=1
         shift 1;;
@@ -985,13 +993,75 @@ get_installed_derper_version() {
   normalize_version_tag "$ver"
 }
 
+go_build_cache_root() {
+  if [[ "$(id -u)" -eq 0 ]]; then
+    printf '%s\n' "${DERPER_GO_BUILD_CACHE_DIR:-/var/cache/derper-deploy/go-build}"
+  elif [[ -n "${_tmpdir:-}" ]]; then
+    printf '%s/go-build\n' "${_tmpdir}"
+  else
+    return 1
+  fi
+}
+
+prepare_go_build_root() {
+  if [[ -z "${_tmpdir:-}" || ! -d "${_tmpdir}" ]]; then
+    echo "[错误] 安全临时目录未初始化，无法检查构建空间。" >&2
+    return 1
+  fi
+  local cache_root path available min_free uid
+  cache_root=$(go_build_cache_root) || return 1
+  min_free="${DERPER_GO_MIN_FREE_KB:-1048576}"
+  [[ "$cache_root" == /* && "$cache_root" != / && ! -L "$cache_root" ]] || {
+    echo "[错误] Go 构建缓存必须为绝对路径且不能是符号链接：${cache_root}" >&2
+    return 1
+  }
+  mkdir -p "$cache_root" || return 1
+  if [[ "$(id -u)" -eq 0 ]]; then
+    uid=$(stat -c %u "$cache_root" 2>/dev/null || stat -f %u "$cache_root") || return 1
+    [[ "$uid" -eq 0 ]] || { echo "[错误] root 的 Go 构建缓存必须归 root 所有：${cache_root}" >&2; return 1; }
+  fi
+  chmod 700 "$cache_root" || return 1
+  mkdir -p "$cache_root/gopath/pkg/mod" "$cache_root/cache" "${_tmpdir}/go-work" || return 1
+  for path in "${_tmpdir}" "$cache_root"; do
+    available=$(df -Pk "$path" 2>/dev/null | awk 'NR == 2 {print $4}')
+    if [[ ! "$available" =~ ^[0-9]+$ ]] || ! _decimal_ge "$available" "$min_free"; then
+      echo "[错误] Go 构建空间不足：${path} 可用=${available:-未知}KiB，至少需要 ${min_free}KiB。请清理磁盘或调整缓存位置。" >&2
+      return 1
+    fi
+  done
+}
+
 # 使用与构建一致的模块环境解析 commit；查询失败时保守重装，不冒充已对齐。
 resolve_derper_module_version() {
   command -v go >/dev/null 2>&1 || return 1
-  local envs=("GO111MODULE=on" "GOTOOLCHAIN=${GOTOOLCHAIN_ARG}" "GIT_TERMINAL_PROMPT=0")
-  [[ -z "$GOPROXY_ARG" ]] || envs+=("GOPROXY=$GOPROXY_ARG")
-  [[ -z "$GOSUMDB_ARG" ]] || envs+=("GOSUMDB=$GOSUMDB_ARG")
-  _run_with_progress '解析 derper 同源版本' /dev/null 60 env "${envs[@]}" go list -m -f '{{.Version}}' "tailscale.com@$1"
+  # go list 也可能自动下载工具链；必须与构建入口共用空间和缓存安全预检。
+  # 独立调用时仅创建查询临时目录，不改变调用者的 _tmpdir 或删除持久缓存。
+  local _tmpdir="${_tmpdir:-}" go_build_root owns_tmp=0 rc=0
+  if [[ -z "$_tmpdir" ]]; then
+    _tmpdir=$(mktemp -d /var/tmp/derper-go-query.XXXXXXXXXX) || return 1
+    owns_tmp=1
+  fi
+  if prepare_go_build_root; then
+    go_build_root=$(go_build_cache_root) || rc=$?
+    if [[ "$rc" -eq 0 ]]; then
+      local envs=("GO111MODULE=on" "GOTOOLCHAIN=${GOTOOLCHAIN_ARG}" "GIT_TERMINAL_PROMPT=0"
+        "GOPATH=${go_build_root}/gopath" "GOMODCACHE=${go_build_root}/gopath/pkg/mod" "GOCACHE=${go_build_root}/cache"
+        "GOTMPDIR=${_tmpdir}/go-work" "TMPDIR=${_tmpdir}")
+      [[ -z "$GOPROXY_ARG" ]] || envs+=("GOPROXY=$GOPROXY_ARG")
+      [[ -z "$GOSUMDB_ARG" ]] || envs+=("GOSUMDB=$GOSUMDB_ARG")
+      _run_with_progress '解析 derper 同源版本' /dev/null 60 env "${envs[@]}" go list -m -f '{{.Version}}' "tailscale.com@$1" || rc=$?
+    fi
+  else
+    rc=$?
+  fi
+  if [[ "$owns_tmp" -ne 0 ]]; then
+    chmod -R u+w "$_tmpdir" 2>/dev/null || true
+    if ! rm -rf "$_tmpdir"; then
+      echo "[警告] 无法完全清理查询临时目录：${_tmpdir}" >&2
+      [[ "$rc" -ne 0 ]] || rc=1
+    fi
+  fi
+  return "$rc"
 }
 
 # 判断是否需要安装/重装 derper：缺失、或目标版本（非 latest）与已安装不一致。
@@ -1222,6 +1292,106 @@ validate_settings() {
   TLS_CONNLIMIT=$(_decimal_norm "${TLS_CONNLIMIT:-0}")
 }
 
+precheck_region_id_conflict() {
+  if [[ -z "${IP_ADDR:-}" ]]; then
+    echo "[警告] 无法确认 Region ${REGION_ID} 是否已占用：本次公网 IP 未确定。" >&2
+    return 2
+  fi
+  if ! command -v tailscale >/dev/null 2>&1 || ! command -v python3 >/dev/null 2>&1; then
+    echo "[警告] 无法确认 Region ${REGION_ID} 是否已占用：需要 tailscale 与 python3。部署可继续，但合并策略前必须人工核对。" >&2
+    return 2
+  fi
+  local map="" rc=0
+  map=$(_timeout_run 10 tailscale debug derp-map 2>/dev/null) || rc=$?
+  if [[ "$rc" -ne 0 || -z "$map" ]]; then
+    echo "[警告] 无法确认 Region ${REGION_ID} 是否已占用：tailscale debug derp-map 读取失败。部署可继续，但合并策略前必须人工核对。" >&2
+    return 2
+  fi
+
+  local map_file result="" parse_rc=0
+  map_file=$(mktemp "${_tmpdir:-/tmp}/derp-map.XXXXXXXXXX") || {
+    echo "[警告] 无法确认 Region ${REGION_ID} 是否已占用：无法创建临时解析文件。" >&2
+    return 2
+  }
+  printf '%s\n' "$map" >"$map_file"
+  result=$(python3 - "$map_file" "$REGION_ID" "$IP_ADDR" "$DERP_PORT" "$STUN_PORT" 2>/dev/null <<'PY'
+import json
+import sys
+
+try:
+    map_file, rid, host, derp_port, stun_port = sys.argv[1:6]
+    with open(map_file, encoding="utf-8") as stream:
+        data = json.load(stream)
+    if not isinstance(data, dict):
+        raise ValueError("derpMap is not an object")
+    regions = data.get("Regions")
+    if not isinstance(regions, dict):
+        raise ValueError("Regions is not an object")
+    region_key = str(int(rid))
+    if region_key not in regions:
+        sys.exit(0)
+    region = regions[region_key]
+    if not isinstance(region, dict) or not isinstance(region.get("Nodes"), list):
+        raise ValueError("region Nodes is not an array")
+    nodes = region["Nodes"]
+    if any(not isinstance(node, dict) for node in nodes):
+        raise ValueError("region node is not an object")
+    if not nodes:
+        sys.exit(4)
+
+    def port(value, default):
+        try:
+            return int(value or default)
+        except (TypeError, ValueError):
+            return -1
+
+    same_identity = len(nodes) == 1 and (
+        nodes[0].get("HostName") == host
+        and nodes[0].get("IPv4", host) == host
+    )
+    if same_identity:
+        same_ports = (
+            port(nodes[0].get("DERPPort"), 443) == int(derp_port)
+            and port(nodes[0].get("STUNPort"), 3478) == int(stun_port)
+        )
+        sys.exit(0 if same_ports else 3)
+    names = [str(n.get("HostName", "?")) for n in nodes if isinstance(n, dict)]
+    print("Region %s 已被 %d 个节点占用：%s" % (rid, len(nodes), ", ".join(names) or "未列出节点"))
+    sys.exit(1)
+except (ValueError, TypeError, json.JSONDecodeError):
+    sys.exit(2)
+PY
+) || parse_rc=$?
+  rm -f "$map_file"
+
+  case "$parse_rc" in
+    0)
+      echo "[信息] Region ${REGION_ID} 未发现冲突，或为本次相同的唯一节点目标。"
+      return 0
+      ;;
+    3)
+      echo "[信息] Region ${REGION_ID} 的唯一节点与本次地址相同，仅端口配置变化；允许部署，但须同步控制面 DERPPort/STUNPort。"
+      return 0
+      ;;
+    4)
+      echo "[警告] 无法确认 Region ${REGION_ID} 是否已占用：Region 已存在但 Nodes 为空，请人工核对后再合并。" >&2
+      return 2
+      ;;
+    1)
+      if [[ "${ALLOW_REGION_ID_CONFLICT:-0}" -eq 1 ]]; then
+        echo "[警告] ${result}；已显式放行 RegionID 冲突。合并策略时必须保留需要共存的 Nodes，或自行承担替换后果。" >&2
+        return 0
+      fi
+      echo "[错误] RegionID 冲突：${result}。请改用未占用的 --region-id；确需共用或替换时，先规划策略合并并显式添加 --allow-region-id-conflict。" >&2
+      return 1
+      ;;
+    *)
+      echo "[警告] 无法确认 Region ${REGION_ID} 是否已占用：derpMap 格式无法可靠解析。部署可继续，但合并策略前必须人工核对。" >&2
+      return 2
+      ;;
+  esac
+}
+
 detect_public_ip() {
   # 自动探测公网 IP（失败则需 --ip 指定）
   if [[ -z "${IP_ADDR}" ]]; then
@@ -1397,7 +1567,8 @@ ts_commit() {
     | grep -E '^[0-9a-f]{7,40}$' || true
 }
 
-# 当前 SSH 是否走 Tailscale（CGNAT 100.64/10 或 fd7a:115c:a1e0::/48）。
+# 当前 SSH 传输是否走 Tailnet（含普通 OpenSSH；不表示启用了 Tailscale SSH）。
+# 本脚本不调用 tailscale ssh、不启用 --ssh，也不修改已有 SSH 服务或 RunSSH 设置。
 ssh_session_via_tailscale() {
   [[ -n "${SSH_CONNECTION:-}" ]] || return 1
   local src
@@ -1405,7 +1576,7 @@ ssh_session_via_tailscale() {
   [[ "$src" == 100.* || "$src" == fd7a:115c:a1e0:* ]]
 }
 
-# 重启 tailscaled.socket 以使 drop-in 生效。经由 Tailscale 的 SSH 会话会因此断开，默认跳过。
+# 重启 tailscaled.socket 以使 drop-in 生效。经 Tailnet 传输的 OpenSSH 也可能受影响，默认跳过。
 restart_tailscaled_socket_unit() {
   if ssh_session_via_tailscale; then
     echo "[警告] 检测到当前 SSH 连接可能经由 Tailscale（${SSH_CONNECTION%% *}）。" >&2
@@ -1893,6 +2064,14 @@ cert_days_remaining() {
   fi
   [[ -n "$ts_end" ]] || { echo ""; return 0; }
   echo $(( (ts_end - ts_now) / 86400 ))
+}
+
+cert_not_after() {
+  command -v openssl >/dev/null 2>&1 || return 0
+  local cert_pem
+  cert_pem=$(resolve_disk_cert_pem 2>/dev/null || true)
+  [[ -n "$cert_pem" && -f "$cert_pem" ]] || return 0
+  openssl x509 -in "$cert_pem" -noout -enddate 2>/dev/null | awk -F= '{print $2}'
 }
 
 install_deps() {
@@ -3204,14 +3383,23 @@ import_local_derper() {
 install_derper() {
   if [[ -n "${LOCAL_BINARY:-}" ]]; then import_local_derper || return 1; return 0; fi
   echo "[步骤] 安装/构建 derper 可执行文件…"
+  # root 的 Go 依赖与编译缓存持久保存在磁盘；工具链和事务文件使用安全临时目录。
+  if [[ -z "${_tmpdir:-}" || ! -d "${_tmpdir}" ]]; then
+    echo "[错误] 内部错误：安全临时目录未初始化，已中止构建，未改动现有二进制。" >&2
+    exit 1
+  fi
+  prepare_go_build_root || exit 1
   precheck_go_network || exit 1
   ensure_go
-  local candidate_dir
+  local candidate_dir go_build_root
   candidate_dir="$(deploy_state_root)/candidate"
-  mkdir -p "$candidate_dir" || exit 1
+  go_build_root=$(go_build_cache_root) || exit 1
+  mkdir -p "$candidate_dir" "$go_build_root/gopath/pkg/mod" "$go_build_root/cache" || exit 1
   rm -f "${candidate_dir}/derper"
   export GOBIN="${candidate_dir}"
-  local envs=("GOBIN=${candidate_dir}" "GO111MODULE=on" "GOTOOLCHAIN=${GOTOOLCHAIN_ARG}")
+  local envs=("GOBIN=${candidate_dir}" "GO111MODULE=on" "GOTOOLCHAIN=${GOTOOLCHAIN_ARG}"
+    "GOPATH=${go_build_root}/gopath" "GOMODCACHE=${go_build_root}/gopath/pkg/mod" "GOCACHE=${go_build_root}/cache"
+    "GOTMPDIR=${_tmpdir}/go-work" "TMPDIR=${_tmpdir}")
   if [[ -n "${GOPROXY_ARG}" ]]; then envs+=("GOPROXY=${GOPROXY_ARG}"); fi
   if [[ -n "${GOSUMDB_ARG}" ]]; then envs+=("GOSUMDB=${GOSUMDB_ARG}"); fi
   echo "[信息] 安装 derper 版本：${DERPER_VERSION}"
@@ -4421,12 +4609,13 @@ print_auto_maintain_feedback() {
     unknown)
       echo "云端检查超时/授权状态无法确认/维护执行条件未就绪，目前不能承诺自动更新。"
       echo "请查看原因后重试；也可按下面的人工步骤处理。不要把当前状态当成确定的授权结论。"
-      print_client_verify_steps
+      [[ "${DEPLOY_CLIENT_GUIDANCE_PRINTED:-0}" == 1 ]] || print_client_verify_steps
       ;;
     *)
-      echo "未配置云端自动维护授权/当前凭据只读，因此没有启用自动换证。请按以下步骤完成 Tailnet 配置；临期仍会提示。"
+      echo "未配置云端自动维护授权/当前凭据只读，因此没有启用自动换证。"
+      echo "到期提示仅在执行检查时输出；如需周期检查，请显式配置 --install-healthcheck-cron 并核对 timer/cron。当前没有站外通知。"
       echo "片段已保存：$(cert_rotation_snippet_path 2>/dev/null || echo 见部署输出)。"
-      print_client_verify_steps
+      [[ "${DEPLOY_CLIENT_GUIDANCE_PRINTED:-0}" == 1 ]] || print_client_verify_steps
       ;;
   esac
 }
@@ -5150,7 +5339,11 @@ ensure_compatible_certs() {
       return 0
     fi
   fi
-  echo "[警告] 即将重签证书：CertName 指纹会变化，请同步更新 ACL。" >&2
+  if [[ "${CERT_PRESENT:-0}" == 1 ]]; then
+    echo "[警告] 即将重签证书：CertName 指纹会变化，请同步更新 ACL。" >&2
+  else
+    echo "[信息] 首次签发证书：将生成本节点 CertName，部署后需合并到 Tailnet 策略。"
+  fi
   generate_selfsigned_cert || return 1
   CERTS_CHANGED=1
   return 0
@@ -6027,8 +6220,8 @@ EOT
 
   if command -v systemd-analyze >/dev/null 2>&1; then
     echo ""
-    echo "[信息] systemd 安全评分："
-    systemd-analyze security derper.service 2>/dev/null | head -20 || true
+    echo "[信息] systemd 安全评分摘要（详细项：systemd-analyze security derper.service）："
+    systemd-analyze security derper.service 2>/dev/null | tail -1 || true
   fi
 }
 
@@ -6333,42 +6526,68 @@ systemd_escape_arg() {
 render_healthcheck_commands() {
   local prog="$1" ip="$2" metrics="$3"
   local cron_prog cron_ip cron_metrics cron_port cron_stun cron_level cron_verify non_global_arg=""
-  if [[ "${ALLOW_NON_GLOBAL_IP:-0}" -eq 1 ]]; then
-    non_global_arg=" --allow-non-global-ip"
+  local scheduler_config="${4:-${CONFIG_FILE:-}}" cron_config="" sys_config="" config_dir=""
+  if [[ -n "$scheduler_config" ]]; then
+    if [[ "$scheduler_config" != /* ]]; then
+      if ! config_dir=$(cd "$(dirname "$scheduler_config")" 2>/dev/null && pwd -P); then
+        echo "[错误] 无法解析健康检查配置文件目录：${scheduler_config}（调度命令不能使用相对路径）" >&2
+        return 1
+      fi
+      scheduler_config="${config_dir}/$(basename "$scheduler_config")"
+    fi
+    printf -v cron_config ' --config %q' "$scheduler_config"
+    sys_config=" --config $(systemd_escape_arg "$scheduler_config")"
   fi
   cron_prog=$(printf '%q' "$prog")
-  cron_ip=$(printf '%q' "$ip")
   cron_metrics=$(printf '%q' "$metrics")
-  cron_port=$(printf '%q' "${DERP_PORT}")
-  cron_stun=$(printf '%q' "${STUN_PORT}")
-  cron_level=$(printf '%q' "${SECURITY_LEVEL}")
-  if [[ "${VERIFY_CLIENTS_MODE}" == "off" ]]; then
-    cron_verify="--no-verify-clients"
-  else
-    cron_verify="--force-verify-clients"
-  fi
-  BASH_HEALTHCHECK_CMD="bash ${cron_prog} --health-check --ip ${cron_ip} --derp-port ${cron_port} --stun-port ${cron_stun} --security-level ${cron_level} ${cron_verify}${non_global_arg} --metrics-textfile ${cron_metrics}"
-
-  local sys_prog sys_ip sys_metrics sys_port sys_stun sys_level
+  local sys_prog sys_metrics
   sys_prog=$(systemd_escape_arg "$prog")
-  sys_ip=$(systemd_escape_arg "$ip")
   sys_metrics=$(systemd_escape_arg "$metrics")
-  sys_port=$(systemd_escape_arg "${DERP_PORT}")
-  sys_stun=$(systemd_escape_arg "${STUN_PORT}")
-  sys_level=$(systemd_escape_arg "${SECURITY_LEVEL}")
-  SYSTEMD_HEALTHCHECK_EXEC="/bin/bash ${sys_prog} --health-check --ip ${sys_ip} --derp-port ${sys_port} --stun-port ${sys_stun} --security-level ${sys_level} ${cron_verify}${non_global_arg} --metrics-textfile ${sys_metrics}"
+  if [[ -n "$scheduler_config" ]]; then
+    BASH_HEALTHCHECK_CMD="bash ${cron_prog}${cron_config} --health-check --metrics-textfile ${cron_metrics}"
+    SYSTEMD_HEALTHCHECK_EXEC="/bin/bash ${sys_prog}${sys_config} --health-check --metrics-textfile ${sys_metrics}"
+  else
+    if [[ "${ALLOW_NON_GLOBAL_IP:-0}" -eq 1 ]]; then
+      non_global_arg=" --allow-non-global-ip"
+    fi
+    cron_ip=$(printf '%q' "$ip")
+    cron_port=$(printf '%q' "${DERP_PORT}")
+    cron_stun=$(printf '%q' "${STUN_PORT}")
+    cron_level=$(printf '%q' "${SECURITY_LEVEL}")
+    if [[ "${VERIFY_CLIENTS_MODE}" == "off" ]]; then
+      cron_verify="--no-verify-clients"
+    else
+      cron_verify="--force-verify-clients"
+    fi
+    BASH_HEALTHCHECK_CMD="bash ${cron_prog} --health-check --ip ${cron_ip} --derp-port ${cron_port} --stun-port ${cron_stun} --security-level ${cron_level} ${cron_verify}${non_global_arg} --metrics-textfile ${cron_metrics}"
+    local sys_ip sys_port sys_stun sys_level
+    sys_ip=$(systemd_escape_arg "$ip")
+    sys_port=$(systemd_escape_arg "${DERP_PORT}")
+    sys_stun=$(systemd_escape_arg "${STUN_PORT}")
+    sys_level=$(systemd_escape_arg "${SECURITY_LEVEL}")
+    SYSTEMD_HEALTHCHECK_EXEC="/bin/bash ${sys_prog} --health-check --ip ${sys_ip} --derp-port ${sys_port} --stun-port ${sys_stun} --security-level ${sys_level} ${cron_verify}${non_global_arg} --metrics-textfile ${sys_metrics}"
+  fi
   local extra flag val
   for flag in state-file external-probe; do
+    [[ -z "$scheduler_config" || "$flag" == state-file ]] || continue
     case "$flag" in state-file) val=$HEALTH_STATE_FILE ;; *) val=$EXTERNAL_PROBE ;; esac
     [[ -n "$val" ]] || continue
     printf -v extra '%q' "$val"
     BASH_HEALTHCHECK_CMD+=" --$flag $extra"
     SYSTEMD_HEALTHCHECK_EXEC+=" --$flag $(systemd_escape_arg "$val")"
   done
-  if [[ -n "$EXTERNAL_PROBE" || "$REQUIRE_H3" == 1 ]]; then
-    BASH_HEALTHCHECK_CMD+=" --probe-timeout $PROBE_TIMEOUT --probe-max-age $PROBE_MAX_AGE --region-id $REGION_ID"
-    SYSTEMD_HEALTHCHECK_EXEC+=" --probe-timeout $PROBE_TIMEOUT --probe-max-age $PROBE_MAX_AGE --region-id $REGION_ID"
-    if [[ "$REQUIRE_H3" == 1 ]]; then BASH_HEALTHCHECK_CMD+=' --require-h3'; SYSTEMD_HEALTHCHECK_EXEC+=' --require-h3'; fi
+  if [[ -z "$scheduler_config" ]]; then
+    local cron_region_id cron_region_code cron_region_name
+    cron_region_id=$(printf '%q' "$REGION_ID")
+    cron_region_code=$(printf '%q' "$REGION_CODE")
+    cron_region_name=$(printf '%q' "$REGION_NAME")
+    BASH_HEALTHCHECK_CMD+=" --region-id $cron_region_id --region-code $cron_region_code --region-name $cron_region_name"
+    SYSTEMD_HEALTHCHECK_EXEC+=" --region-id $(systemd_escape_arg "$REGION_ID") --region-code $(systemd_escape_arg "$REGION_CODE") --region-name $(systemd_escape_arg "$REGION_NAME")"
+    if [[ -n "$EXTERNAL_PROBE" || "$REQUIRE_H3" == 1 ]]; then
+      BASH_HEALTHCHECK_CMD+=" --probe-timeout $PROBE_TIMEOUT --probe-max-age $PROBE_MAX_AGE"
+      SYSTEMD_HEALTHCHECK_EXEC+=" --probe-timeout $PROBE_TIMEOUT --probe-max-age $PROBE_MAX_AGE"
+      if [[ "$REQUIRE_H3" == 1 ]]; then BASH_HEALTHCHECK_CMD+=' --require-h3'; SYSTEMD_HEALTHCHECK_EXEC+=' --require-h3'; fi
+    fi
   fi
 }
 
@@ -6501,6 +6720,7 @@ rollback_healthcheck_transaction() {
   restore_healthcheck_snapshot "$dest" "${tx_dir}/dest.bak" "${tx_dir}/dest.missing" 755 || failed=1
   restore_healthcheck_snapshot "$cron_file" "${tx_dir}/cron.bak" "${tx_dir}/cron.missing" 644 || failed=1
   restore_healthcheck_snapshot "${stable}/status" "${tx_dir}/status.bak" "${tx_dir}/status.missing" || failed=1
+  restore_healthcheck_snapshot "${stable}/target.conf" "${tx_dir}/config.bak" "${tx_dir}/config.missing" 600 || failed=1
   if [[ "$failed" -eq 0 ]] && ! restore_recorded_timer_runtime "$tx_dir"; then
     echo "[错误] 无法恢复原 timer 运行状态，已保留快照：${tx_dir}" >&2
     failed=1
@@ -6526,7 +6746,7 @@ finish_healthcheck_rollback() {
 
 install_healthcheck_cron() {
   local HEALTH_STATE_FILE="${HEALTH_STATE_FILE:-$(deploy_state_root)/health/status.json}"
-  local self ip metrics stable dest
+  local self ip metrics stable dest stable_config="" source_config="" config_dir
   self=$(script_self_path)
   if [[ ! -f "$self" ]]; then
     echo "[错误] 无法定位可重复执行的脚本文件（当前路径：${self}）。curl | bash 无法写入可靠 cron，请先把脚本保存到磁盘后再使用 --install-healthcheck-cron。" >&2
@@ -6544,9 +6764,20 @@ install_healthcheck_cron() {
   fi
   mkdir -p "$stable" || return 1
   dest="${stable}/deploy_derper_ip_selfsigned.sh"
+  if [[ -n "${CONFIG_FILE:-}" ]]; then
+    source_config="$CONFIG_FILE"
+    if [[ "$source_config" != /* ]]; then
+      config_dir=$(cd "$(dirname "$source_config")" 2>/dev/null && pwd -P) || {
+        echo "[错误] 无法解析健康检查配置文件目录：${source_config}" >&2
+        return 1
+      }
+      source_config="${config_dir}/$(basename "$source_config")"
+    fi
+    stable_config="${stable}/target.conf"
+  fi
 
   local BASH_HEALTHCHECK_CMD="" SYSTEMD_HEALTHCHECK_EXEC=""
-  render_healthcheck_commands "$dest" "$ip" "$metrics"
+  render_healthcheck_commands "$dest" "$ip" "$metrics" "$stable_config" || return 1
 
   local unit_dir="${HEALTHCHECK_UNIT_DIR:-/etc/systemd/system}"
   local svc_file="${unit_dir}/derper-healthcheck.service"
@@ -6568,6 +6799,10 @@ install_healthcheck_cron() {
     if ! snapshot_healthcheck_file "$dest" "${tx_dir}/dest.bak" "${tx_dir}/dest.missing" \
       || ! snapshot_healthcheck_file "${stable}/status" "${tx_dir}/status.bak" "${tx_dir}/status.missing" \
       || ! snapshot_healthcheck_file "$cron_file" "${tx_dir}/cron.bak" "${tx_dir}/cron.missing"; then
+      rm -rf "$tx_dir" 2>/dev/null || true
+      return 1
+    fi
+    if [[ -n "$stable_config" ]] && ! snapshot_healthcheck_file "$stable_config" "${tx_dir}/config.bak" "${tx_dir}/config.missing"; then
       rm -rf "$tx_dir" 2>/dev/null || true
       return 1
     fi
@@ -6595,6 +6830,16 @@ install_healthcheck_cron() {
   if ! cp -f "$self" "$dest_tmp" 2>/dev/null || ! chmod 755 "$dest_tmp" 2>/dev/null || ! mv -f "$dest_tmp" "$dest" 2>/dev/null; then
     rm -f "$dest_tmp" 2>/dev/null || true
     finish_healthcheck_rollback "无法安装健康检查稳定副本程序" "$tx_dir" "$dest" "$stable" "$svc_file" "$timer_file" "$cron_file" || return 1
+  fi
+
+  if [[ -n "$stable_config" ]]; then
+    local config_tmp
+    config_tmp=$(mktemp "${stable}/.derper-healthcheck-config.XXXXXX" 2>/dev/null || true)
+    [[ -z "$config_tmp" ]] && config_tmp="${stable_config}.tmp.$$"
+    if ! cp -f "$source_config" "$config_tmp" 2>/dev/null || ! chmod 600 "$config_tmp" 2>/dev/null || ! mv -f "$config_tmp" "$stable_config" 2>/dev/null; then
+      rm -f "$config_tmp" 2>/dev/null || true
+      finish_healthcheck_rollback "无法安装健康检查稳定配置副本" "$tx_dir" "$dest" "$stable" "$svc_file" "$timer_file" "$cron_file" || return 1
+    fi
   fi
 
   if [[ "$use_timer" -eq 1 ]]; then
@@ -6725,11 +6970,11 @@ purge_healthcheck_program() {
     [[ -e "$stable" || -L "$stable" ]] || continue
     refuse_symlink "$stable" || return 1
     [[ -d "$stable" ]] || { echo "[错误] 健康检查副本路径不是目录：${stable}" >&2; return 1; }
-    if ! rm -f -- "${stable}/deploy_derper_ip_selfsigned.sh" "${stable}/status"; then
-      echo "[错误] 无法删除健康检查稳定副本或状态：${stable}" >&2
+    if ! rm -f -- "${stable}/deploy_derper_ip_selfsigned.sh" "${stable}/status" "${stable}/target.conf"; then
+      echo "[错误] 无法删除健康检查稳定副本、配置或状态：${stable}" >&2
       return 1
     fi
-    if [[ -e "${stable}/deploy_derper_ip_selfsigned.sh" || -L "${stable}/deploy_derper_ip_selfsigned.sh" || -e "${stable}/status" || -L "${stable}/status" ]]; then
+    if [[ -e "${stable}/deploy_derper_ip_selfsigned.sh" || -L "${stable}/deploy_derper_ip_selfsigned.sh" || -e "${stable}/status" || -L "${stable}/status" || -e "${stable}/target.conf" || -L "${stable}/target.conf" ]]; then
       echo "[错误] 健康检查稳定副本或状态仍有残留：${stable}" >&2
       return 1
     fi
@@ -6801,7 +7046,7 @@ print_firewall_tips() {
   echo ""
   echo "[建议] 主机加固（公网中继关键项）："
   echo "  - 云安全组入方向只放行 ${DERP_PORT}/tcp 与 ${STUN_PORT}/udp；其余端口（尤其 22/tcp）不要对 0.0.0.0/0 开放。"
-  echo "  - SSH 优先走 Tailscale（sshd 只监听 tailscale IP），并保留云厂商 VNC/控制台兜底；"
+  echo "  - 管理连接使用系统 OpenSSH（sshd）经 Tailnet 传输，不启用 Tailscale SSH；保留云厂商 VNC/控制台兜底；"
   echo "    或至少限源 IP + 禁用密码登录（PasswordAuthentication no）。"
   echo "  - 出方向不要收紧：tailscaled 需要访问控制面与官方 DERP/STUN 做探测（netcheck/升级）。"
   echo "  - 单机单用途：本机只跑 derper + tailscaled，减少暴露面。"
@@ -6842,19 +7087,13 @@ runtime_checks() {
     echo "  [提示] 未找到 nc，跳过 UDP 探测。"
   fi
 
-  echo "- DERP/STUN 协议级诊断（若工具可用）："
-  local derp_probe_done=0
+  echo "- 网络区域探测（不等于合法客户端中继验收）："
   if command -v tailscale >/dev/null 2>&1; then
-    if tailscale debug derp 2>/dev/null | head -n 40; then
-      derp_probe_done=1
-    elif tailscale netcheck 2>/dev/null | sed -n '1,40p'; then
-      derp_probe_done=1
-    fi
+    tailscale netcheck 2>/dev/null | sed -n '1,40p' || true
   fi
-  if [[ "$derp_probe_done" -ne 1 ]]; then
-    echo "  [提示] 本检查仅覆盖端口监听与 TLS 握手，不等于完整 DERP/STUN/Tailnet 连通性验证。"
-    echo "         建议在客户端执行：tailscale debug derp / tailscale netcheck / derpprobe"
-  fi
+  echo "  [未验范围] netcheck 的成功或最近区域不等于 Region ${REGION_ID} 的合法客户端中继往返。"
+  echo "  [下一步] 核对客户端下发配置，再运行独立合法客户端 H3 探针；当前快速自检不报告 H3 通过。"
+  echo "  [说明] debug derp 使用临时身份，verify-clients 开启时可能被正常拒绝，不自动执行。"
 }
 
 # 从 ss -tulnp 或 netstat -tulnp 的混合输出中取出一种协议上的一个端口。
@@ -6979,7 +7218,7 @@ check_extra_attack_surface() {
     printf '%s\n' "$EXTRA_LISTENERS" | sed 's/^/  - /' >&2
     echo "  公网 DERP 服务器建议单机单用途；每个额外端口都会扩大暴露面。" >&2
     if printf '%s\n' "$EXTRA_LISTENERS" | grep -qE '(^|:)22$|^\[::\]:22$'; then
-      echo "  尤其注意 22/tcp（SSH）：建议云安全组不要对 0.0.0.0/0 放行，SSH 优先走 Tailscale 或限源 IP。" >&2
+      echo "  尤其注意 SSH 端口：使用系统 OpenSSH 经 Tailnet 传输或限源 IP，不启用 Tailscale SSH。" >&2
     fi
   fi
   return 0
@@ -7042,14 +7281,17 @@ JSON
 print_client_verify_steps() {
   cat <<EOF
 ============================== 客户端验证步骤（在同一 Tailnet 的任意设备上执行） ==============================
-1) 更新 ACL：把上面的 derpMap 片段粘贴到管理后台 Access Controls 并保存；
+1) 合并策略：上面仅是本节点片段，不是完整策略替换文件。
+   - 保留现有 grants、ssh、其他规则和 Regions；只合并本次节点，先核对 Region ${REGION_ID} 无冲突。
+   - 上游 derper 日志中的 Region 900 可能只是示例；以本次脚本生成的 Region ${REGION_ID} 为准。
    - 若你修改了端口，请同步更新 "DERPPort" 与 "STUNPort"。
    - 保存后等待 10~60 秒，客户端会自动拉取最新 derpMap。
 
 2) 在客户端验证：
    - 查看 DERP 拓扑：
        tailscale netcheck | sed -n '1,160p'
-     观察 "DERP latency" / 自定义 Region 是否出现你的自建节点（延迟应较低）。
+     观察目标 Region ${REGION_ID} / ${REGION_CODE} 是否出现；这只证明区域探测，不证明中继往返。
+   - 确认实际下发配置：tailscale debug derp-map（核对 IP、端口和 CertName）。
 
    - 查看连接状态：
        tailscale status
@@ -7058,16 +7300,20 @@ print_client_verify_steps() {
 3) UDP STUN 探测（可选）：
    - 在 Linux/macOS 客户端上可运行：
        nc -zvu <你的公网IP> ${STUN_PORT}
-     若显示 succeeded / open，一般表示 STUN 端口可达（注意：nc -zvu 可能假阳性）。
-   - 更可靠：使用上游工具 stunc / derpprobe，或：
-       tailscale debug derp
-       tailscale netcheck
+     succeeded / open 也可能是假阳性，不作为 STUN 验收通过条件。
+   - 用 stunc、已正确配置的 derpprobe 或 scripts/h3_probe.py 验证真实 STUN Binding 响应。
+   - debug derp 使用随机临时身份，verify-clients 开启时可能被正常拒绝，不能代替合法客户端。
 
-4) 常见排查：
+4) 完整中继验收（H3）：
+   - 在独立合法 Linux 客户端按 docs/ACCEPTANCE_CN.md 运行 h3_probe.py，指定 Region ${REGION_ID} 和合法对端。
+   - 必须同时核对下发配置、在线证书、指定 Region 的真实往返及 STUN；直连/其他区域记为未验，不是 DERP 故障。
+   - Windows 实证需保留自己的指定区域往返；不要为了出结果全局封 UDP 或关闭 verify-clients。
+
+5) 常见排查：
    - derper 启动失败：journalctl -u derper -f 查看报错（证书路径/端口占用/参数）。
    - 证书文件名：derper manual 模式读取 /opt/derper/certs/<公网IP>.crt 与 .key。
    - 客户端未走你的 DERP：确认 derpMap 已保存、HostName 为公网 IP、CertName 指纹与在线证书一致。
-   - 自动重签会改变 CertName：请先更新 ACL 再重启服务，或接受短暂中断后粘贴新指纹。
+   - 证书轮换会改变 CertName：按 prepare/apply 流程安排策略同步与切换窗口；默认不自动换证。
    - 端口被拦截：确认云安全组/本机防火墙已放行 ${DERP_PORT}/tcp 与 ${STUN_PORT}/udp。
 =========================================================================================================
 EOF
@@ -7825,7 +8071,7 @@ EOT
 
 EOT
 
-  local scenario="" account_pref="" port_choice="" verify_choice="" region_choice=""
+  local scenario="" account_pref="" port_choice="" verify_choice="" region_choice="" health_choice=""
   local execute="" user_ip="" final_confirm=""
 
   # 问题1：使用场景
@@ -7845,8 +8091,10 @@ EOT
   # 问题3：端口选择
   echo ""
   echo "3. DERP 端口？"
-  echo "   a) 443（推荐，防火墙友好）"
+  echo "   a) 443（对受限网络更友好，可能与 HTTPS 服务冲突）"
   echo "   b) 30399（默认，避免与其他服务冲突）"
+  echo "   也可在生成的命令中用 --derp-port 指定其他空闲 TCP 端口。"
+  echo "   云安全组/主机防火墙与 derpMap 的 DERPPort 必须使用同一端口。"
   port_choice=$(wizard_read_choice "   请选择 (a/b): " "ab") || return 1
   
   # 问题4：客户端验证
@@ -7862,6 +8110,14 @@ EOT
   echo "   a) 是（推荐，配置 goproxy.cn）"
   echo "   b) 否（全球环境）"
   region_choice=$(wizard_read_choice "   请选择 (a/b): " "ab") || return 1
+
+  # 问题6：周期健康检查
+  echo ""
+  echo "6. 是否安装每 5 分钟的本机健康检查？"
+  echo "   a) 是（长期运行推荐，记录状态与 Prometheus 指标）"
+  echo "   b) 否（仅人工执行检查）"
+  echo "   健康检查不等于自动换证，当前没有站外通知；告警须另行配置。"
+  health_choice=$(wizard_read_choice "   请选择 (a/b): " "ab") || return 1
   
   # 生成命令（使用模板替换，不用 eval）
   # 注意：每个参数必须是独立的数组元素，以便 exec 正确执行
@@ -7902,6 +8158,7 @@ EOT
   
   # 自动防火墙
   cmd_parts+=("--auto-ufw")
+  [[ "$health_choice" == b ]] || cmd_parts+=("--install-healthcheck-cron")
   
   # 网络环境（代理）
   case "$region_choice" in
@@ -7929,6 +8186,7 @@ $full_cmd
 
 提示：
 - 请将 __IP_PLACEHOLDER__ 替换为您的实际公网 IP
+- --derp-port 可更换为其他空闲 TCP 端口；同步云安全组/主机防火墙和 derpMap 的 DERPPort
 - 命令已保存到 derper_deploy_cmd.sh，方便后续使用
 
 是否立即执行？(y/n)
@@ -8010,6 +8268,7 @@ service_needs_reconcile() {
 # 丢掉部署临时目录。exec 替换进程时 EXIT trap 不会运行，向导在 exec 前必须调用。
 release_tmpdir() {
   if [[ -n "${_tmpdir:-}" && -d "${_tmpdir}" ]]; then
+    chmod -R u+w "${_tmpdir}" 2>/dev/null || true
     rm -rf "${_tmpdir}"
   fi
   trap - EXIT
@@ -8062,12 +8321,16 @@ cleanup_deployment() {
   if [[ "$rc" -ne 0 && "${CERT_TRANSACTION_ACTIVE:-0}" -eq 1 ]]; then
     recover_cert_update || echo "[错误] 证书或服务恢复失败，请检查 ${SERVICE_PATH}.certs-rollback 和服务日志。" >&2
   fi
-  [[ -z "${_tmpdir:-}" ]] || rm -rf "$_tmpdir"
+  if [[ -n "${_tmpdir:-}" ]]; then
+    # Go 模块缓存目录是只读的，直接 rm -rf 会留下残骸；先恢复写权限。
+    chmod -R u+w "$_tmpdir" 2>/dev/null || true
+    rm -rf "$_tmpdir" || echo "[警告] 无法完全清理临时目录：${_tmpdir}" >&2
+  fi
 }
 
 main() {
-  # 创建安全临时目录（防止 /tmp 可预测路径符号链接攻击，CWE-377）
-  _tmpdir=$(mktemp -d /tmp/derper-deploy.XXXXXXXXXX)
+  # 工具链下载与事务文件使用磁盘上的安全临时目录，避免小内存 tmpfs。
+  _tmpdir=$(mktemp -d /var/tmp/derper-deploy.XXXXXXXXXX)
   trap 'cleanup_deployment $?' EXIT
 
   # 特殊子命令处理：先记录 wizard，再解析其后的通用参数。
@@ -8156,6 +8419,18 @@ main() {
     fi
   fi
 
+  if [[ "$HEALTH_CHECK" -ne 1 && "$CERT_PREPARE$CERT_APPLY$CERT_CANCEL$CERT_MAINTAIN" == 0000 ]]; then
+    local region_check_rc=0
+    precheck_region_id_conflict || region_check_rc=$?
+    if [[ "$region_check_rc" -eq 1 ]]; then
+      if [[ "${DRY_RUN}" -eq 1 || "${CHECK_ONLY}" -eq 1 ]]; then
+        check_validate_failed=1
+      else
+        exit 1
+      fi
+    fi
+  fi
+
   if [[ "$CERT_PREPARE$CERT_APPLY$CERT_CANCEL$CERT_MAINTAIN" != 0000 ]]; then
     # 停用维护本身就是本次 maintain 的操作：先持久化并移除调度，不再运行换证。
     if [[ "$CERT_MAINTAIN" -eq 1 && "${DISABLE_AUTO_MAINTAIN:-0}" -eq 1 ]]; then
@@ -8197,6 +8472,12 @@ main() {
     echo "[检查] 参数与环境状态总结："
     echo "- 公网 IP：${ip_show}"
     echo "- DERP 端口：${DERP_PORT}/tcp；STUN 端口：${STUN_PORT}/udp"
+    local region_check_text="未知"
+    case "${region_check_rc:-0}" in
+      0) region_check_text="未发现冲突或为同一目标" ;;
+      1) region_check_text="确认冲突" ;;
+    esac
+    echo "- Region ${REGION_ID} 预检：${region_check_text}"
     echo "- tailscale：安装=${TS_INSTALLED} 运行=${TS_RUNNING} 版本=${TS_VERSION:-<未知>} (>=${REQUIRED_TS_VER}) 满足=${TS_VER_OK}"
     echo "- derper：二进制=${DERPER_BIN} 服务文件=${DERPER_SERVICE_PRESENT} 运行=${DERPER_RUNNING}"
     local derper_installed_ver=""
@@ -8345,26 +8626,43 @@ main() {
 # 若无法取得证书指纹，宁可失败并要求排查 TLS，也不输出 InsecureForTests 配置：
 # 上游明确说明该字段仅用于单元测试，用户不应在生产配置中设置。
 finalize_deployment_report() {
-  local FP
+  local FP fp_source=在线TLS
   FP=$(live_cert_sha256_raw || true)
-  if [[ -z "$FP" ]]; then FP=$(journal_certname_raw || true); fi
-  if [[ -z "$FP" ]]; then FP=$(cert_file_sha256_raw || true); fi
+  if [[ -z "$FP" ]]; then FP=$(journal_certname_raw || true); fp_source=服务日志; fi
+  if [[ -z "$FP" ]]; then FP=$(cert_file_sha256_raw || true); fp_source=磁盘证书; fi
   if [[ -n "$FP" ]]; then
     print_acl_snippet_cert "${IP_ADDR}" "${DERP_PORT}" "$FP"
-    echo "[信息] 已基于实际在线证书指纹生成片段：sha256-raw:${FP}"
+    echo "[信息] 片段指纹来源：${fp_source}；CertName=sha256-raw:${FP}。公网与客户端传播须另行确认。"
     print_client_verify_steps
+    local DEPLOY_CLIENT_GUIDANCE_PRINTED=1
     print_server_node_acl_advice
     warn_world_writable_socket "$(expected_tailscaled_socket)"
+    local cert_expiry cert_days cert_expiry_text
+    cert_expiry=$(cert_not_after || true)
+    cert_days=$(cert_days_remaining || true)
+    cert_expiry_text="${cert_expiry:-无法确认}"
+    [[ -z "$cert_expiry" || ! "$cert_days" =~ ^-?[0-9]+$ ]] || cert_expiry_text+="（剩余 ${cert_days} 天）"
 
+    local health_timer=未安装 health_cron=未发现
+    if command -v systemctl >/dev/null 2>&1 && systemctl cat derper-healthcheck.timer >/dev/null 2>&1; then
+      health_timer=$(systemctl is-active derper-healthcheck.timer 2>/dev/null || true)
+    fi
+    [[ -f /etc/cron.d/derper-healthcheck ]] && health_cron=文件存在
     cat <<INFO
-完成：DERP 服务已部署/修复并尝试运行。
+完成：本机部署步骤完成；公网可达、策略下发和实际中继须分别确认。
+- 本次目标：${IP_ADDR}；TCP ${DERP_PORT} / UDP ${STUN_PORT}；Region ${REGION_ID} / ${REGION_CODE} / ${REGION_NAME}
+- 客户端校验：verify-clients=${VERIFY_CLIENTS_MODE}；运行用户：${RUN_USER}；加固：${SECURITY_LEVEL}
+- 本地门禁：H0=${H0_STATUS:-unknown} H1=${H1_STATUS:-unknown} H2=${H2_STATUS:-unknown} H3=${H3_STATUS:-not_checked}
+- 健康检查调度：timer=${health_timer:-unknown}；cron=${health_cron}（文件存在不证明 cron 正在执行）
 - 服务：systemctl status derper
 - 日志：journalctl -u derper -f
 - 证书：$(derper_manual_cert_file) / $(derper_manual_key_file)（上游 derper manual 模式读取；兼容链接 fullchain.pem/privkey.pem）
+- 证书到期：${cert_expiry_text}；过期后本节点 TLS 校验失败，客户端可能回落其他 DERP
+- 维护：人工续期入口 prepare/apply；周期检查与自动换证须分别显式启用，当前没有站外通知
 - 配置：$(derper_config_path)
 
-在 Tailscale 后台粘贴 derpMap 后，客户端数十秒内会自动下发。
-若本次重签了证书，请立即用新的 CertName 更新 ACL，避免短暂中断后无法接入。
+下一步：合并本节点片段并保留现有策略，读取客户端实际 derpMap 确认下发，再验证公网 TLS/STUN 与指定 Region 中继。
+上游服务日志的示例 Region 不是配置依据；请使用本次目标 ${REGION_ID}。
 INFO
     finish_deploy_auto_maintain || return 1
     return 0
@@ -8375,7 +8673,7 @@ INFO
 
 为安全起见，脚本不会输出 InsecureForTests 配置：
 上游明确说明该字段仅用于单元测试，用户不应设置（设置后将关闭 TLS 证书校验，
-等同于明文传输，参考 https://github.com/tailscale/tailscale/blob/main/tailcfg/derpmap.go）。
+无法验证服务身份并有中间人风险，并非关闭 TLS 加密，参考 https://github.com/tailscale/tailscale/blob/main/tailcfg/derpmap.go）。
 
 请先排查 TLS 后再重试：
   1) systemctl status derper && journalctl -u derper -n 100（确认服务与端口）
