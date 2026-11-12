@@ -1,0 +1,158 @@
+# ========================================
+# Tailscale DERP 部署项目专用 .gitignore
+# ========================================
+
+# ============ 项目特定目录 ============
+# 正式需求、设计与开发计划（沿用原忽略设置；旧路径规则保留兼容）
+plan/
+plans/
+/design/plans/
+
+# 审查/检查/调研报告、执行结果和历史快照（不纳入版本控制；旧 records/ 规则保留兼容）
+records/
+checkpoints/
+/design/checkpoints/
+
+# 内部台账、Agent 约定与设计记录（保留本地，不随公开仓库发布）
+/task-list.md
+/CLAUDE.md
+/design/
+
+# 测试部署生成的临时文件
+test-deploy/
+*.test.sh
+derper_deploy_cmd.sh
+
+# ============ 系统文件 ============
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.AppleDouble
+.LSOverride
+.Spotlight-V100
+.Trashes
+.fseventsd
+.apdisk
+.DocumentRevisions-V100
+.TemporaryItems
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux/Unix
+.Trash-*
+.nfs*
+*.swp
+*.swo
+*~
+
+# ============ 编辑器/IDE ============
+# Vim
+*.swp
+*.swo
+*.swn
+.*.sw[a-p]
+
+# Emacs
+*~
+\#*\#
+.\#*
+
+# VS Code（完全忽略，不上传到 GitHub）
+.vscode/
+
+# Claude Code 本地配置（完全忽略，不上传到 GitHub）
+.claude/
+
+# JetBrains IDEs
+.idea/
+*.iml
+*.iws
+*.ipr
+
+# Sublime Text
+*.sublime-project
+*.sublime-workspace
+
+# ============ 日志和临时文件 ============
+# 日志文件
+logs/
+*.log
+*.log.*
+
+# 缓存
+.cache/
+cache/
+
+# 临时文件
+*.tmp
+*.temp
+*.bak
+*.old
+*.orig
+*.save
+.~*
+
+# ============ 敏感信息 ============
+# 环境变量和密钥（保留示例文件）
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+# 私钥和证书（如果有测试生成的）
+*.key
+*.pem
+*.crt
+*.csr
+*.p12
+*.pfx
+!*.example.key
+!*.example.pem
+
+# SSH 密钥
+id_rsa
+id_rsa.pub
+id_ed25519
+id_ed25519.pub
+
+# 敏感配置
+secrets/
+.secrets/
+credentials/
+
+# ============ 其他 ============
+# 压缩文件
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+# 编译产物（如果有 Go 编译测试）
+*.o
+*.so
+*.exe
+*.dll
+derper
+tailscale
+tailscaled
+
+# 包管理（一般不会用到，但保留）
+node_modules/
+vendor/
+
+# Python可选验收工具缓存
+__pycache__/
+*.pyc
+
+# 台账工具跨进程锁文件（保留本地文件，不纳入版本控制）
+task-list.md.lock
