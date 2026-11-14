@@ -2352,6 +2352,50 @@ test_bug144_install_failure_explains_transient_revision_resolution() {
 
   rc=0 out=''
   out=$( (
+    _tmpdir="$case_tmp/deploy-direct-tmp"; mkdir -p "$_tmpdir"
+    DEPLOY_STATE_DIR="$case_tmp/deploy-direct-state"
+    BIN_PATH="$case_tmp/derper-direct"
+    DERPER_VERSION="$target" LOCAL_BINARY='' GOPROXY_ARG='direct'
+    GOSUMDB_ARG='' GOTOOLCHAIN_ARG=auto
+    prepare_go_build_root() { :; }
+    precheck_go_network() { :; }
+    ensure_go() { :; }
+    _run_with_progress() {
+      printf '%s\n' \
+        "go: tailscale.com/cmd/derper@${target}: invalid version: git ls-remote -q origin in /var/cache/derper-deploy/go-build/gopath/pkg/mod/cache/vcs/x: exit status 128:" \
+        "fatal: unable to access 'https://github.com/tailscale/tailscale/': network unreachable" >"$2"
+      return 1
+    }
+    install_derper
+  ) 2>&1 ) || rc=$?
+  [[ "${rc:-0}" -ne 0 ]] || fail 'direct 直连失败时必须非零退出'
+  [[ "$out" != *"模块代理未能把目标"* ]] ||
+    fail "direct-only 未使用模块代理也未发生回退，不得误报定向提示，实际输出：$out"
+
+  rc=0 out=''
+  out=$( (
+    _tmpdir="$case_tmp/deploy-tag-tmp"; mkdir -p "$_tmpdir"
+    DEPLOY_STATE_DIR="$case_tmp/deploy-tag-state"
+    BIN_PATH="$case_tmp/derper-tag"
+    DERPER_VERSION=v1.104.6 LOCAL_BINARY='' GOPROXY_ARG='https://goproxy.cn,direct'
+    GOSUMDB_ARG='' GOTOOLCHAIN_ARG=auto
+    prepare_go_build_root() { :; }
+    precheck_go_network() { :; }
+    ensure_go() { :; }
+    _run_with_progress() {
+      printf '%s\n' \
+        'go: tailscale.com/cmd/derper@v1.104.6: invalid version: git ls-remote -q origin in /var/cache/derper-deploy/go-build/gopath/pkg/mod/cache/vcs/x: exit status 128:' \
+        "fatal: unable to access 'https://github.com/tailscale/tailscale/': network unreachable" >"$2"
+      return 1
+    }
+    install_derper
+  ) 2>&1 ) || rc=$?
+  [[ "${rc:-0}" -ne 0 ]] || fail '语义版本源码直连失败时必须非零退出'
+  [[ "$out" != *"模块代理未能把目标"* ]] ||
+    fail "语义版本的 Git 直连失败不得误报为 revision 解析失败，实际输出：$out"
+
+  rc=0 out=''
+  out=$( (
     _tmpdir="$case_tmp/deploy-tmp2"; mkdir -p "$_tmpdir"
     DEPLOY_STATE_DIR="$case_tmp/deploy-state2"
     BIN_PATH="$case_tmp/derper2"
@@ -2371,7 +2415,584 @@ test_bug144_install_failure_explains_transient_revision_resolution() {
     fail "非 revision 解析失败不得误报定向提示，实际输出：$out"
 }
 
+test_bug146_goproxy_separators_and_terminal_modes() {
+  local spec targets direct
+  while IFS=';' read -r spec targets direct; do
+    GOPROXY_ARG="$spec"
+    [[ "$(goproxy_probe_targets)" == "$targets" ]] || fail "代理目标解析错误：$spec"
+    if [[ "$direct" == yes ]]; then
+      goproxy_spec_allows_direct || fail "漏掉direct：$spec"
+    else
+      if goproxy_spec_allows_direct; then fail "不应允许direct：$spec"; fi
+    fi
+  done <<'CASES'
+https://proxy.invalid|direct;https://proxy.invalid;yes
+https://proxy.invalid,off,direct;https://proxy.invalid;no
+https://proxy.invalid|off|direct;https://proxy.invalid;no
+off,direct;;no
+off|https://ignored.invalid;;no
+direct,https://ignored.invalid;;yes
+https://proxy.invalid;https://proxy.invalid;no
+ , https://proxy.invalid | , direct , https://ignored.invalid ;https://proxy.invalid;yes
+CASES
+  GOPROXY_ARG='https://first.invalid|https://second.invalid,off,https://ignored.invalid'
+  [[ "$(goproxy_probe_targets)" == $'https://first.invalid\nhttps://second.invalid' ]] || fail '混合分隔符/终止标记处理错误'
+}
+
+test_bug147_goproxy_effective_configuration_precedence() {
+  go() {
+    [[ "$*" == 'env GOPROXY' && "$GOTOOLCHAIN" == local ]] || fail '查询持久配置不得下载工具链或执行构建'
+    printf queried >>"$case_tmp/go-env-called"
+    printf '%s\n' 'https://saved.invalid|direct'
+  }
+  GOPROXY_ARG='https://cli.invalid'; GOPROXY='https://env.invalid'
+  [[ "$(goproxy_probe_spec)" == https://cli.invalid ]] || fail 'CLI必须优先于环境与Go持久配置'
+  [[ ! -e "$case_tmp/go-env-called" ]] || fail 'CLI显式配置不应查询Go'
+  GOPROXY_ARG=''
+  [[ "$(goproxy_probe_spec)" == https://env.invalid ]] || fail '环境必须优先于Go持久配置'
+  [[ ! -e "$case_tmp/go-env-called" ]] || fail '环境显式配置不应查询Go'
+  unset GOPROXY
+  [[ "$(goproxy_probe_spec)" == 'https://saved.invalid|direct' ]] || fail '未读取go env持久配置'
+  [[ -s "$case_tmp/go-env-called" ]] || fail '未调用go env GOPROXY'
+  GOPROXY=''
+  [[ "$(goproxy_probe_spec)" == 'https://saved.invalid|direct' ]] || fail '空环境变量应遵循Go持久配置'
+}
+
+test_bug147_goproxy_unavailable_configuration_uses_default() {
+  local saved_path="$PATH" out
+  GOPROXY_ARG=''; unset GOPROXY
+  go() { return 1; }
+  [[ "$(goproxy_probe_spec)" == 'https://proxy.golang.org,direct' ]] || fail 'Go配置查询失败时应使用默认值'
+  go() { :; }
+  [[ "$(goproxy_probe_spec)" == 'https://proxy.golang.org,direct' ]] || fail 'Go配置为空时应使用默认值'
+  unset -f go
+  PATH="$case_tmp/no-go"
+  out=$(goproxy_probe_spec)
+  PATH="$saved_path"
+  [[ "$out" == 'https://proxy.golang.org,direct' ]] || fail '未安装Go时应使用默认值'
+}
+
+test_bug146_goproxy_precheck_pipe_and_off() {
+  probe_http_url() { printf '%s\n' "$1" >>"$case_tmp/probed"; return 7; }
+  GOPROXY_ARG='https://proxy.invalid|direct'
+  precheck_go_network >/dev/null 2>&1 || fail '竖线direct回退不得被预检拦截'
+  [[ "$(cat "$case_tmp/probed")" == https://proxy.invalid ]] || fail '不得把竖线拼入URL'
+  : >"$case_tmp/probed"
+  GOPROXY_ARG='https://proxy.invalid,off,direct,https://ignored.invalid'
+  if precheck_go_network >/dev/null 2>&1; then fail 'off之后的direct不得绕过失败门禁'; fi
+  [[ "$(cat "$case_tmp/probed")" == https://proxy.invalid ]] || fail '不得探测终止标记后的代理'
+}
+
+test_bug146_install_failure_respects_effective_proxy_paths() {
+  local spec mode expected out rc stored_proxy
+  while IFS=';' read -r mode spec expected; do
+    rc=0
+    out=$( (
+      _tmpdir="$case_tmp/install-tmp"; mkdir -p "$_tmpdir"
+      DEPLOY_STATE_DIR="$case_tmp/deploy-state"; BIN_PATH="$case_tmp/derper"
+      DERPER_VERSION=abcdef1234567890abcdef1234567890abcdef12; LOCAL_BINARY=''
+      GOPROXY_ARG=''; unset GOPROXY
+      if [[ "$mode" == cli ]]; then
+        GOPROXY_ARG="$spec"
+      elif [[ "$mode" == env ]]; then
+        export GOPROXY="$spec"
+      else
+        stored_proxy="$spec"
+        go() { [[ "$*" == 'env GOPROXY' ]] || return 1; printf '%s\n' "$stored_proxy"; }
+      fi
+      prepare_go_build_root() { :; }; precheck_go_network() { :; }; ensure_go() { :; }
+      _run_with_progress() {
+        printf '%s\n' 'invalid version: git ls-remote -q origin: exit status 128' >"$2"
+        return 1
+      }
+      install_derper
+    ) 2>&1) || rc=$?
+    [[ "$rc" != 0 ]] || fail '构建失败必须非零退出'
+    if [[ "$expected" == hint ]]; then
+      [[ "$out" == *'模块代理未能把目标'* ]] || fail "漏报定向提示：$mode $spec"
+    else
+      [[ "$out" != *'模块代理未能把目标'* ]] || fail "误报代理回退：$mode $spec"
+    fi
+    [[ ! -e "$case_tmp/derper" ]] || fail '构建失败不得发布候选'
+  done <<'CASES'
+cli;https://proxy.invalid;none
+cli;https://proxy.invalid|direct;hint
+cli;https://proxy.invalid,off,direct;none
+cli;off|direct;none
+cli;direct,https://ignored.invalid;none
+env;https://proxy.invalid|direct;hint
+env;https://proxy.invalid;none
+saved;direct;none
+saved;https://proxy.invalid;none
+saved;https://proxy.invalid|direct;hint
+saved;https://proxy.invalid,off,direct;none
+CASES
+}
+
+test_bug148_short_commit_pseudoversion_install_identity() {
+  BIN_PATH=/bin/bash
+  get_installed_derper_version() { echo '1.2.3-0.20260920000000-abcdef123456'; }
+  resolve_derper_module_version() { touch "$case_tmp/resolved"; return 1; }
+  local rev
+  for rev in abcdef1 abcdef12345 abcdef123456 ABCDEF12345 abcdef1234567890abcdef1234567890abcdef12; do
+    DERPER_VERSION="$rev"
+    if derper_binary_needs_install; then fail "同源commit不应重装：$rev"; fi
+    [[ ! -e "$case_tmp/resolved" ]] || fail "匹配伪版本不应联网解析：$rev"
+  done
+  for rev in abcdef2 abcdef123457 abcdef abcdef1234567890abcdef1234567890abcdef123; do
+    DERPER_VERSION="$rev"
+    derper_binary_needs_install || fail "不同/非法commit不得匹配：$rev"
+  done
+}
+
+test_bug148_short_commit_pseudoversion_daemon_identity() {
+  local module=v1.2.3-0.20260920000000-abcdef123456 rev
+  resolve_derper_module_version() { touch "$case_tmp/resolved"; return 1; }
+  for rev in abcdef1 abcdef12345 abcdef123456 ABCDEF12345 abcdef1234567890abcdef1234567890abcdef12; do
+    same_derper_identity "$rev" "$module" || fail "daemon与伪版本未匹配：$rev"
+    same_derper_identity "$module" "$rev" || fail "反向身份比较未匹配：$rev"
+    [[ ! -e "$case_tmp/resolved" ]] || fail '已有伪版本证据不应联网解析'
+  done
+  for rev in abcdef2 abcdef123457 abcdef abcdef1234567890abcdef1234567890abcdef123; do
+    if same_derper_identity "$rev" "$module"; then fail "不同/非法commit不得放行：$rev"; fi
+    if same_derper_identity "$module" "$rev"; then fail "反向比较不得误放行：$rev"; fi
+  done
+  if same_derper_identity abcdef1 v1.2.3-abcdef123456; then fail '非Go伪版本不得仅凭hash放行'; fi
+}
+
+test_iter1_version_model_and_toolchain_evidence() {
+  local requested=3b273a64cef3fe6d3d495afae7bb6a553344ce64
+  local source=c54807352ae196919497b3f8fddc3cedf88368b9
+  DERPER_VERSION="$requested" LOCAL_BINARY='' GOPROXY_ARG='https://proxy.invalid' GOSUMDB_ARG='sum.example.invalid'
+  GOTOOLCHAIN_ARG=auto
+  _tmpdir="$case_tmp/model-tmp"; mkdir -p "$_tmpdir"
+  prepare_go_build_root() { :; }
+  go_build_cache_root() { printf '%s\n' "$case_tmp/go-cache"; }
+  go() { printf 'go version go1.22.6 linux/arm64\n'; }
+  probe_http_url() { fail '版本解析不得用代理首页代替目标模块查询'; }
+  mkdir -p "$case_tmp/go-cache/gopath/pkg/mod/cache/download/tailscale.com/@v"
+  printf 'module tailscale.com\n\ngo 1.27.3\n' >"$case_tmp/go-cache/gopath/pkg/mod/cache/download/tailscale.com/@v/v1.104.6.mod"
+  _run_with_progress() {
+    if [[ "$*" == *'go install -n'* ]]; then
+      [[ "$3" == 900 ]] || fail "工具链预检不应比正式构建900秒预算更短：$3"
+      touch "$case_tmp/toolchain-preflight"
+      printf '%s\n' 'go: module tailscale.com requires go >= 1.27.3; switching to go1.27.4' >"$2"
+    else
+      printf 'tailscale.com|v1.104.6||%s\n' "$source"
+    fi
+  }
+  prepare_derper_version_model || fail '完整模块元数据应解析成功'
+  [[ -e "$case_tmp/toolchain-preflight" ]] || fail '仅go list未验证真实构建工具链'
+  [[ "$DERPER_REQUESTED_VERSION" == "$requested" && "$DERPER_ORIGINAL_REVISION" == "$requested" ]] || fail '请求值或原始revision被覆盖'
+  [[ "$DERPER_RESOLVED_MODULE_VERSION" == v1.104.6 && "$DERPER_SOURCE_COMMIT" == "$source" ]] || fail '模块版本或最终源commit证据错误'
+  [[ "$DERPER_SOURCE_COMMIT" != "$DERPER_ORIGINAL_REVISION" ]] || fail 'tag对象SHA不得直接当成peeled源commit'
+  [[ "$DERPER_BASE_GO_VERSION" == 1.22.6 && "$DERPER_MODULE_GO_VERSION" == 1.27.3 ]] || fail '基础Go与模块Go要求未分开'
+  [[ "$DERPER_BUILD_TOOLCHAIN" == go1.27.4 && "$DERPER_BUILD_TOOLCHAIN" != "go$DERPER_MODULE_GO_VERSION" ]] || fail '最低Go要求不得与实际选择的补丁工具链混用'
+
+  DERPER_VERSION=abcdef1234567890abcdef1234567890abcdef12
+  _run_with_progress() { printf 'tailscale.com|v1.104.7|1.27.3|\n'; }
+  prepare_derper_version_model || fail '无Origin的代理解析仍应成功'
+  [[ "$DERPER_RESOLVED_MODULE_VERSION" == v1.104.7 && -z "$DERPER_SOURCE_COMMIT" ]] || fail '缺少Origin时必须保留源commit未知'
+
+  DERPER_VERSION="$requested"
+  _run_with_progress() { printf 'tailscale.com|v1.104.6-rc1|1.27.3|%s\n' "$requested"; }
+  prepare_derper_version_model || fail '预发布标签解析应成功'
+  [[ -z "$DERPER_SOURCE_COMMIT" ]] || fail '预发布annotated tag对象SHA也不能冒充peeled源commit'
+
+  DERPER_VERSION=v1.104.6
+  _run_with_progress() { printf 'tailscale.com|not-a-version|1.27.3|\n'; }
+  if prepare_derper_version_model >/dev/null 2>&1; then fail '非法模块版本不得进入安装模型'; fi
+  [[ "$DERPER_VERSION_RESOLUTION_STATE" == invalid_response && -z "$DERPER_RESOLVED_MODULE_VERSION" ]] || fail '非法响应必须保持模块版本未知'
+
+  GOSUMDB_ARG=''; GOSUMDB=''
+  go() {
+    [[ "$*" == 'env GOSUMDB' && "$GOTOOLCHAIN" == local ]] || fail '校验配置查询不得触发工具链下载'
+    printf 'sum.saved.invalid\n'
+  }
+  [[ "$(gosumdb_probe_spec)" == sum.saved.invalid ]] || fail '未读取Go持久GOSUMDB配置'
+}
+
+test_iter1_install_uses_resolved_module_version() {
+  local requested=3b273a64cef3fe6d3d495afae7bb6a553344ce64 last
+  _tmpdir="$case_tmp/install-tmp"; mkdir -p "$_tmpdir"
+  DEPLOY_STATE_DIR="$case_tmp/install-state"; BIN_PATH="$case_tmp/derper"
+  DERPER_VERSION="$requested" LOCAL_BINARY='' GOPROXY_ARG='https://proxy.invalid' GOSUMDB_ARG='sum.golang.google.cn' GOTOOLCHAIN_ARG=auto
+  reset_derper_version_model
+  DERPER_VERSION_RESOLUTION_STATE=unresolved
+  prepare_go_build_root() { :; }
+  precheck_go_network() { :; }
+  ensure_go() { :; }
+  go() { printf 'go version go1.22.6 linux/arm64\n'; }
+  go_build_cache_root() { printf '%s\n' "$case_tmp/go-cache"; }
+  _run_with_progress() {
+    case "$*" in
+      *'go list -m'*) printf 'tailscale.com|v1.104.6|1.27.3|\n' ;;
+      *'go install -n'*) : ;;
+      *'go install'*)
+        for last in "$@"; do :; done
+        [[ "$last" == tailscale.com/cmd/derper@v1.104.6 ]] || fail "安装未使用规范模块版本：$last"
+        printf '#!/bin/sh\n' >"$GOBIN/derper"; chmod 755 "$GOBIN/derper"
+        ;;
+      *) fail "未知Go调用：$*" ;;
+    esac
+  }
+  publish_derper_candidate() { printf '%s\n' "$DERPER_VERSION" >"$case_tmp/published-version"; }
+  install_derper || fail '解析成功的构建应完成'
+  [[ "$(cat "$case_tmp/published-version")" == v1.104.6 ]] || fail '发布流程未保持规范模块目标'
+  [[ "$DERPER_REQUESTED_VERSION" == "$requested" && "$DERPER_ORIGINAL_REVISION" == "$requested" ]] || fail '安装后丢失原始revision证据'
+
+  local out rc=0
+  GOPROXY_ARG='https://proxy.invalid,direct'
+  _run_with_progress() {
+    [[ "$*" == *'go install'* ]] || fail '已解析模型不应重复查询'
+    printf '%s\n' 'invalid version: git ls-remote -q origin: exit status 128' >"$2"
+    return 1
+  }
+  out=$(install_derper 2>&1) || rc=$?
+  [[ "$rc" -ne 0 ]] || fail '规范模块编译失败必须非零退出'
+  [[ "$out" != *'模块代理未能把目标'* ]] || fail '解析成功后的规范版本编译失败不得再误报revision解析'
+
+  local before after
+  printf 'existing-derper\n' >"$BIN_PATH"
+  before=$(sha256_hex <"$BIN_PATH")
+  DERPER_VERSION="$requested"
+  reset_derper_version_model
+  _run_with_progress() {
+    case "$*" in
+      *'go list -m'*) printf 'tailscale.com|v1.104.6|1.27.3|\n' ;;
+      *'go install -n'*) printf 'toolchain verification failed\n' >"$2"; return 1 ;;
+      *'go install'*) touch "$case_tmp/unexpected-real-install"; return 1 ;;
+    esac
+  }
+  rc=0
+  out=$(install_derper 2>&1) || rc=$?
+  after=$(sha256_hex <"$BIN_PATH")
+  [[ "$rc" -ne 0 && "$before" == "$after" && ! -e "$case_tmp/unexpected-real-install" ]] || fail '工具链预检失败不得进入正式构建或改动既有二进制'
+}
+
+test_iter1_model_reuse_does_not_weaken_same_origin() {
+  local requested=3b273a64cef3fe6d3d495afae7bb6a553344ce64
+  DERPER_REQUESTED_VERSION="$requested" DERPER_ORIGINAL_REVISION="$requested"
+  DERPER_RESOLVED_MODULE_VERSION=v1.104.6 DERPER_VERSION_RESOLUTION_STATE=resolved
+  resolve_derper_module_version() { return 1; }
+  same_derper_identity "$requested" v1.104.6 || fail '当前请求的已验证映射应可复用'
+  if same_derper_identity abcdef1234567890abcdef1234567890abcdef12 v1.104.6; then
+    fail '不同revision不得复用当前映射或仅凭semver放行'
+  fi
+}
+
+test_iter1_check_displays_resolved_version_model() {
+  local requested=3b273a64cef3fe6d3d495afae7bb6a553344ce64 out rc=0
+  flock() { return 0; }
+  check_os_environment() { :; }
+  check_tailscale_status() { TS_INSTALLED=1 TS_RUNNING=1 TS_VERSION=1.104.6 TS_VER_OK=1; }
+  check_derper_status() { DERPER_BIN=0 DERPER_SERVICE_PRESENT=0 DERPER_RUNNING=0 PURE_IP_OK=0 DESIRED_CONFIG_OK=0 DERPER_VERIFY_CLIENTS_EFFECTIVE=0 PORT_TLS_OK=0 PORT_STUN_OK=0; }
+  check_cert_status() { CERT_PRESENT=0 CERT_NAMING_OK=0 CERT_SAN_MATCH=0 CERT_EXPIRY_OK=0; }
+  check_live_cert_status() { LIVE_CERT_CHECKED=0 CERT_LIVE_MATCH=0; }
+  cert_layout_is_ok() { return 0; }
+  health_is_ok() { return 1; }
+  check_extra_attack_surface() { EXTRA_LISTENERS=''; }
+  check_automatic_updates() { AUTO_UPDATES_OK=1; }
+  tailscale() { printf '{"Regions":{}}\n'; }
+  _timeout_run() { shift; "$@"; }
+  prepare_go_build_root() { :; }
+  go_build_cache_root() { printf '%s\n' "$case_tmp/check-go-cache"; }
+  go() { printf 'go version go1.22.6 linux/arm64\n'; }
+  _run_with_progress() { printf 'tailscale.com|v1.104.6|1.27.3|\n'; }
+  out=$(main --check --ip 8.8.8.8 --derper-version "$requested" --goproxy https://proxy.invalid --gosumdb sum.golang.google.cn 2>&1) || rc=$?
+  [[ "$rc" -eq 0 ]] || fail "成功解析的check应通过：rc=$rc out=$out"
+  [[ "$out" == *"请求=${requested}"* && "$out" == *"模块=v1.104.6"* ]] || fail "check未展示请求与规范模块版本：$out"
+  [[ "$out" == *"原始 revision=${requested}"* && "$out" == *'最终源 commit=<未知>'* ]] || fail "check混淆原始revision和最终源commit：$out"
+  [[ "$out" == *'基础 Go=1.22.6'* && "$out" == *'模块 Go 要求=1.27.3'* ]] || fail "check未展示基础Go与模块要求：$out"
+
+  derper_binary_needs_install() { return 1; }
+  prepare_derper_version_model() { touch "$case_tmp/unexpected-query"; return 1; }
+  out=$(main --check --ip 8.8.8.8 --derper-version "$requested" 2>&1) || rc=$?
+  [[ "$rc" -eq 0 && ! -e "$case_tmp/unexpected-query" ]] || fail '无需构建的既有部署不应被强制联网解析或失败'
+}
+
+test_iter1_resolution_failure_preserves_direct_diagnostic() {
+  local requested=3b273a64cef3fe6d3d495afae7bb6a553344ce64 out rc=0
+  DERPER_VERSION="$requested" LOCAL_BINARY='' GOPROXY_ARG='https://goproxy.cn,direct' GOSUMDB_ARG='' GOTOOLCHAIN_ARG=auto
+  _tmpdir="$case_tmp/resolution-tmp"; mkdir -p "$_tmpdir"
+  prepare_go_build_root() { :; }
+  go_build_cache_root() { printf '%s\n' "$case_tmp/go-cache"; }
+  go() { printf 'go version go1.22.6 linux/arm64\n'; }
+  _run_with_progress() {
+    printf '%s\n' 'invalid version: git ls-remote -q origin: exit status 128' >"$2"
+    return 1
+  }
+  prepare_derper_version_model >"$case_tmp/resolution-out" 2>&1 || rc=$?
+  out=$(cat "$case_tmp/resolution-out")
+  [[ "$rc" -ne 0 && "$DERPER_VERSION_RESOLUTION_STATE" == unresolved ]] || fail "目标解析失败必须保持未知并非零退出：rc=$rc state=$DERPER_VERSION_RESOLUTION_STATE out=$out"
+  [[ "$out" == *'模块代理未能把目标'* && "$out" == *'--goproxy https://proxy.golang.com.cn,direct'* ]] || fail "前置解析丢失direct排障提示：$out"
+  [[ -z "$DERPER_RESOLVED_MODULE_VERSION" && -z "$DERPER_SOURCE_COMMIT" ]] || fail '失败时不得伪造模块或源commit'
+
+  rc=0
+  DERPER_VERSION="$requested"
+  _run_with_progress() {
+    printf '%s\n' 'invalid version: git fetch -f origin refs/heads/*:refs/heads/* refs/tags/*:refs/tags/*: exit status 128' >"$2"
+    return 1
+  }
+  prepare_derper_version_model >"$case_tmp/resolution-fetch-out" 2>&1 || rc=$?
+  out=$(cat "$case_tmp/resolution-fetch-out")
+  [[ "$rc" -ne 0 && "$out" == *'模块代理未能把目标'* ]] || fail "direct的git fetch失败也应给出revision诊断：$out"
+}
+
+test_bug150_install_ignores_proxy_homepage_gate() {
+  local requested=3b273a64cef3fe6d3d495afae7bb6a553344ce64 rc=0
+  _tmpdir="$case_tmp/install-tmp"; mkdir -p "$_tmpdir"
+  DEPLOY_STATE_DIR="$case_tmp/install-state"; BIN_PATH="$case_tmp/derper"
+  DERPER_VERSION="$requested" LOCAL_BINARY='' GOPROXY_ARG='https://proxy.invalid' GOSUMDB_ARG='sum.golang.google.cn' GOTOOLCHAIN_ARG=auto
+  reset_derper_version_model
+  DERPER_RESOLVED_MODULE_VERSION=v1.104.6 DERPER_VERSION_RESOLUTION_STATE=resolved
+  prepare_go_build_root() { :; }
+  precheck_go_network() { touch "$case_tmp/homepage-gate"; return 1; }
+  ensure_go() { :; }
+  go_build_cache_root() { printf '%s\n' "$case_tmp/go-cache"; }
+  _run_with_progress() {
+    [[ "$*" == *'go install'* && "$*" != *'go install -n'* ]] || fail "首页失败后不应提前退出：$*"
+    printf '#!/bin/sh\n' >"$GOBIN/derper"; chmod 755 "$GOBIN/derper"
+  }
+  publish_derper_candidate() { return 0; }
+  (install_derper) || rc=$?
+  [[ "$rc" -eq 0 && ! -e "$case_tmp/homepage-gate" ]] || fail 'proxy-only目标已解析时，代理首页失败不得阻断实际构建'
+}
+
+test_bug151_final_source_commit_passes_real_daemon_gate_without_query() {
+  local requested=3b273a64cef3fe6d3d495afae7bb6a553344ce64
+  local source=c54807352ae196919497b3f8fddc3cedf88368b9
+  DERPER_REQUESTED_VERSION="$requested" DERPER_ORIGINAL_REVISION="$requested"
+  DERPER_SOURCE_COMMIT="$source" DERPER_RESOLVED_MODULE_VERSION=v1.104.6 DERPER_VERSION_RESOLUTION_STATE=resolved
+  VERIFY_CLIENTS_MODE=on
+  local candidate="$case_tmp/candidate"
+  printf '#!/bin/sh\n# tailscale.com v1.104.6\necho -- -a\n' >"$candidate"
+  chmod 755 "$candidate"
+  tailscaled_daemon_revision() { printf '%s\n' "$source"; }
+  resolve_derper_module_version() { touch "$case_tmp/unexpected-query"; return 1; }
+  candidate_matches_running_daemon "$candidate" || fail '最终源commit与已确认模型一致时，真实候选门禁应放行'
+  [[ ! -e "$case_tmp/unexpected-query" ]] || fail '最终源commit命中可信模型后不得重复查询'
+}
+
+test_bug151_real_idempotence_preserves_and_reuses_version_model() {
+  local requested=3b273a64cef3fe6d3d495afae7bb6a553344ce64
+  local source=c54807352ae196919497b3f8fddc3cedf88368b9
+  BIN_PATH=/bin/bash DERPER_VERSION="$requested" LOCAL_BINARY=''
+  GOPROXY_ARG='https://proxy.invalid' GOSUMDB_ARG='sum.golang.google.cn' GOTOOLCHAIN_ARG=auto
+  _tmpdir="$case_tmp/idempotent-tmp"; mkdir -p "$_tmpdir"
+  reset_derper_version_model
+  get_installed_derper_version() { printf 'v1.104.6\n'; }
+  prepare_go_build_root() { :; }
+  go_build_cache_root() { printf '%s\n' "$case_tmp/go-cache"; }
+  go() { printf 'go version go1.22.6 linux/arm64\n'; }
+  _run_with_progress() {
+    printf '%s\n' "$*" >>"$case_tmp/go-calls"
+    if [[ "$*" == *'go list -m'* ]]; then
+      printf 'tailscale.com|v1.104.6|1.27.3|%s\n' "$source"
+    elif [[ "$*" == *'go install -n'* ]]; then
+      :
+    else
+      fail '幂等检查不得执行真实构建'
+    fi
+  }
+  if derper_binary_needs_install; then fail '真实幂等函数未复用tag对象到发布版本的映射'; fi
+  [[ "$DERPER_VERSION_RESOLUTION_STATE" == resolved && "$DERPER_SOURCE_COMMIT" == "$source" ]] || fail '幂等解析后未保留统一模型'
+  if derper_binary_needs_install; then fail '第二次真实幂等判断仍应同源'; fi
+  [[ "$(grep -c 'go list -m' "$case_tmp/go-calls")" -eq 1 ]] || fail '同一目标的真实幂等路径重复查询模块'
+}
+
+bug156_check_stubs() {
+  flock() { return 0; }
+  check_os_environment() { :; }
+  check_tailscale_status() { TS_INSTALLED=1 TS_RUNNING=1 TS_VERSION=1.104.6 TS_VER_OK=1; }
+  check_derper_status() { DERPER_BIN=1 DERPER_SERVICE_PRESENT=0 DERPER_RUNNING=0 PURE_IP_OK=0 DESIRED_CONFIG_OK=0 DERPER_VERIFY_CLIENTS_EFFECTIVE=0 PORT_TLS_OK=0 PORT_STUN_OK=0; }
+  check_cert_status() { CERT_PRESENT=0 CERT_NAMING_OK=0 CERT_SAN_MATCH=0 CERT_EXPIRY_OK=0; }
+  check_live_cert_status() { LIVE_CERT_CHECKED=0 CERT_LIVE_MATCH=0; }
+  cert_layout_is_ok() { return 0; }
+  health_is_ok() { return 1; }
+  check_extra_attack_surface() { EXTRA_LISTENERS=''; }
+  check_automatic_updates() { AUTO_UPDATES_OK=1; }
+  tailscale() { printf '{"Regions":{}}\n'; }
+  _timeout_run() { shift; "$@"; }
+  prepare_go_build_root() { :; }
+  go_build_cache_root() { printf '%s\n' "$case_tmp/check-go-cache"; }
+  go() { printf 'go version go1.22.6 linux/arm64\n'; }
+  BIN_PATH=/bin/bash
+  get_installed_derper_version() { printf 'v1.104.5\n'; }
+}
+
+test_bug156_check_upgrade_queries_module_once() {
+  local requested=3b273a64cef3fe6d3d495afae7bb6a553344ce64 out rc=0
+  bug156_check_stubs
+  _run_with_progress() {
+    printf '%s\n' "$*" >>"$case_tmp/go-calls"
+    if [[ "$*" == *'go list -m'* ]]; then printf 'tailscale.com|v1.104.6|1.27.3|\n'; fi
+  }
+  out=$(main --check --ip 8.8.8.8 --derper-version "$requested" --goproxy https://proxy.invalid --gosumdb sum.golang.google.cn 2>&1) || rc=$?
+  [[ "$rc" -eq 0 ]] || fail "需要升级且解析成功的check应通过：rc=$rc out=$out"
+  [[ "$(grep -c 'go list -m' "$case_tmp/go-calls")" -eq 1 ]] || fail "check需要升级时重复查询模块：$(cat "$case_tmp/go-calls")"
+  [[ "$out" == *'模块=v1.104.6'* ]] || fail "check未展示解析结果：$out"
+
+  rm -f "$case_tmp/go-calls"
+  rc=0
+  _run_with_progress() {
+    printf '%s\n' "$*" >>"$case_tmp/go-calls"
+    printf '%s\n' 'invalid version: git ls-remote -q origin: exit status 128' >"$2"
+    return 1
+  }
+  out=$(main --check --ip 8.8.8.8 --derper-version "$requested" --goproxy https://proxy.invalid --gosumdb sum.golang.google.cn 2>&1) || rc=$?
+  [[ "$rc" -ne 0 ]] || fail "解析失败的check必须非零：out=$out"
+  [[ "$(grep -c 'go list -m' "$case_tmp/go-calls")" -eq 1 ]] || fail "check解析失败时重复查询模块：$(cat "$case_tmp/go-calls")"
+  [[ "$(grep -c 'Go 目标模块解析/构建失败' <<<"$out")" -eq 1 ]] || fail "解析失败错误被重复输出：$out"
+}
+
+test_bug157_needs_install_without_go_is_quiet_before_ensure_go() {
+  local requested=3b273a64cef3fe6d3d495afae7bb6a553344ce64 out rc=0
+  BIN_PATH=/bin/bash DERPER_VERSION="$requested" LOCAL_BINARY=''
+  get_installed_derper_version() { printf 'v1.104.5\n'; }
+  reset_derper_version_model
+  _run_with_progress() { touch "$case_tmp/unexpected-query"; return 1; }
+  # 缺 Go：go 不可用。
+  go() { return 127; }
+  out=$(derper_binary_needs_install 2>&1) || rc=$?
+  [[ "$rc" -eq 0 ]] || fail "缺Go时应判定需要安装：rc=$rc out=$out"
+  [[ ! -e "$case_tmp/unexpected-query" ]] || fail '缺Go时不应尝试查询模块'
+  [[ "$out" != *'[错误]'* && "$out" != *'目标模块解析/构建失败'* ]] || fail "ensure_go前不得输出误导性错误：$out"
+  [[ "$out" == *'暂无法核对'* ]] || fail "应提示将在安装阶段重新解析：$out"
+
+  # Go 过旧（<1.21）：同样不得先输出解析错误。
+  go() { printf 'go version go1.18.1 linux/amd64\n'; }
+  rc=0
+  out=$(derper_binary_needs_install 2>&1) || rc=$?
+  [[ "$rc" -eq 0 && ! -e "$case_tmp/unexpected-query" ]] || fail "Go过旧时不应查询模块：rc=$rc out=$out"
+  [[ "$out" != *'[错误]'* && "$out" != *'目标模块解析/构建失败'* ]] || fail "Go过旧时输出了误导性错误：$out"
+}
+
+test_bug158_check_without_usable_go_is_explicitly_unverified() {
+  local requested=3b273a64cef3fe6d3d495afae7bb6a553344ce64 out rc=0
+  bug156_check_stubs
+  BIN_PATH="$case_tmp/missing-derper"
+  check_derper_status() { DERPER_BIN=0 DERPER_SERVICE_PRESENT=0 DERPER_RUNNING=0 PURE_IP_OK=0 DESIRED_CONFIG_OK=0 DERPER_VERIFY_CLIENTS_EFFECTIVE=0 PORT_TLS_OK=0 PORT_STUN_OK=0; }
+  _run_with_progress() { touch "$case_tmp/unexpected-query"; return 1; }
+  command() {
+    if [[ "${1:-}" == -v && "${2:-}" == go ]]; then return 1; fi
+    builtin command "$@"
+  }
+  out=$(main --check --ip 8.8.8.8 --derper-version "$requested" --goproxy https://proxy.invalid --gosumdb sum.golang.google.cn 2>&1) || rc=$?
+  [[ "$rc" -eq 0 ]] || fail "首装check仅缺Go时不应误失败：rc=$rc out=$out"
+  [[ "$out" == *'解析状态=unavailable'* && "$out" != *'[错误] 未找到 Go'* ]] || fail "缺Go应明确未验证而不是报错：$out"
+  [[ ! -e "$case_tmp/unexpected-query" ]] || fail '缺Go时不得执行目标模块查询'
+
+  unset -f command
+  go() { printf 'go version go1.18.1 linux/amd64\n'; }
+  BIN_PATH=/bin/bash
+  check_derper_status() { DERPER_BIN=1 DERPER_SERVICE_PRESENT=1 DERPER_RUNNING=1 PURE_IP_OK=1 DESIRED_CONFIG_OK=0 DERPER_VERIFY_CLIENTS_EFFECTIVE=1 PORT_TLS_OK=1 PORT_STUN_OK=1; }
+  rc=0
+  out=$(main --check --ip 8.8.8.8 --derper-version "$requested" --goproxy https://proxy.invalid --gosumdb sum.golang.google.cn 2>&1) || rc=$?
+  [[ "$rc" -eq 0 ]] || fail "旧Go升级check不应调用Origin模板后失败：rc=$rc out=$out"
+  [[ "$out" == *'暂无法核对'* && "$out" == *'解析状态=unavailable'* ]] || fail "旧Go应保留安装阶段再解析的提示：$out"
+  [[ ! -e "$case_tmp/unexpected-query" ]] || fail '旧Go不得执行包含Origin的模块查询'
+}
+
+test_bug159_install_does_not_repeat_failed_prepare() {
+  local requested=3b273a64cef3fe6d3d495afae7bb6a553344ce64 out rc=0
+  BIN_PATH=/bin/bash DERPER_VERSION="$requested" LOCAL_BINARY=''
+  GOPROXY_ARG='https://proxy.invalid' GOSUMDB_ARG='sum.golang.google.cn' GOTOOLCHAIN_ARG=auto
+  _tmpdir="$case_tmp/install-tmp"; mkdir -p "$_tmpdir"
+  reset_derper_version_model
+  get_installed_derper_version() { printf 'v1.104.5\n'; }
+  prepare_go_build_root() { :; }
+  go_build_cache_root() { printf '%s\n' "$case_tmp/go-cache"; }
+  go() { printf 'go version go1.22.6 linux/arm64\n'; }
+  ensure_go() { :; }
+  _run_with_progress() {
+    printf '%s\n' "$*" >>"$case_tmp/go-calls"
+    printf '%s\n' 'invalid version: git ls-remote -q origin: exit status 128' >"$2"
+    return 1
+  }
+  derper_binary_needs_install >"$case_tmp/needs-install.out" 2>&1 || fail '目标解析失败后仍应判定需要安装'
+  out=$(cat "$case_tmp/needs-install.out")
+  [[ "${DERPER_VERSION_PREPARE_FAILED:-0}" -eq 1 ]] || fail '前置解析失败状态未保留'
+  local install_out
+  install_out=$(install_derper 2>&1) || rc=$?
+  out="${out}"$'\n'"${install_out}"
+  [[ "$rc" -ne 0 ]] || fail '正式安装不得忽略已失败的解析'
+  [[ "$(grep -c 'go list -m' "$case_tmp/go-calls")" -eq 1 ]] || fail "正式安装重复查询：$(cat "$case_tmp/go-calls")"
+  [[ "$(grep -c 'Go 目标模块解析/构建失败' <<<"$out")" -eq 1 ]] || fail "正式安装重复报错：$out"
+}
+
+test_bug160_short_tag_sha_does_not_become_source_commit() {
+  local requested=3b273a64cef3fe6d3d495afae7bb6a553344ce64
+  DERPER_VERSION="${requested:0:12}" LOCAL_BINARY='' GOPROXY_ARG='https://proxy.invalid' GOSUMDB_ARG='sum.golang.google.cn' GOTOOLCHAIN_ARG=auto
+  _tmpdir="$case_tmp/short-tag-tmp"; mkdir -p "$_tmpdir"
+  prepare_go_build_root() { :; }
+  go_build_cache_root() { printf '%s\n' "$case_tmp/go-cache"; }
+  go() { printf 'go version go1.22.6 linux/arm64\n'; }
+  _run_with_progress() {
+    if [[ "$*" == *'go list -m'* ]]; then
+      printf 'tailscale.com|v1.104.6||%s\n' "$requested"
+    fi
+  }
+  prepare_derper_version_model || fail '短revision解析本身应成功'
+  [[ "$DERPER_ORIGINAL_REVISION" == "${requested:0:12}" && -z "$DERPER_SOURCE_COMMIT" ]] || fail '短tag对象SHA前缀匹配时不得把完整tag SHA当成源commit'
+}
+
+test_bug162_base_go_checks_use_local_toolchain() {
+  local out
+  # 受外部 GOTOOLCHAIN=auto/go.mod 影响时，裸 go version 会下载工具链而误判；桩在非 local 时模拟不可用。
+  go() {
+    if [[ "${GOTOOLCHAIN:-}" != local ]]; then return 1; fi
+    if [[ "${1:-}" == version ]]; then printf 'go version go1.22.6 linux/amd64\n'; return 0; fi
+    return 1
+  }
+  export GOTOOLCHAIN=auto
+  go_toolchain_meets_min || fail '基础 Go 检查未固定 GOTOOLCHAIN=local，本地 Go 1.22.6 被误判不可用'
+  out=$(ensure_go 2>&1) || fail "ensure_go 不应因工具链选择失败：$out"
+  [[ "$out" == *'go1.22.6'* ]] || fail "ensure_go 日志未读取本地 Go 版本：$out"
+  [[ "$out" != *'官方工具链'* ]] || fail "ensure_go 误走重装基础 Go：$out"
+}
+
+test_bug163_iter1_vm_runtime_fixture_isolates_config() {
+  local vm="$ROOT_DIR/tests/test_iter1_vm.sh" starts
+  starts=$(grep -nE '^"\$BIN_PATH" .*-hostname 127\.0\.0\.1' "$vm" | head -n1)
+  [[ -n "$starts" ]] || fail '未找到运行夹具启动命令'
+  grep -qE '^"\$BIN_PATH" -c "\$NODE_STATE_DIR/derper\.json" ' "$vm" || fail '运行夹具未显式使用 -c 隔离配置'
+  grep -q 'ExecStart=%s -c %s ' "$vm" || fail '夹具 unit 未与实际启动参数一致（缺 -c）'
+  ! grep -q "RegionID\":900" "$vm" || fail '不得预写无 PrivateKey 的配置，应由 derper 生成'
+  grep -q '"PrivateKey"' "$vm" || fail '快照前未确认配置含有效 PrivateKey'
+}
+
+test_bug164_iter1_vm_gosumdb_uses_valid_verifier() {
+  local vm="$ROOT_DIR/tests/test_iter1_vm.sh"
+  grep -q "GOSUMDB_ARG='sum.golang.org https://sum.golang.invalid'" "$vm" || fail 'GOSUMDB 场景未使用合法 verifier + 故障 URL'
+  ! grep -q "GOSUMDB_ARG='sum.golang.invalid'" "$vm" || fail '仍使用非法裸 GOSUMDB 名'
+  grep -q 'connect_failed sum' "$vm" || fail '未断言校验库请求实际失败'
+}
+
 tests=(
+  test_bug162_base_go_checks_use_local_toolchain
+  test_bug163_iter1_vm_runtime_fixture_isolates_config
+  test_bug164_iter1_vm_gosumdb_uses_valid_verifier
+  test_bug158_check_without_usable_go_is_explicitly_unverified
+  test_bug159_install_does_not_repeat_failed_prepare
+  test_bug160_short_tag_sha_does_not_become_source_commit
+  test_bug156_check_upgrade_queries_module_once
+  test_bug157_needs_install_without_go_is_quiet_before_ensure_go
+  test_bug150_install_ignores_proxy_homepage_gate
+  test_bug151_final_source_commit_passes_real_daemon_gate_without_query
+  test_bug151_real_idempotence_preserves_and_reuses_version_model
+  test_iter1_version_model_and_toolchain_evidence
+  test_iter1_resolution_failure_preserves_direct_diagnostic
+  test_iter1_install_uses_resolved_module_version
+  test_iter1_model_reuse_does_not_weaken_same_origin
+  test_iter1_check_displays_resolved_version_model
+  test_bug146_goproxy_separators_and_terminal_modes
+  test_bug147_goproxy_effective_configuration_precedence
+  test_bug147_goproxy_unavailable_configuration_uses_default
+  test_bug146_goproxy_precheck_pipe_and_off
+  test_bug146_install_failure_respects_effective_proxy_paths
+  test_bug148_short_commit_pseudoversion_install_identity
+  test_bug148_short_commit_pseudoversion_daemon_identity
   test_bug144_install_failure_explains_transient_revision_resolution
   test_bug143_module_query_checks_both_filesystems_before_go
   test_bug143_module_query_rejects_untrusted_root_cache

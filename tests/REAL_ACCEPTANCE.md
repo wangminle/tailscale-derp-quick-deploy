@@ -10,6 +10,21 @@
 
 当前暂缺专用 Tailnet、Region 和独立客户端；第二步及后续步骤待资源就绪后执行。第一步保留为复现说明，无需因文档更新重复创建 VM。
 
+## 迭代一补充：真实Go受限网络构建（TST-039）
+
+此入口只验证 DEV-016，不替代下方 systemd、GD、H3 或长效验收。准备明确可销毁的 Linux VM、root、低于目标要求的 Go≥1.21 和可用模块代理；安装 `go git curl openssl tar python3 systemd`。复制当前 scripts/tests/VERSION 后执行：
+
+```bash
+sudo -i
+cd /root/derper-acceptance
+touch /root/DERPER_DISPOSABLE_ITER1_VM
+DERPER_ITER1_VM=1 bash tests/test_iter1_vm.sh
+```
+
+脚本先用 `systemd-detect-virt` 拒绝普通容器/WSL，再在 `/var/tmp` 的独立目录使用全新 Go 缓存构建。进程内 Git `insteadOf` 阻断 GitHub direct；本地 CONNECT fixture 只对本测试进程阻断 go.dev，其余 HTTPS 目标经真实隧道访问，不修改 VM 的 hosts 或全局网络。成功场景必须观察到高于基础 Go 的实际工具链切换，核对请求 SHA、规范模块版本、最终源 commit 和二进制元数据。
+
+失败场景分别注入不可达代理+direct和独立 GOSUMDB 故障，逐项比较既有二进制、证书/私钥、unit、配置及真实运行 derper 进程的 PID、启动时间和可执行文件身份。默认证据写入 `/root/derper-iter1-evidence/<时间>-<PID>/`，也可用 `DERPER_TEST_ARTIFACTS` 指定；包含 environment、分场景原始日志、网络阻断记录、前后快照和 cleanup。可用 `DERPER_TEST_GOPROXY`、`DERPER_TEST_GOSUMDB` 指定可信测试镜像/校验服务。0为全部场景及清理通过，1失败，2环境不符；失败时也保留证据。Docker结果只能辅助开发，不能关闭本项。
+
 ## 第一步：提供一次性VM（需要用户准备资源）
 
 准备两台**可销毁、无DERP部署**的Ubuntu22.04和24.04 VM。必须systemd PID1、虚拟机（普通容器/WSL不能替代）、root权限、2GB内存和可用网络。告知SSH主机别名、架构；不要发送私钥。普通固定矩阵CI在GitHub托管runner运行，真实PID1套件使用独立一次性VM/自托管runner。

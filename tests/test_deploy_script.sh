@@ -2780,6 +2780,7 @@ test_main_modes_end_to_end_orchestration() {
     _timeout_run() { shift; "$@"; }
 
     # 1) main --check：合法参数返回 0；非法参数仍输出总结但返回 1
+    derper_binary_needs_install() { return 1; }
     local out rc=0
     out=$(main --check --ip 8.8.8.8 2>&1) || rc=$?
     [[ "$rc" -eq 0 && "$out" == *"[检查] 参数与环境状态总结："* && "$out" == *"<已就绪：可直接跳过>"* ]] ||

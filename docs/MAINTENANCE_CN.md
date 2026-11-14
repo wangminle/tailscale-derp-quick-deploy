@@ -93,6 +93,8 @@ root 构建使用 `/var/cache/derper-deploy/go-build` 保存 GOPATH、模块和�
 
 每次下载工具链或构建前，脚本分别检查临时目录与缓存所在文件系统，默认各需至少1GiB可用空间，空间不足会在下载前失败。 独立执行 `go list -m` 版本解析也复用该空间和缓存安全预检，因为查询可能自动下载工具链；没有部署临时目录时，会在 `/var/tmp` 创建仅供本次查询使用的目录，成功或预检失败后均清理该目录，root 持久缓存保留。空间预检不保证编译内存足够，小内存主机仍需另验实际构建资源。可通过 `DERPER_GO_BUILD_CACHE_DIR` 调整缓存位置，或用 `DERPER_GO_MIN_FREE_KB` 调整最低空间；root 使用自定义缓存时同样必须满足属主和路径安全要求。
 
+需要构建时，`check` 与安装共用目标模块解析：分别保存请求值、规范模块版本、原始 revision 和最终确认的完整源 commit。tag 对象 SHA 不能直接视为 peeled 源 commit；代理响应没有 Origin 或映射有歧义时源 commit 保持未知。解析成功后安装固定到规范模块版本；同源比较只对相同原始 revision 或该模型已确认的最终源 commit 复用映射，幂等判断保留并复用同一模型，自定义构建不会仅凭相同 semver 放行。代理首页不再作为安装硬门禁，实际目标查询、工具链预检和构建结果才决定成败。基础 Go≥1.21 只代表可启动自动工具链机制，目标模块可能要求更高版本；实际查询通过当前 GOPROXY/GOSUMDB 获取并校验工具链，go.dev 仅用于仍需下载基础 Go 的路径。无需构建的既有部署不会被强制联网解析。
+
 ## 状态、指标与结果
 
 同一次核心采集供文本、JSON、指标和 derpmap 使用。JSON schema_version=1，包含 sampled_at、last_success_at、result/reason、needs_manual_attention、layers、目标参数、证书摘要、新鲜度及写入结果。缺失摘要/时间等为 null；last_success_at 为当前请求检查范围最近通过的时间，H3 未配置时不代表外部中继最近成功。

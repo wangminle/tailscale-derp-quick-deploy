@@ -44,6 +44,19 @@ GO_SHA256_ARM64="c15fa895341b8eaf7f219fada25c36a610eb042985dc1a912410c1c90098eaf
 
 # derper 版本（默认 latest，可通过 --derper-version 指定确定性版本）
 DERPER_VERSION="${DERPER_VERSION:-latest}"
+DERPER_REQUESTED_VERSION=""
+DERPER_RESOLVED_MODULE_VERSION=""
+DERPER_ORIGINAL_REVISION=""
+DERPER_SOURCE_COMMIT=""
+DERPER_VERSION_RESOLUTION_STATE="uninitialized"
+DERPER_VERSION_PREPARE_FAILED=0
+DERPER_BASE_GO_VERSION=""
+DERPER_MODULE_GO_VERSION=""
+DERPER_BUILD_TOOLCHAIN=""
+DERPER_BUILD_TOOLCHAIN_SOURCE=""
+DERPER_QUERY_OUTPUT=""
+DERPER_QUERY_ERROR=""
+DERPER_QUERY_TOOLCHAIN=""
 
 # 客户端校验：on=强制启用；off=禁用（默认 on）
 VERIFY_CLIENTS_MODE="on"
@@ -266,7 +279,7 @@ C/D阶段入口（旧参数继续支持）：
   --auto-ufw              若检测到 UFW，自动放行端口规则。
   --goproxy URL           设置 GOPROXY，例如 https://goproxy.cn,direct（默认继承环境）。
   --gosumdb VALUE         设置 GOSUMDB，例如 sum.golang.google.cn（默认继承环境）。
-  --gotoolchain MODE      go 工具链策略，默认 auto 以便自动获取 >=1.25 的工具链。
+  --gotoolchain MODE      go 工具链策略，默认 auto 以获取目标模块要求的工具链。
   --no-verify-clients     不验证客户端身份（仅测试，默认并不推荐）。
   --force-verify-clients  强制启用客户端校验（默认行为）。
   --region-id             ACL derpMap 的 RegionID（默认 900）。
@@ -971,7 +984,7 @@ get_installed_derper_version() {
   module_re='tailscale\.com(/cmd/derper)?[[:space:]]+v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?'
   version_re='v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?'
   if command -v go >/dev/null 2>&1; then
-    ver=$(go version -m "${BIN_PATH}" 2>/dev/null \
+    ver=$(GOTOOLCHAIN=local go version -m "${BIN_PATH}" 2>/dev/null \
       | awk '/^[[:space:]]*mod[[:space:]]+tailscale\.com([[:space:]]|$)/ {print $3; exit}')
   fi
   if [[ -z "$ver" ]]; then
@@ -1031,16 +1044,38 @@ prepare_go_build_root() {
   done
 }
 
-# 使用与构建一致的模块环境解析 commit；查询失败时保守重装，不冒充已对齐。
-resolve_derper_module_version() {
+reset_derper_version_model() {
+  DERPER_REQUESTED_VERSION="${1:-$DERPER_VERSION}"
+  DERPER_RESOLVED_MODULE_VERSION=""
+  DERPER_ORIGINAL_REVISION=""
+  DERPER_SOURCE_COMMIT=""
+  DERPER_BASE_GO_VERSION=""
+  DERPER_MODULE_GO_VERSION=""
+  DERPER_BUILD_TOOLCHAIN=""
+  DERPER_BUILD_TOOLCHAIN_SOURCE=""
+  DERPER_VERSION_RESOLUTION_STATE="unresolved"
+  DERPER_VERSION_PREPARE_FAILED=0
+  local requested_lc
+  requested_lc=$(printf '%s' "$DERPER_REQUESTED_VERSION" | tr 'A-Z' 'a-z')
+  if [[ "$requested_lc" =~ ^[0-9a-f]{7,40}$ ]]; then
+    DERPER_ORIGINAL_REVISION="$requested_lc"
+  fi
+}
+
+# 所有目标模块查询共用构建缓存、网络和工具链环境；结果通过全局字段返回，避免命令替换丢失证据。
+run_derper_go_command() {
   command -v go >/dev/null 2>&1 || return 1
-  # go list 也可能自动下载工具链；必须与构建入口共用空间和缓存安全预检。
-  # 独立调用时仅创建查询临时目录，不改变调用者的 _tmpdir 或删除持久缓存。
-  local _tmpdir="${_tmpdir:-}" go_build_root owns_tmp=0 rc=0
+  DERPER_QUERY_OUTPUT=""
+  DERPER_QUERY_ERROR=""
+  DERPER_QUERY_TOOLCHAIN=""
+  local label="$1" timeout="$2"
+  shift 2
+  local _tmpdir="${_tmpdir:-}" go_build_root owns_tmp=0 rc=0 query_err
   if [[ -z "$_tmpdir" ]]; then
     _tmpdir=$(mktemp -d /var/tmp/derper-go-query.XXXXXXXXXX) || return 1
     owns_tmp=1
   fi
+  query_err="${_tmpdir}/derper_module_query.err"
   if prepare_go_build_root; then
     go_build_root=$(go_build_cache_root) || rc=$?
     if [[ "$rc" -eq 0 ]]; then
@@ -1049,11 +1084,16 @@ resolve_derper_module_version() {
         "GOTMPDIR=${_tmpdir}/go-work" "TMPDIR=${_tmpdir}")
       [[ -z "$GOPROXY_ARG" ]] || envs+=("GOPROXY=$GOPROXY_ARG")
       [[ -z "$GOSUMDB_ARG" ]] || envs+=("GOSUMDB=$GOSUMDB_ARG")
-      _run_with_progress '解析 derper 同源版本' /dev/null 60 env "${envs[@]}" go list -m -f '{{.Version}}' "tailscale.com@$1" || rc=$?
+      DERPER_QUERY_OUTPUT=$(_run_with_progress "$label" "$query_err" "$timeout" env "${envs[@]}" "$@") || rc=$?
     fi
   else
     rc=$?
   fi
+  DERPER_QUERY_ERROR=$(sed -n '1,160p' "$query_err" 2>/dev/null || true)
+  DERPER_QUERY_TOOLCHAIN=$(printf '%s\n' "$DERPER_QUERY_ERROR" \
+    | grep -E 'switching to go ?[0-9]' | tail -n1 \
+    | grep -oE 'go ?[0-9]+\.[0-9]+(\.[0-9]+)?(rc[0-9]+)?' \
+    | sed 's/ //' || true)
   if [[ "$owns_tmp" -ne 0 ]]; then
     chmod -R u+w "$_tmpdir" 2>/dev/null || true
     if ! rm -rf "$_tmpdir"; then
@@ -1062,6 +1102,90 @@ resolve_derper_module_version() {
     fi
   fi
   return "$rc"
+}
+
+run_derper_module_query() {
+  run_derper_go_command '解析 derper 同源版本' 60 go list -m -f "$2" "tailscale.com@$1"
+}
+
+run_derper_toolchain_preflight() {
+  run_derper_go_command '验证 derper 构建工具链' 900 go install -n "tailscale.com/cmd/derper@$1"
+}
+
+# 兼容只需要模块版本的既有调用方。
+resolve_derper_module_version() {
+  run_derper_module_query "$1" '{{.Version}}' || return 1
+  [[ -n "$DERPER_QUERY_OUTPUT" ]] || return 1
+  printf '%s\n' "$DERPER_QUERY_OUTPUT"
+}
+
+explain_go_module_failure() {
+  local target="$1" error_text="$2" target_lc
+  echo "[错误] Go 目标模块解析/构建失败；请检查模块代理/校验数据库连通性。国内网络可显式使用 --goproxy https://goproxy.cn,direct；脚本保留现有代理设置，不自动切换第三方代理或关闭校验。" >&2
+  target_lc=$(printf '%s' "$target" | tr 'A-Z' 'a-z')
+  if [[ "$target_lc" =~ ^[0-9a-f]{7,40}$ ]] \
+    && [[ -n "$(goproxy_probe_targets)" ]] \
+    && goproxy_spec_allows_direct \
+    && printf '%s\n' "$error_text" | grep -Eq 'invalid version:.*git (ls-remote|fetch)|git (ls-remote|fetch) .*exit status 128'; then
+    echo "[提示] 模块代理未能把目标 ${target} 解析为版本，Go 已按 GOPROXY 回退 direct 直连源码站；大陆网络通常无法直连 GitHub。该解析失败多为代理瞬时故障，可先原样重试；持续失败请改用支持 revision 查询的代理，例如 --goproxy https://proxy.golang.com.cn,direct。" >&2
+  fi
+  [[ -z "$error_text" ]] || printf '%s\n' "$error_text" >&2
+}
+
+prepare_derper_version_model() {
+  reset_derper_version_model "$DERPER_VERSION"
+  if ! command -v go >/dev/null 2>&1 || ! go_toolchain_meets_min; then
+    DERPER_VERSION_RESOLUTION_STATE=unavailable
+    echo "[提示] 本机 Go 缺失或低于 ${MIN_GO_VERSION}，目标模块与工具链尚未验证；正式安装会先准备 Go 再重新解析。" >&2
+    return 1
+  fi
+  DERPER_BASE_GO_VERSION=$(parse_go_version "$(GOTOOLCHAIN=local go version 2>/dev/null || true)")
+  [[ -n "$DERPER_BASE_GO_VERSION" ]] || {
+    DERPER_VERSION_RESOLUTION_STATE=unavailable
+    echo '[错误] 无法读取基础 Go 版本，目标模块未验证。' >&2
+    return 1
+  }
+  run_derper_module_query "$DERPER_REQUESTED_VERSION" '{{.Path}}|{{.Version}}|{{.GoVersion}}|{{if .Origin}}{{.Origin.Hash}}{{end}}' || {
+    DERPER_VERSION_RESOLUTION_STATE=unresolved
+    explain_go_module_failure "$DERPER_REQUESTED_VERSION" "$DERPER_QUERY_ERROR"
+    return 1
+  }
+  local path module go_requirement source extra
+  IFS='|' read -r path module go_requirement source extra <<<"$DERPER_QUERY_OUTPUT"
+  if [[ "$path" != tailscale.com || ! "$module" =~ ^v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ || -n "$extra" ]]; then
+    DERPER_VERSION_RESOLUTION_STATE=invalid_response
+    echo "[错误] Go 返回了无法确认的目标模块元数据：${DERPER_QUERY_OUTPUT}" >&2
+    return 1
+  fi
+  DERPER_RESOLVED_MODULE_VERSION="$module"
+  [[ "$go_requirement" == '<nil>' ]] || DERPER_MODULE_GO_VERSION="$go_requirement"
+  local module_mod
+  module_mod="$(go_build_cache_root)/gopath/pkg/mod/cache/download/tailscale.com/@v/${module}.mod"
+  if [[ -f "$module_mod" ]]; then
+    go_requirement=$(awk '$1 == "go" {print $2; exit}' "$module_mod" 2>/dev/null || true)
+    [[ -z "$go_requirement" ]] || DERPER_MODULE_GO_VERSION="$go_requirement"
+  fi
+  source=$(printf '%s' "$source" | tr 'A-Z' 'a-z')
+  if [[ "$source" =~ ^[0-9a-f]{40}$ ]]; then
+    # 规范标签与原请求相同仍可能是 annotated tag 对象；这种歧义保留源 commit 未知。
+    if [[ -z "$DERPER_ORIGINAL_REVISION" || "$source" != "$DERPER_ORIGINAL_REVISION"* ]] \
+      || [[ "$module" =~ [.-][0-9]{14}-[0-9a-f]{12}$ && "$source" == "${module##*-}"* ]]; then
+      DERPER_SOURCE_COMMIT="$source"
+    fi
+  fi
+  run_derper_toolchain_preflight "$module" || {
+    DERPER_VERSION_RESOLUTION_STATE=toolchain_unverified
+    explain_go_module_failure "$module" "$DERPER_QUERY_ERROR"
+    return 1
+  }
+  if [[ -n "$DERPER_QUERY_TOOLCHAIN" ]]; then
+    DERPER_BUILD_TOOLCHAIN="$DERPER_QUERY_TOOLCHAIN"
+    DERPER_BUILD_TOOLCHAIN_SOURCE=go_install_switch_message
+  else
+    DERPER_BUILD_TOOLCHAIN="go${DERPER_BASE_GO_VERSION}"
+    DERPER_BUILD_TOOLCHAIN_SOURCE=local_after_successful_noop_install
+  fi
+  DERPER_VERSION_RESOLUTION_STATE=resolved
 }
 
 # 判断是否需要安装/重装 derper：缺失、或目标版本（非 latest）与已安装不一致。
@@ -1090,13 +1214,33 @@ derper_binary_needs_install() {
     if [[ "$want_lc" =~ ^[0-9a-f]{7,40}$ ]]; then
       # Go 伪版本只保存 12 位 revision；必须比较末尾，不能任意子串命中。
       local revision="${have_lc##*-}" canonical=""
-      if [[ "$have_lc" =~ [.-][0-9]{14}-[0-9a-f]{12}$ && "$want_lc" == "$revision"* ]]; then
+      if [[ "$have_lc" =~ [.-][0-9]{14}-[0-9a-f]{12}$ ]] \
+        && [[ "$want_lc" == "$revision"* || "$revision" == "$want_lc"* ]]; then
         return 1
       fi
       # commit 恰好是发布标签时，Go 记录规范标签而非伪版本。
-      canonical=$(resolve_derper_module_version "$want_lc" || true)
-      if [[ -n "$canonical" && "$(normalize_version_tag "$canonical")" == "$have" ]]; then
-        return 1
+      # 主流程先解析一次并保留完整模型；后续同源、安装与候选门禁共用该证据。
+      if [[ "${DERPER_VERSION_RESOLUTION_STATE:-uninitialized}" == unresolved ]]; then
+        if ! command -v go >/dev/null 2>&1 || ! go_toolchain_meets_min; then
+          # 此时尚未执行 ensure_go；缺 Go 或 Go 过旧无法预先核对同源身份，静默交由安装阶段补齐后重新解析。
+          echo "[提示] 本机 Go 缺失或低于 ${MIN_GO_VERSION}，暂无法核对已安装 derper 的同源身份；将在安装阶段准备 Go 后重新解析。" >&2
+        elif prepare_derper_version_model; then
+          if same_derper_identity "$want_lc" "$have_lc"; then
+            return 1
+          fi
+        else
+          # 已查询且失败；调用方不得再重复查询/重复输出同一错误。
+          DERPER_VERSION_PREPARE_FAILED=1
+        fi
+      elif [[ "${DERPER_VERSION_RESOLUTION_STATE:-uninitialized}" == resolved ]]; then
+        if same_derper_identity "$want_lc" "$have_lc"; then
+          return 1
+        fi
+      else
+        canonical=$(resolve_derper_module_version "$want_lc" || true)
+        if [[ -n "$canonical" && "$(normalize_version_tag "$canonical")" == "$have" ]]; then
+          return 1
+        fi
       fi
     fi
     echo "[信息] 已安装 derper=${have}，目标=${want}，将重新安装以对齐版本。"
@@ -1530,7 +1674,7 @@ parse_go_version() {
 # 当前 PATH 中的 go 是否满足 MIN_GO_VERSION（GOTOOLCHAIN=auto 的下限）。
 go_toolchain_meets_min() {
   local have
-  have=$(parse_go_version "$(go version 2>/dev/null || true)")
+  have=$(parse_go_version "$(GOTOOLCHAIN=local go version 2>/dev/null || true)")
   [[ -n "$have" ]] && ver_ge "$have" "${MIN_GO_VERSION}"
 }
 
@@ -2139,19 +2283,34 @@ install_deps() {
   fi
 }
 
-# 解析 GOPROXY 列表，跳过 direct/off，供连通性预检使用。
+# 与 Go 一致：CLI 覆盖环境，环境为空时读取 go env（含 GOENV 持久配置）。
+# 读取配置强制使用本地工具链，不因预检下载工具链；无 Go/查询失败才退回默认值。
 goproxy_probe_spec() {
-  printf '%s\n' "${GOPROXY_ARG:-${GOPROXY:-https://proxy.golang.org,direct}}"
+  local spec="${GOPROXY_ARG:-${GOPROXY:-}}"
+  if [[ -z "$spec" ]] && command -v go >/dev/null 2>&1; then
+    spec=$(GOTOOLCHAIN=local go env GOPROXY 2>/dev/null) || spec=''
+  fi
+  printf '%s\n' "${spec:-https://proxy.golang.org,direct}"
 }
 
+gosumdb_probe_spec() {
+  local spec="${GOSUMDB_ARG:-${GOSUMDB:-}}"
+  if [[ -z "$spec" ]] && command -v go >/dev/null 2>&1; then
+    spec=$(GOTOOLCHAIN=local go env GOSUMDB 2>/dev/null) || spec=''
+  fi
+  printf '%s\n' "${spec:-sum.golang.org}"
+}
+
+# 逗号与竖线均为分隔符；off/direct 均终止列表，后续项不是有效目标。
 goproxy_probe_targets() {
   local spec part
   spec=$(goproxy_probe_spec)
-  local IFS=','
+  local IFS=',|'
   for part in $spec; do
     part="${part#"${part%%[![:space:]]*}"}"
     part="${part%"${part##*[![:space:]]}"}"
-    [[ -n "$part" && "$part" != "direct" && "$part" != "off" ]] || continue
+    [[ "$part" != direct && "$part" != off ]] || break
+    [[ -n "$part" ]] || continue
     printf '%s\n' "$part"
   done
 }
@@ -2159,10 +2318,11 @@ goproxy_probe_targets() {
 goproxy_spec_allows_direct() {
   local spec part
   spec=$(goproxy_probe_spec)
-  local IFS=','
+  local IFS=',|'
   for part in $spec; do
     part="${part#"${part%%[![:space:]]*}"}"
     part="${part%"${part##*[![:space:]]}"}"
+    [[ "$part" != off ]] || break
     [[ "$part" == "direct" ]] && return 0
   done
   return 1
@@ -2174,7 +2334,7 @@ probe_http_url() {
     || curl --connect-timeout 5 --max-time 5 -fsS -o /dev/null "$url" 2>/dev/null
 }
 
-# 构建前探测模块代理；失败立即提示 --goproxy，不自动切换第三方代理。
+# 独立诊断用的代理首页探测；安装由实际目标查询、工具链预检和构建结果判断。
 # GOPROXY 含 direct 时，代理全不可达仍交由 Go 直连，避免误杀 ,direct 回退。
 precheck_go_network() {
   local target any=0
@@ -2209,11 +2369,11 @@ precheck_go_download() {
 # 确保系统有足够新的 Go（>= MIN_GO_VERSION）。发行版包经常偏旧，GOTOOLCHAIN=auto 在 1.21 之前不可用。
 ensure_go() {
   if go_toolchain_meets_min; then
-    echo "[信息] 已检测到 Go：$(go version 2>/dev/null)"
+    echo "[信息] 已检测到 Go：$(GOTOOLCHAIN=local go version 2>/dev/null)"
     return 0
   fi
   if command -v go >/dev/null 2>&1; then
-    echo "[警告] 已安装 Go 版本过低（$(go version 2>/dev/null)），需要 >= ${MIN_GO_VERSION}（GOTOOLCHAIN=auto 在此之前不可用）。将安装官方工具链 ${GO_VERSION}。" >&2
+    echo "[警告] 已安装 Go 版本过低（$(GOTOOLCHAIN=local go version 2>/dev/null)），需要 >= ${MIN_GO_VERSION}（GOTOOLCHAIN=auto 在此之前不可用）。将安装官方工具链 ${GO_VERSION}。" >&2
   else
     echo "[步骤] 未检测到 go，尝试通过系统包管理器安装 golang-go…"
     if command -v apt >/dev/null 2>&1; then
@@ -2224,11 +2384,11 @@ ensure_go() {
       yum install -y golang || true
     fi
     if go_toolchain_meets_min; then
-      echo "[信息] Go 安装完成：$(go version 2>/dev/null)"
+      echo "[信息] Go 安装完成：$(GOTOOLCHAIN=local go version 2>/dev/null)"
       return 0
     fi
     if command -v go >/dev/null 2>&1; then
-      echo "[警告] 发行版 Go 仍低于 ${MIN_GO_VERSION}（$(go version 2>/dev/null)），改为安装官方工具链 ${GO_VERSION}。" >&2
+      echo "[警告] 发行版 Go 仍低于 ${MIN_GO_VERSION}（$(GOTOOLCHAIN=local go version 2>/dev/null)），改为安装官方工具链 ${GO_VERSION}。" >&2
     fi
   fi
   # 兜底：按架构安装官方二进制（最新稳定工具链可再由 GOTOOLCHAIN 自动拉取）。
@@ -2280,7 +2440,7 @@ ensure_go() {
   
   if [[ -d /usr/local/go ]]; then
     local existing_go_ver
-    existing_go_ver=$(/usr/local/go/bin/go version 2>/dev/null | awk '{print $3}' || echo "未知")
+    existing_go_ver=$(GOTOOLCHAIN=local /usr/local/go/bin/go version 2>/dev/null | awk '{print $3}' || echo "未知")
     echo "[警告] 将替换已有 Go 安装：$existing_go_ver → Go ${GO_VERSION}" >&2
     if [[ "${NON_INTERACTIVE}" -ne 1 ]]; then
       local _go_confirm=""
@@ -2297,7 +2457,7 @@ ensure_go() {
   mkdir -p /etc/profile.d
   echo 'export PATH=/usr/local/go/bin:$PATH' >/etc/profile.d/go.sh
   export PATH=/usr/local/go/bin:$PATH
-  echo "[信息] Go 安装完成：$(go version 2>/dev/null || echo 失败)"
+  echo "[信息] Go 安装完成：$(GOTOOLCHAIN=local go version 2>/dev/null || echo 失败)"
 }
 
 deploy_state_root() {
@@ -2729,8 +2889,16 @@ same_derper_identity() {
     return 1
   fi
   rev="${module##*-}"
-  if [[ "$module" =~ [.-][0-9]{14}-[0-9a-f]{12}$ && "$commit" == "$rev"* ]]; then
+  if [[ "$module" =~ [.-][0-9]{14}-[0-9a-f]{12}$ ]] \
+    && [[ "$commit" == "$rev"* || "$rev" == "$commit"* ]]; then
     return 0
+  fi
+  if [[ "${DERPER_VERSION_RESOLUTION_STATE:-uninitialized}" == resolved ]] \
+    && [[ "$DERPER_ORIGINAL_REVISION" == "$commit" || "$DERPER_SOURCE_COMMIT" == "$commit" ]]; then
+    canon=$(normalize_version_tag "$DERPER_RESOLVED_MODULE_VERSION")
+    module=$(normalize_version_tag "$module")
+    [[ -n "$canon" && "$canon" == "$module" ]]
+    return
   fi
   canon=$(resolve_derper_module_version "$commit" || true)
   canon=$(normalize_version_tag "$canon")
@@ -3389,8 +3557,14 @@ install_derper() {
     exit 1
   fi
   prepare_go_build_root || exit 1
-  precheck_go_network || exit 1
   ensure_go
+  [[ "${DERPER_VERSION_PREPARE_FAILED:-0}" -eq 0 ]] || exit 1
+  if [[ "${DERPER_VERSION_RESOLUTION_STATE:-uninitialized}" != uninitialized ]]; then
+    if [[ "$DERPER_VERSION_RESOLUTION_STATE" != resolved ]]; then
+      prepare_derper_version_model || exit 1
+    fi
+    DERPER_VERSION="$DERPER_RESOLVED_MODULE_VERSION"
+  fi
   local candidate_dir go_build_root
   candidate_dir="$(deploy_state_root)/candidate"
   go_build_root=$(go_build_cache_root) || exit 1
@@ -3404,13 +3578,9 @@ install_derper() {
   if [[ -n "${GOSUMDB_ARG}" ]]; then envs+=("GOSUMDB=${GOSUMDB_ARG}"); fi
   echo "[信息] 安装 derper 版本：${DERPER_VERSION}"
   if ! _run_with_progress '下载/编译 derper' "${_tmpdir}/derper_install.err" 900 env "${envs[@]}" go install "tailscale.com/cmd/derper@${DERPER_VERSION}"; then
-    echo "[错误] go install 失败；请检查模块代理/校验数据库连通性。国内网络可显式使用 --goproxy https://goproxy.cn,direct；脚本保留现有代理设置，不自动切换第三方代理或关闭校验。" >&2
-    # commit/revision 目标需由代理解析为模块版本；代理瞬时失败时 Go 会回退 direct 直连源码站，
-    # 大陆网络直连 GitHub 通常被阻断。给出与“代理不可达”不同的定向提示。
-    if grep -Eq 'invalid version:.*git ls-remote|git ls-remote .*exit status 128' "${_tmpdir}/derper_install.err" 2>/dev/null; then
-      echo "[提示] 模块代理未能把目标 ${DERPER_VERSION} 解析为版本，Go 已按 GOPROXY 回退 direct 直连源码站；大陆网络通常无法直连 GitHub。该解析失败多为代理瞬时故障，可先原样重试；持续失败请改用支持 revision 查询的代理，例如 --goproxy https://proxy.golang.com.cn,direct。" >&2
-    fi
-    sed -n '1,160p' "${_tmpdir}/derper_install.err" >&2 || true
+    local install_error
+    install_error=$(sed -n '1,160p' "${_tmpdir}/derper_install.err" 2>/dev/null || true)
+    explain_go_module_failure "$DERPER_VERSION" "$install_error"
     exit 1
   fi
   if [[ ! -x "${candidate_dir}/derper" ]]; then
@@ -8472,6 +8642,25 @@ main() {
   check_live_cert_status
 
   if [[ "${DRY_RUN}" -eq 1 || "${CHECK_ONLY}" -eq 1 ]]; then
+    align_derper_version_with_tailscale
+    # 与正式安装分支一致：先进入 unresolved，避免旧包装在 needs_install 内重复查询模块。
+    reset_derper_version_model
+    if derper_binary_needs_install; then
+      if [[ "${DERPER_VERSION_PREPARE_FAILED:-0}" -eq 1 ]]; then
+        check_validate_failed=1
+      elif [[ "${DERPER_VERSION_RESOLUTION_STATE:-uninitialized}" != resolved ]]; then
+        if ! command -v go >/dev/null 2>&1 || ! go_toolchain_meets_min; then
+          DERPER_VERSION_RESOLUTION_STATE=unavailable
+        else
+          prepare_derper_version_model || check_validate_failed=1
+        fi
+      fi
+    else
+      if [[ "${DERPER_VERSION_RESOLUTION_STATE:-uninitialized}" != resolved ]]; then
+        reset_derper_version_model
+        DERPER_VERSION_RESOLUTION_STATE=not_required
+      fi
+    fi
     local ip_show="<未探测到>"
     [[ -n "${IP_ADDR}" ]] && ip_show="${IP_ADDR}"
     echo "[检查] 参数与环境状态总结："
@@ -8487,7 +8676,10 @@ main() {
     echo "- derper：二进制=${DERPER_BIN} 服务文件=${DERPER_SERVICE_PRESENT} 运行=${DERPER_RUNNING}"
     local derper_installed_ver=""
     derper_installed_ver=$(get_installed_derper_version 2>/dev/null || true)
-    echo "- derper 版本：已安装=${derper_installed_ver:-<未知>} 目标=${DERPER_VERSION}"
+    echo "- derper 版本：已安装=${derper_installed_ver:-<未知>} 目标=${DERPER_VERSION} 请求=${DERPER_REQUESTED_VERSION:-$DERPER_VERSION} 模块=${DERPER_RESOLVED_MODULE_VERSION:-<未知>}"
+    echo "- revision 证据：原始 revision=${DERPER_ORIGINAL_REVISION:-<无>} 最终源 commit=${DERPER_SOURCE_COMMIT:-<未知>} 解析状态=${DERPER_VERSION_RESOLUTION_STATE}"
+    echo "- Go 构建：基础 Go=${DERPER_BASE_GO_VERSION:-<未知>} 模块 Go 要求=${DERPER_MODULE_GO_VERSION:-<未知>} 构建工具链=${DERPER_BUILD_TOOLCHAIN:-<未知>}"
+    echo "- Go 校验路径：GOPROXY=$(goproxy_probe_spec) GOSUMDB=$(gosumdb_probe_spec)"
     echo "- 端口监听：TLS=${PORT_TLS_OK} STUN=${PORT_STUN_OK}"
     echo "- 纯 IP 配置判定（基于 unit）：${PURE_IP_OK}"
     echo "- 目标配置匹配（基于 unit）：${DESIRED_CONFIG_OK}"
@@ -8557,6 +8749,7 @@ main() {
   precheck_verify_clients
   # verify-clients 启用时，将 derper 版本对齐到本机 tailscale 版本（同源构建）
   align_derper_version_with_tailscale
+  reset_derper_version_model
 
   # 对齐后若目标版本与已安装二进制不一致，必须重装（无需额外 --force）
   local need_derper_install=0

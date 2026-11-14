@@ -95,6 +95,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 - Port occupation status
 - Tailscale installation and login state
 - System dependency integrity
+- When a build is needed: requested/resolved module versions, separate revision evidence, base/target Go requirements, selected toolchain, and GOPROXY/GOSUMDB
 - Repair recommendations
 
 ##### Step 3: Formal Deployment
@@ -175,13 +176,15 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # Use current login user
 
 While resolving the same-origin module version and downloading/building derper, the terminal refreshes animated dots and elapsed seconds every second and shows the stage time limit (60 and 900 seconds respectively). The dots mean the task is still running; the first dependency or toolchain download may take a while. The result and total duration are printed when a stage ends, and a build failure prints the error details. Redirected logs, `TERM=dumb`, and JSON mode keep only the static start/end messages; progress output goes to stderr.
 
-Build caches (`GOPATH`, `GOMODCACHE`, and `GOCACHE`) stay in the run's secure temporary directory and are removed on exit. The script does not write to or clean the caller's existing `~/go`; later rebuilds download dependencies again.
+When a build is needed, check and installation share actual target-module resolution. The requested value, canonical module version, original revision, and confirmed final source commit remain separate; ambiguous tag/revision mappings stay unknown. Installation uses the resolved module version without weakening same-origin checks. Base Go≥1.21 only enables automatic toolchain selection; the target module may require a newer toolchain, downloaded and verified through GOPROXY/GOSUMDB. No online resolution is forced when an existing deployment needs no build.
+
+Root build caches (`GOPATH`, `GOMODCACHE`, and `GOCACHE`) persist under `/var/cache/derper-deploy/go-build` by default; independent non-root queries/tests use isolated temporary caches. The script does not write to or clean the caller's existing `~/go`.
 
 | Parameter | Description | Default | Recommended (China) |
 |-----------|-------------|---------|---------------------|
 | `--goproxy <URL>` | Go module proxy (no automatic third-party fallback) | Inherit env | `https://goproxy.cn,direct` |
 | `--gosumdb <VALUE>` | Go checksum database | Inherit env | `sum.golang.google.cn` |
-| `--gotoolchain <MODE>` | Toolchain policy | `auto` | `auto` (auto-fetch ≥1.25) |
+| `--gotoolchain <MODE>` | Toolchain policy | `auto` | `auto` (fetch the target-required toolchain) |
 | `--derper-version <VER>` | Pin derper module version or git commit | `latest` | `--derper-version v1.80.0` |
 
 ##### Security & Account Management
@@ -224,7 +227,7 @@ Deploy and `--check` read `tailscale debug derp-map` with Python 3 for a read-on
 
 | Parameter | Description | System Impact | When to Use |
 |-----------|-------------|---------------|-------------|
-| `--check` / `--dry-run` | Check only, no system changes. Prints both target and deployed run user. | ❌ None | Diagnose issues, verify parameters |
+| `--check` / `--dry-run` | Check only; no service, unit, certificate, or firewall changes. Target resolution may update Go caches when a build is needed. Prints both target and deployed run user. | Go cache only | Diagnose issues, verify parameters |
 | `--repair` | Fix configuration (certs/service); reinstalls derper only if the binary drifts from the aligned version. Inherits deployed `User=` unless a user flag is given. | 🔧 Service restart | Certificate expiry, config drift |
 | `--force` | Force complete reinstall | 🔄 Full rebuild | Version upgrade, complete reset |
 | `--yes` / `--non-interactive` | Skip ordinary prompts | Does **not** confirm certificate fingerprint rotation | CI / automation |
@@ -629,6 +632,7 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 - 端口占用情况
 - Tailscale 安装与登录状态
 - 系统依赖完整性
+- 需要构建时：请求/解析模块版本、分离的 revision 证据、基础/目标 Go 要求、构建工具链及 GOPROXY/GOSUMDB
 - 给出修复建议
 
 ##### 第三步：正式部署
@@ -709,13 +713,15 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # 使用当前登录用户
 
 同源模块版本解析和下载/编译 derper 时，终端每秒刷新跳点与已等待秒数，并显示阶段时限（分别为 60 秒和 900 秒）。跳点表示任务仍在执行；首次下载依赖或工具链可能较慢。结束后显示结果与耗时，构建失败会输出错误详情。重定向日志、`TERM=dumb` 或 JSON 模式只保留静态起止提示，进度信息写入 stderr。
 
-构建缓存（`GOPATH`、`GOMODCACHE`、`GOCACHE`）只放在本次安全临时目录并随退出清理，不写入或删除调用者已有的 `~/go`；后续重建会重新下载依赖。
+需要构建时，`check` 与安装共用真实目标模块解析。请求值、规范模块版本、原始 revision 和已确认的最终源 commit 分开保存；有歧义的 tag/revision 映射保持未知。安装使用解析后的模块版本，但不削弱同源门禁。基础 Go≥1.21 只代表可启动自动工具链机制，目标模块可能要求更高版本，由 GOPROXY/GOSUMDB 下载并校验。无需构建的既有部署不强制联网解析。
+
+root 构建缓存（`GOPATH`、`GOMODCACHE`、`GOCACHE`）默认持久保存在 `/var/cache/derper-deploy/go-build`；非 root 独立查询/测试使用隔离临时缓存。不写入或删除调用者已有的 `~/go`。
 
 | 参数 | 说明 | 默认值 | 推荐值（国内） |
 |------|------|--------|----------------|
 | `--goproxy <URL>` | Go 模块代理（不会自动切换第三方代理） | 继承环境 | `https://goproxy.cn,direct` |
 | `--gosumdb <VALUE>` | Go 校验数据库 | 继承环境 | `sum.golang.google.cn` |
-| `--gotoolchain <MODE>` | 工具链策略 | `auto` | `auto`（自动获取 ≥1.25）|
+| `--gotoolchain <MODE>` | 工具链策略 | `auto` | `auto`（获取目标模块要求的工具链）|
 | `--derper-version <VER>` | 固定 derper 模块版本或 git commit | `latest` | `--derper-version v1.80.0` |
 
 ##### 安全与账户管理
@@ -758,7 +764,7 @@ RUN_USER="${SUDO_USER:-${USER:-$(id -un)}}" # 使用当前登录用户
 
 | 参数 | 说明 | 系统影响 | 使用时机 |
 |------|------|----------|----------|
-| `--check` / `--dry-run` | 仅检查，不修改系统。同时打印目标运行用户与已部署用户。 | ❌ 无 | 诊断问题、验证参数 |
+| `--check` / `--dry-run` | 不修改服务、unit、证书或防火墙；需要构建时的目标解析可能更新 Go 缓存。同时打印目标运行用户与已部署用户。 | 仅 Go 缓存 | 诊断问题、验证参数 |
 | `--repair` | 修复配置（证书/服务）；仅当已部署二进制与对齐目标版本不一致时才重装 derper。未指定用户时继承已部署 `User=`。 | 🔧 重启服务 | 证书过期、配置漂移 |
 | `--force` | 强制全量重装 | 🔄 完全重建 | 版本升级、彻底重置 |
 | `--yes` / `--non-interactive` | 跳过普通交互确认 | **不能**代替证书指纹轮换确认 | CI / 自动化 |

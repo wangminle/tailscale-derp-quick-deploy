@@ -222,7 +222,10 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
   - 满足=false：升级到 `REQUIRED_TS_VER` 或更高版本。
   - 未登录：`sudo tailscale up` 完成登录（或使用 `--authkey`）。
 - derper 组件（二进制/服务文件/运行）
-  - 二进制=0：正式安装阶段会自动构建安装；离线环境可 `go install tailscale.com/cmd/derper@latest`。
+  - 二进制=0：正式安装阶段会自动构建安装；预构建产物可用 `--binary FILE --binary-sha256 HEX --derper-version VER` 导入，但默认同源门禁仍可能需要联网解析映射，不能将其理解为无条件离线部署。
+  - 需要构建时会实际解析目标模块并显示请求值、规范模块版本、原始 revision、最终完整源 commit 和解析状态；原始 revision 可能是 tag 对象 SHA，不能直接当成 peeled 源 commit，未确认的字段显示未知。
+  - Go 构建行分别显示基础 Go、目标模块 Go 要求和实际有证据的构建工具链；Go 校验路径显示有效 GOPROXY/GOSUMDB。代理首页可达不代替目标模块与工具链验证。
+  - 缺少 Go 或基础 Go 低于 1.21 时，构建目标显示 `unavailable`：不会用旧 Go 查询 Origin，也不会仅因此使其他只读 check 失败；正式安装会先准备 Go 再解析，准备后仍失败则停止安装。
   - 服务文件=0：正式安装会自动写入 systemd；无 systemd 见下述“服务管理器”。
   - 运行=0：`journalctl -u derper -f` 看日志，多为端口冲突或证书路径/权限问题。
 - 端口监听（TLS / STUN）
@@ -266,9 +269,9 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh \
 --auto-ufw                若检测到 UFW，自动放行端口
 
 --goproxy <URL>           Go 模块代理，例：https://goproxy.cn,direct
-                          构建前会做 5 秒连通性预检；失败请显式传入，脚本不自动切换
+                          以实际目标查询和构建判断成败，不用代理首页作硬门禁；不自动切换
 --gosumdb <VALUE>         Go 校验数据库，例：sum.golang.google.cn
---gotoolchain <MODE>      go 工具链策略，默认 auto（可自动拉取 ≥1.25）
+--gotoolchain <MODE>      go 工具链策略，默认 auto（按目标模块要求获取工具链）
 
 --no-verify-clients       关闭客户端校验（默认不开启此项；仅测试）
 --force-verify-clients    强制开启客户端校验（默认行为）
@@ -737,13 +740,15 @@ sudo bash scripts/deploy_derper_ip_selfsigned.sh --uninstall --purge-all
     ```bash
     --goproxy https://goproxy.cn,direct --gosumdb sum.golang.google.cn
     ```
-- Go 模块代理解析 commit/revision 失败（报错含 `invalid version: … git ls-remote … exit status 128`）：
-  - 原因：启用 `-verify-clients` 且未指定 `--derper-version` 时，脚本按 tailscaled 的 Git commit 安装；代理若暂时无法把该 commit 解析为模块版本，Go 会按 `GOPROXY` 列表回退 `direct` 直连 GitHub，大陆网络通常被阻断。
+- Go 模块代理解析 commit/revision 失败（报错含 `invalid version`，且 direct 源码访问出现 `git ls-remote` 或 `git fetch` 的 `exit status 128`）：
+  - 原因：启用 `-verify-clients` 且未指定 `--derper-version` 时，脚本先把 tailscaled 报告的 revision 解析为规范模块版本，成功后按该模块版本安装；代理若暂时无法完成解析，Go 会按 `GOPROXY` 列表回退 `direct` 直连 GitHub，大陆网络通常被阻断。
   - 处理：先原样重试，代理侧解析失败多为瞬时；持续失败时改用支持 revision 查询的代理，例如 `--goproxy https://proxy.golang.com.cn,direct --gosumdb sum.golang.google.cn`。不要为绕过该失败关闭 `-verify-clients` 或校验数据库。
   - 影响范围：失败发生在候选二进制发布之前，现有 derper 不会被替换。
-- Go 版本不足：
-  - 新版 Tailscale 需要 Go ≥ 1.25。脚本默认 `--gotoolchain auto`，会自动拉取更高版本工具链。
-  - 产品构建的 `GOPATH`、`GOMODCACHE`、`GOCACHE` 位于本次安全临时目录并随退出清理，不写入或删除调用者已有的 `~/go`；需要重建时会重新下载依赖。
+- Go 版本与工具链：
+  - 基础 Go ≥1.21 只负责启动自动工具链机制，不等于满足目标 derper 的编译要求。脚本通过实际目标模块查询显示模块 Go 要求，并默认用 `--gotoolchain auto` 经当前 GOPROXY/GOSUMDB 下载和校验所需工具链。
+  - 基础 Go 已满足启动门槛时，go.dev 不可达不妨碍经模块代理获取工具链；只有仍需下载基础 Go 官方包时才检查 go.dev。目标查询或校验失败会非零退出，不关闭校验或发布未确认候选。
+  - GOSUMDB 查询出现瞬时 `unexpected EOF` 或 TLS handshake timeout 时，可原样重试并利用已校验缓存；不得用 `--gosumdb off`、关闭校验或改用未知来源来绕过。
+  - root 构建的 `GOPATH`、`GOMODCACHE`、`GOCACHE` 持久保存在 `/var/cache/derper-deploy/go-build`，跨运行复用，退出时不删除；可通过 `DERPER_GO_BUILD_CACHE_DIR` 指定满足属主和路径要求的缓存目录。非 root 的独立查询/测试缓存使用本次安全临时目录。查询与构建的 `GOTMPDIR`、`TMPDIR` 使用经空间预检的临时目录并在退出时清理；不写入或删除调用者已有的 `~/go`。详见[Go 构建缓存与磁盘空间](MAINTENANCE_CN.md#go-构建缓存与磁盘空间)。
 - `derper --version` 显示 `ERR-BuildInfo`：
   - 这是 `go install tailscale.com/cmd/derper@版本` 未注入上游 release 版本戳的显示问题，不代表模块版本或服务异常。用 `go version -m /usr/local/bin/derper` 或脚本 `status` 核对实际模块版本；无 Go 时脚本也从二进制模块信息兜底解析。
 - derper 参数不兼容：

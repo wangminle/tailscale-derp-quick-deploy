@@ -187,7 +187,10 @@ Pre-check outputs several key items, their meanings and solutions (in order of a
   - Meets=false: Upgrade to `REQUIRED_TS_VER` or higher.
   - Not logged in: `sudo tailscale up` to complete login (or use `--authkey`).
 - derper components (binary/service file/running)
-  - Binary=0: Formal installation phase will auto-build; for offline environments, use `go install tailscale.com/cmd/derper@latest`.
+  - Binary=0: Formal installation auto-builds. A prebuilt artifact can be imported with `--binary FILE --binary-sha256 HEX --derper-version VER`, but the default same-origin gate may still need to resolve mappings online; this is not an unconditional offline promise.
+  - When a build is needed, the script resolves the actual target module and prints the requested value, canonical module version, original revision, final full source commit, and resolution state. The original revision may be a tag-object SHA and must not be presented as the peeled source commit; unconfirmed fields remain unknown.
+  - The Go build line separates the base Go, target-module Go requirement, and build toolchain supported by actual evidence. The Go verification path shows effective GOPROXY/GOSUMDB. Reaching a proxy homepage does not replace target-module and toolchain verification.
+  - If Go is missing or base Go is older than 1.21, the build target is `unavailable`: the old toolchain is not used for an Origin query, and other read-only checks do not fail solely for this reason. Formal installation prepares Go before resolution and stops if resolution still fails afterward.
   - Service file=0: Formal installation will auto-write to systemd; for non-systemd see "Service Manager" below.
   - Running=0: `journalctl -u derper -f` to check logs, mostly port conflicts or cert path/permission issues.
 - Port listening (TLS / STUN)
@@ -231,9 +234,9 @@ Common paths:
 --auto-ufw                If UFW detected, auto-open ports
 
 --goproxy <URL>           Go module proxy, e.g.: https://goproxy.cn,direct
-                          Probed for 5s before a build; on failure pass it explicitly (no auto-switch)
+                          Actual target resolution/build determines success; no homepage gate or auto-switch
 --gosumdb <VALUE>         Go checksum database, e.g.: sum.golang.google.cn
---gotoolchain <MODE>      go toolchain policy, default auto (can auto-fetch ≥1.25)
+--gotoolchain <MODE>      go toolchain policy, default auto (fetches the target-required toolchain)
 
 --no-verify-clients       Disable client verification (not enabled by default; testing only)
 --force-verify-clients    Force enable client verification (default behavior)
@@ -705,13 +708,15 @@ Note: Uninstall doesn't affect Tailscale itself (tailscaled, clients etc.). To r
     ```bash
     --goproxy https://goproxy.cn,direct --gosumdb sum.golang.google.cn
     ```
-- Go module proxy cannot resolve a commit/revision (error contains `invalid version: … git ls-remote … exit status 128`):
-  - Cause: with `-verify-clients` enabled and no explicit `--derper-version`, the script installs the derper matching tailscaled's Git commit. If the proxy temporarily cannot resolve that commit to a module version, Go falls back along `GOPROXY` to `direct`, and direct access to GitHub is normally blocked from mainland networks.
+- Go module proxy cannot resolve a commit/revision (error contains `invalid version`, followed by direct-source `git ls-remote` or `git fetch` with `exit status 128`):
+  - Cause: with `-verify-clients` enabled and no explicit `--derper-version`, the script first resolves tailscaled's reported revision to a canonical module version and installs that version on success. If the proxy temporarily cannot complete the mapping, Go falls back along `GOPROXY` to `direct`, and direct access to GitHub is normally blocked from mainland networks.
   - Solution: retry the same command first; proxy-side resolution failures are usually transient. If it persists, use a proxy that supports revision queries, e.g. `--goproxy https://proxy.golang.com.cn,direct --gosumdb sum.golang.google.cn`. Do not disable `-verify-clients` or the checksum database just to get past this failure.
   - Scope: the failure happens before a candidate binary is published, so the existing derper is not replaced.
-- Go version insufficient:
-  - New Tailscale requires Go ≥ 1.25. Script defaults to `--gotoolchain auto`, will auto-fetch higher version toolchain.
-  - Product builds place `GOPATH`, `GOMODCACHE`, and `GOCACHE` in the run's secure temporary directory and remove them on exit. They neither write to nor delete the caller's existing `~/go`; a later rebuild downloads dependencies again.
+- Go version and toolchain:
+  - Base Go ≥1.21 only enables automatic toolchain selection; it does not prove compatibility with the target derper. The script resolves the actual target module, reports its Go requirement, and by default uses `--gotoolchain auto` to download and verify the required toolchain through the current GOPROXY/GOSUMDB.
+  - Once base Go meets the bootstrap threshold, go.dev being unreachable does not prevent toolchain acquisition through the module proxy. go.dev is checked only when the base Go distribution still needs downloading. Target resolution or verification failure exits nonzero without disabling verification or publishing an unconfirmed candidate.
+  - For transient GOSUMDB `unexpected EOF` or TLS handshake timeout, retry the same command and reuse verified caches. Never bypass this with `--gosumdb off`, disabled verification, or an unknown source.
+  - Root builds persist `GOPATH`, `GOMODCACHE`, and `GOCACHE` under `/var/cache/derper-deploy/go-build` for reuse across runs; exit cleanup does not remove them. `DERPER_GO_BUILD_CACHE_DIR` can select another cache satisfying the ownership and path checks. Independent non-root queries/tests use the run's secure temporary cache. Query/build `GOTMPDIR` and `TMPDIR` use the preflighted temporary directory and are cleaned on exit. The caller's existing `~/go` is neither written to nor deleted. See [Go build cache and disk space](MAINTENANCE_EN.md#go-build-cache-and-disk-space).
 - `derper --version` shows `ERR-BuildInfo`:
   - This is only a missing upstream release stamp when building with `go install tailscale.com/cmd/derper@version`, not a module-version or service failure. Check the actual module with `go version -m /usr/local/bin/derper` or the script's `status`; without Go, the script also falls back to embedded module metadata.
 - derper parameter incompatibility:
